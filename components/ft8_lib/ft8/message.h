@@ -10,7 +10,7 @@ extern "C"
 #endif
 
 #define FTX_PAYLOAD_LENGTH_BYTES 10 ///< number of bytes to hold 77 bits of FTx payload data
-#define FTX_MAX_MESSAGE_LENGTH   35 ///< max message length = callsign[13] + space + callsign[13] + space + report[6] + terminator
+#define FTX_MAX_MESSAGE_LENGTH   64 ///< max decoded message length including multi-part messages such as DXpedition type 0.1
 #define FTX_MAX_MESSAGE_FIELDS   3  // may need to get longer for multi-part messages (DXpedition, contest etc.)
 
 /// Structure that holds the decoded message
@@ -157,6 +157,21 @@ ftx_message_rc_t ftx_message_encode_arrl_fd_ex(ftx_message_t* msg,
                                               char fd_class,
                                               uint8_t section_s7);
 
+/// Pack Type 0.1 (DXpedition) message from free text of the form:
+/// "<call1> RR73; <call2> <fox_call> <report>"
+/// Example: "K1ABC RR73; W9XYZ KH1/KH7Z -08"
+ftx_message_rc_t ftx_message_encode_dxpedition(ftx_message_t* msg,
+                                              ftx_callsign_hash_interface_t* hash_if,
+                                              const char* message_text);
+
+/// Same as ftx_message_encode_dxpedition(), but takes already-parsed fields.
+ftx_message_rc_t ftx_message_encode_dxpedition_ex(ftx_message_t* msg,
+                                                 ftx_callsign_hash_interface_t* hash_if,
+                                                 const char* call_rr73,
+                                                 const char* call_report,
+                                                 const char* fox_call,
+                                                 int report_db);
+
 /// Pack Type 4 (One nonstandard call and one hashed call) message
 ftx_message_rc_t ftx_message_encode_nonstd(ftx_message_t* msg, ftx_callsign_hash_interface_t* hash_if, const char* call_to, const char* call_de, const char* extra);
 
@@ -166,6 +181,7 @@ ftx_message_rc_t ftx_message_encode_telemetry(ftx_message_t* msg, const uint8_t*
 
 ftx_message_rc_t ftx_message_decode(const ftx_message_t* msg, ftx_callsign_hash_interface_t* hash_if, char* message, ftx_message_offsets_t* offsets);
 ftx_message_rc_t ftx_message_decode_std(const ftx_message_t* msg, ftx_callsign_hash_interface_t* hash_if, char* call_to, char* call_de, char* extra, ftx_field_t field_types[FTX_MAX_MESSAGE_FIELDS]);
+ftx_message_rc_t ftx_message_decode_dxpedition(const ftx_message_t* msg, ftx_callsign_hash_interface_t* hash_if, char* field1, char* field2, char* field3, ftx_field_t field_types[FTX_MAX_MESSAGE_FIELDS]);
 ftx_message_rc_t ftx_message_decode_nonstd(const ftx_message_t* msg, ftx_callsign_hash_interface_t* hash_if, char* call_to, char* call_de, char* extra, ftx_field_t field_types[FTX_MAX_MESSAGE_FIELDS]);
 void ftx_message_decode_free(const ftx_message_t* msg, char* text);
 void ftx_message_decode_telemetry_hex(const ftx_message_t* msg, char* telemetry_hex);

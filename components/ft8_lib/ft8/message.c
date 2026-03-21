@@ -47,6 +47,9 @@ static bool unpack58(uint64_t n58, const ftx_callsign_hash_interface_t* hash_if,
 
 static uint16_t packgrid(const char* grid4);
 static int unpackgrid(uint16_t igrid4, uint8_t ir, char* extra, ftx_field_t* extra_field_type);
+static bool parse_dxpedition_message(const char* message_text, char* call_rr73, char* call_report, char* fox_call, int* report_db);
+static bool dxpedition_report_to_r5(int report_db, uint8_t* r5_out);
+static void dxpedition_r5_to_report(uint8_t r5, char* out);
 
 // --- ARRL Field Day (FT8 message types 0.3 / 0.4) helpers ---
 static void set_bits_be(uint8_t* dst, uint16_t start_bit, uint8_t nbits, uint32_t value);
@@ -254,6 +257,11 @@ ftx_message_rc_t ftx_message_encode(ftx_message_t* msg, ftx_callsign_hash_interf
         LOG(LOG_DEBUG, "   ftx_message_encode_arrl_fd failed: %d\n", rc);
     }
 
+    rc = ftx_message_encode_dxpedition(msg, hash_if, message_text);
+    if (rc == FTX_MESSAGE_RC_OK)
+        return rc;
+    LOG(LOG_DEBUG, "   ftx_message_encode_dxpedition failed: %d\n", rc);
+
     rc = ftx_message_encode_free(msg, message_text);
     if (rc == FTX_MESSAGE_RC_OK)
         return rc;
@@ -321,6 +329,63 @@ ftx_message_rc_t ftx_message_encode_std(ftx_message_t* msg, ftx_callsign_hash_in
     msg->payload[7] = (uint8_t)(n29b << 6) | (uint8_t)(igrid4 >> 10);
     msg->payload[8] = (uint8_t)(igrid4 >> 2);
     msg->payload[9] = (uint8_t)(igrid4 << 6) | (uint8_t)(i3 << 3);
+
+    return FTX_MESSAGE_RC_OK;
+}
+
+ftx_message_rc_t ftx_message_encode_dxpedition(ftx_message_t* msg,
+                                              ftx_callsign_hash_interface_t* hash_if,
+                                              const char* message_text)
+{
+    if (!msg || !message_text)
+        return FTX_MESSAGE_RC_ERROR_TYPE;
+
+    char call_rr73[12];
+    char call_report[12];
+    char fox_call[12];
+    int report_db = 0;
+
+    if (!parse_dxpedition_message(message_text, call_rr73, call_report, fox_call, &report_db))
+        return FTX_MESSAGE_RC_ERROR_TYPE;
+
+    return ftx_message_encode_dxpedition_ex(msg, hash_if, call_rr73, call_report, fox_call, report_db);
+}
+
+ftx_message_rc_t ftx_message_encode_dxpedition_ex(ftx_message_t* msg,
+                                                 ftx_callsign_hash_interface_t* hash_if,
+                                                 const char* call_rr73,
+                                                 const char* call_report,
+                                                 const char* fox_call,
+                                                 int report_db)
+{
+    if (!msg || !call_rr73 || !call_report || !fox_call)
+        return FTX_MESSAGE_RC_ERROR_TYPE;
+
+    uint8_t ip_rr73 = 0, ip_report = 0;
+    int32_t c28_rr73 = pack28(call_rr73, hash_if, &ip_rr73);
+    int32_t c28_report = pack28(call_report, hash_if, &ip_report);
+    if (c28_rr73 < 0) return FTX_MESSAGE_RC_ERROR_CALLSIGN1;
+    if (c28_report < 0) return FTX_MESSAGE_RC_ERROR_CALLSIGN2;
+    if (ip_rr73 || ip_report) return FTX_MESSAGE_RC_ERROR_SUFFIX;
+
+    if ((uint32_t)c28_rr73 < NTOKENS || (uint32_t)c28_report < NTOKENS)
+        return FTX_MESSAGE_RC_ERROR_TYPE;
+
+    uint16_t h10 = 0;
+    if (!save_callsign(hash_if, fox_call, NULL, NULL, &h10))
+        return FTX_MESSAGE_RC_ERROR_CALLSIGN2;
+
+    uint8_t r5 = 0;
+    if (!dxpedition_report_to_r5(report_db, &r5))
+        return FTX_MESSAGE_RC_ERROR_GRID;
+
+    memset(msg->payload, 0, sizeof(msg->payload));
+    set_bits_be(msg->payload, 0, 10, h10);
+    set_bits_be(msg->payload, 10, 5, r5);
+    set_bits_be(msg->payload, 15, 28, (uint32_t)c28_rr73);
+    set_bits_be(msg->payload, 43, 28, (uint32_t)c28_report);
+    set_bits_be(msg->payload, 71, 3, 1u);
+    set_bits_be(msg->payload, 74, 3, 0u);
 
     return FTX_MESSAGE_RC_OK;
 }
@@ -699,14 +764,65 @@ ftx_message_rc_t ftx_message_decode_arrl_fd(
     return FTX_MESSAGE_RC_OK;
 }
 
+ftx_message_rc_t ftx_message_decode_dxpedition(
+    const ftx_message_t* msg,
+    ftx_callsign_hash_interface_t* hash_if,
+    char* field1,
+    char* field2,
+    char* field3,
+    ftx_field_t field_types[FTX_MAX_MESSAGE_FIELDS])
+{
+    field1[0] = field2[0] = field3[0] = '\0';
+
+    uint8_t i3 = (uint8_t)get_bits_be(msg->payload, 74, 3);
+    uint8_t n3 = (uint8_t)get_bits_be(msg->payload, 71, 3);
+    if (i3 != 0 || n3 != 1)
+        return FTX_MESSAGE_RC_ERROR_TYPE;
+
+    uint16_t h10 = (uint16_t)get_bits_be(msg->payload, 0, 10);
+    uint8_t r5 = (uint8_t)get_bits_be(msg->payload, 10, 5);
+    uint32_t c28a = (uint32_t)get_bits_be(msg->payload, 15, 28);
+    uint32_t c28b = (uint32_t)get_bits_be(msg->payload, 43, 28);
+
+    char fox_call[14];
+    char report[8];
+
+    if (unpack28(c28a, 0, i3, hash_if, field1, &field_types[0]) < 0)
+        return FTX_MESSAGE_RC_ERROR_CALLSIGN1;
+    if (unpack28(c28b, 0, i3, hash_if, field3, &field_types[2]) < 0)
+        return FTX_MESSAGE_RC_ERROR_CALLSIGN2;
+
+    lookup_callsign(hash_if, FTX_CALLSIGN_HASH_10_BITS, h10, fox_call);
+    dxpedition_r5_to_report(r5, report);
+
+    strcpy(field2, "RR73;");
+    field_types[1] = FTX_FIELD_TOKEN;
+
+    size_t used = strlen(field3);
+    if (used > 0)
+    {
+        strcpy(field3 + used, " ");
+        used += 1;
+    }
+    strcpy(field3 + used, fox_call);
+    used += strlen(fox_call);
+    strcpy(field3 + used, " ");
+    used += 1;
+    strcpy(field3 + used, report);
+
+    return FTX_MESSAGE_RC_OK;
+}
+
 ftx_message_rc_t ftx_message_decode(const ftx_message_t* msg, ftx_callsign_hash_interface_t* hash_if, char* message, ftx_message_offsets_t* offsets)
 {
     ftx_message_rc_t rc;
 
-    char buf[35]; // 13 + 13 + 6 (std/nonstd) / 14 (free text) / 19 (telemetry)
-    char* field1 = buf;
-    char* field2 = buf + 14;
-    char* field3 = buf + 14 + 14;
+    char field1_buf[16];
+    char field2_buf[16];
+    char field3_buf[48];
+    char* field1 = field1_buf;
+    char* field2 = field2_buf;
+    char* field3 = field3_buf;
 
     message[0] = '\0';
     for (int i = 0; i < FTX_MAX_MESSAGE_FIELDS; ++i)
@@ -729,6 +845,9 @@ ftx_message_rc_t ftx_message_decode(const ftx_message_t* msg, ftx_callsign_hash_
         field2 = NULL;
         field3 = NULL;
         rc = FTX_MESSAGE_RC_OK;
+        break;
+    case FTX_MESSAGE_TYPE_DXPEDITION:
+        rc = ftx_message_decode_dxpedition(msg, hash_if, field1, field2, field3, offsets->types);
         break;
     case FTX_MESSAGE_TYPE_ARRL_FD:
         rc = ftx_message_decode_arrl_fd(msg, hash_if, field1, field2, field3, offsets->types);
@@ -1361,6 +1480,86 @@ static bool unpack58(uint64_t n58, const ftx_callsign_hash_interface_t* hash_if,
         return save_callsign(hash_if, callsign, NULL, NULL, NULL);
 
     return false;
+}
+
+static bool parse_dxpedition_message(const char* message_text, char* call_rr73, char* call_report, char* fox_call, int* report_db)
+{
+    if (!message_text || !call_rr73 || !call_report || !fox_call || !report_db)
+        return false;
+
+    char buf[FTX_MAX_MESSAGE_LENGTH];
+    strncpy(buf, message_text, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char* semi = strchr(buf, ';');
+    if (!semi)
+        return false;
+    *semi = '\0';
+
+    char* left = trim(buf);
+    char* right = trim(semi + 1);
+
+    char* tok1 = strtok(left, " ");
+    char* tok2 = strtok(NULL, " ");
+    char* tok3 = strtok(NULL, " ");
+    if (!tok1 || !tok2 || tok3)
+        return false;
+    if (!equals(tok2, "RR73"))
+        return false;
+
+    char* rtok1 = strtok(right, " ");
+    char* rtok2 = strtok(NULL, " ");
+    char* rtok3 = strtok(NULL, " ");
+    char* rtok4 = strtok(NULL, " ");
+    if (!rtok1 || !rtok2 || !rtok3 || rtok4)
+        return false;
+
+    strncpy(call_rr73, tok1, 11);
+    call_rr73[11] = '\0';
+    strncpy(call_report, rtok1, 11);
+    call_report[11] = '\0';
+
+    const char* fox_src = rtok2;
+    size_t fox_len = strlen(fox_src);
+    if (fox_len >= 2 && fox_src[0] == '<' && fox_src[fox_len - 1] == '>')
+    {
+        fox_src++;
+        fox_len -= 2;
+    }
+    if (fox_len == 0 || fox_len > 11)
+        return false;
+    memcpy(fox_call, fox_src, fox_len);
+    fox_call[fox_len] = '\0';
+
+    if (rtok3[0] != '+' && rtok3[0] != '-')
+        return false;
+
+    size_t rpt_len = strlen(rtok3);
+    if (rpt_len != 2 && rpt_len != 3)
+        return false;
+    if (!isdigit((unsigned char)rtok3[1]))
+        return false;
+    if (rpt_len == 3 && !isdigit((unsigned char)rtok3[2]))
+        return false;
+
+    *report_db = (int)strtol(rtok3, NULL, 10);
+
+    return true;
+}
+
+static bool dxpedition_report_to_r5(int report_db, uint8_t* r5_out)
+{
+    if (!r5_out)
+        return false;
+    if (report_db < -30 || report_db > 1)
+        return false;
+    *r5_out = (uint8_t)(report_db + 30);
+    return true;
+}
+
+static void dxpedition_r5_to_report(uint8_t r5, char* out)
+{
+    int_to_dd(out, (int)r5 - 30, 2, true);
 }
 
 static uint16_t packgrid(const char* grid4)

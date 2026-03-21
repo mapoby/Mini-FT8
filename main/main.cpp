@@ -683,6 +683,32 @@ static std::string normalize_call_token(std::string s) {
   return s;
 }
 
+static bool rewrite_dxpedition_for_mycall(const std::string& raw_text,
+                                          const std::string& mycall_up,
+                                          std::string& rewritten_text) {
+  std::istringstream iss(raw_text);
+  std::string call1, rr73_tok, call2, foxcall, rpt;
+  if (!(iss >> call1 >> rr73_tok >> call2 >> foxcall >> rpt)) return false;
+
+  std::string trailing;
+  if (iss >> trailing) return false;
+  if (rr73_tok != "RR73;") return false;
+
+  std::string call1_up = normalize_call_token(call1);
+  std::string call2_up = normalize_call_token(call2);
+  if (call1_up.empty() || call2_up.empty() || mycall_up.empty()) return false;
+
+  if (call1_up == mycall_up) {
+    rewritten_text = call1 + " " + foxcall + " RR73";
+    return true;
+  }
+  if (call2_up == mycall_up) {
+    rewritten_text = call2 + " " + foxcall + " " + rpt;
+    return true;
+  }
+  return false;
+}
+
 static const char* TAG = "FT8";
 enum class UIMode { RX, TX, BAND, MENU, HOST, CONTROL, DEBUG, LIST, STATUS, QSO };
 static UIMode ui_mode = UIMode::RX;
@@ -2140,7 +2166,11 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
              decodedCount, time_s, freq_hz, snr_q, text);
 
     // UI de-dupe by displayed text (keep highest SNR)
-    std::string text_str(text);
+    std::string raw_text_str(text);
+    std::string text_str = raw_text_str;
+    if (rewrite_dxpedition_for_mycall(raw_text_str, mycall_up, text_str)) {
+      ESP_LOGI(TAG, "DXpedition raw match: %s", raw_text_str.c_str());
+    }
     auto it = seen_idx.find(text_str);
     if (it != seen_idx.end()) {
       int idx_ui = it->second;
