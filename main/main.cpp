@@ -433,7 +433,10 @@ static esp_err_t copy_logs_spiffs_to_sd_overwrite() {
   vTaskDelay(pdMS_TO_TICKS(100));
 
   DIR* d = opendir("/spiffs");
-  if (!d) return ESP_FAIL;
+  if (!d) {
+    unmount_sd_spi("/sdcard");
+    return ESP_FAIL;
+  }
 
   esp_err_t last_err = ESP_OK;
   struct dirent* ent;
@@ -455,13 +458,13 @@ static esp_err_t copy_logs_spiffs_to_sd_overwrite() {
 
     std::string dst = std::string("/sdcard/") + name;
     esp_err_t err = copy_file_overwrite(src.c_str(), dst.c_str());
-    if (err != ESP_OK) last_err = err;  // keep going
+    if (err != ESP_OK) last_err = err;
   }
 
   closedir(d);
+  unmount_sd_spi("/sdcard");
   return last_err;
 }
-
 // Delete log files on SPIFFS (keep Station.ini).
 // Deletes: *.adi, RT[YYMMDD].log, fieldday.log
 
