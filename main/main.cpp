@@ -55,6 +55,8 @@ extern "C" {
 #include "esp_vfs_fat.h"
 
 static const char* STATION_FILE = "/spiffs/Station.ini";
+static sdmmc_card_t* g_sd_card = NULL;
+static bool g_sd_mounted = false;
 
 #define ENABLE_BLE 0
 
@@ -261,7 +263,6 @@ void mount_sd_spi(void)
     esp_err_t ret;
     const char mount_point[] = "/sdcard";
 
-    // 1) Init SPI bus
     spi_bus_config_t bus_cfg = {};
     bus_cfg.mosi_io_num = PIN_NUM_MOSI;
     bus_cfg.miso_io_num = PIN_NUM_MISO;
@@ -270,60 +271,42 @@ void mount_sd_spi(void)
     bus_cfg.quadhd_io_num = -1;
     bus_cfg.max_transfer_sz = 4000;
 
-    // Pick an SPI host; SPI2_HOST is commonly available on ESP32-S3.
     ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        //ESP_LOGE(TAG, "spi_bus_initialize failed: %s", esp_err_to_name(ret));
-
-#ifdef DEBUG_LOG
-    char buf[32];
-    snprintf(buf, sizeof(buf), "SPI_INIT Failed: %s", esp_err_to_name(ret));
-    debug_log_line_public(buf);
-#endif
         return;
     }
 
-    // 2) Configure SDSPI device
     sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
     slot_config.gpio_cs = PIN_NUM_CS;
     slot_config.host_id = SPI2_HOST;
 
-    // 3) Mount FAT filesystem
     esp_vfs_fat_mount_config_t mount_config = {};
     mount_config.format_if_mount_failed = false;
     mount_config.max_files = 5;
     mount_config.allocation_unit_size = 16 * 1024;
 
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    // If you had flaky mounts, try slowing SPI down:
-    host.max_freq_khz = 5000;  // 10 MHz (try 5000 if still flaky)
+    host.max_freq_khz = 5000;
 
-    sdmmc_card_t *card;
-    ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &card);
+    ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &g_sd_card);
     if (ret != ESP_OK) {
-        //ESP_LOGE(TAG, "Mount failed: %s", esp_err_to_name(ret));
-#ifdef DEBUG_LOG
-    char buf[32];
-    snprintf(buf, sizeof(buf), "sd %x %s", (unsigned)ret, esp_err_to_name(ret));
-    debug_log_line_public(buf);
-#endif
-
+        spi_bus_free(SPI2_HOST);
+        g_sd_card = NULL;
+        g_sd_mounted = false;
         return;
     }
 
-    sdmmc_card_print_info(stdout, card);
-    //ESP_LOGI(TAG, "Mounted at %s", mount_point);
-#ifdef DEBUG_LOG
-    char buf[32];
-    snprintf(buf, sizeof(buf), "Mounted at %s", mount_point);
-    debug_log_line_public(buf);
-#endif
-
+    g_sd_mounted = true;
 }
 
 void unmount_sd_spi(const char *mount_point)
 {
-    esp_vfs_fat_sdcard_unmount(mount_point, NULL);
+    if (g_sd_mounted && g_sd_card) {
+        esp_vfs_fat_sdcard_unmount(mount_point, g_sd_card);
+        g_sd_card = NULL;
+        g_sd_mounted = false;
+    }
+    spi_bus_free(SPI2_HOST);
 }
 
 // ---------- Log copy/delete helpers ----------
@@ -383,8 +366,7 @@ static bool file_exists(const char* path) {
 
 static void sync_station_ini_from_sd_to_spiffs() {
   static const char* TAG = "FT8";
-  // Best effort only:
-  // if SD mount or copy fails, keep using the Station.ini already in SPIFFS.
+
   if (ensure_sdcard_mounted() != ESP_OK) {
     ESP_LOGI(TAG, "SD not mounted, using SPIFFS Station.ini");
     return;
@@ -395,6 +377,7 @@ static void sync_station_ini_from_sd_to_spiffs() {
 
   if (!file_exists(sd_path)) {
     ESP_LOGI(TAG, "No Station.ini on SD, using SPIFFS Station.ini");
+    unmount_sd_spi("/sdcard");
     return;
   }
 
@@ -403,6 +386,8 @@ static void sync_station_ini_from_sd_to_spiffs() {
   } else {
     ESP_LOGW(TAG, "Failed to copy Station.ini from SD, using SPIFFS Station.ini");
   }
+
+  unmount_sd_spi("/sdcard");
 }
 
 
