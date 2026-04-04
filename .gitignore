@@ -24,3 +24,7 @@ __pycache__/
 *.log
 
 !release/*.bin
+
+# macOS
+.DS_Store
+

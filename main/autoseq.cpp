@@ -20,7 +20,11 @@ static const char* TAG = "AUTOSEQ";
 // ============== Internal state ==============
 
 static QsoContext s_queue[AUTOSEQ_MAX_QUEUE];
-static int s_queue_size = 0;
+// Active zone: s_queue[0 .. s_active_count-1], grows from front
+// Inactive zone: s_queue[s_inactive_start .. AUTOSEQ_MAX_QUEUE-1], grows from back
+// Free space: s_queue[s_active_count .. s_inactive_start-1]
+static int s_active_count = 0;
+static int s_inactive_start = AUTOSEQ_MAX_QUEUE;  // no inactive entries
 
 // Station configuration
 static std::string s_my_call;
@@ -61,6 +65,10 @@ static void on_decode(const UiRxLine& msg);
 static bool compare_ctx(const QsoContext& left, const QsoContext& right);
 static void pop_front();
 static QsoContext* append_ctx();
+static void move_to_inactive(int idx);
+static void evict_oldest_inactive();
+static int find_inactive_by_dxcall(const std::string& dxcall);
+static void reactivate(int inactive_idx);
 static void sort_and_clean();
 static bool looks_like_grid(const std::string& s);
 static bool looks_like_report(const std::string& s, int& out);
@@ -80,7 +88,8 @@ static bool has_exchanged(const QsoContext* ctx) {
 // ============== Public API ==============
 
 void autoseq_init() {
-    s_queue_size = 0;
+    s_active_count = 0;
+    s_inactive_start = AUTOSEQ_MAX_QUEUE;
     s_pending_valid = false;
     s_pending_ctx_idx = -1;
     s_last_tx_slot_idx = -1000;
@@ -103,21 +112,21 @@ static void dlogf(const char* fmt, ...) {
 */
 
 bool autoseq_drop_index(int idx) {
-    if (idx < 0 || idx >= s_queue_size) return false;
-    for (int i = idx; i + 1 < s_queue_size; ++i) {
+    if (idx < 0 || idx >= s_active_count) return false;
+    for (int i = idx; i + 1 < s_active_count; ++i) {
         s_queue[i] = s_queue[i + 1];
     }
-    --s_queue_size;
+    --s_active_count;
     return true;
 }
 
 bool autoseq_rotate_same_parity() {
-    if (s_queue_size < 2) return false;
+    if (s_active_count < 2) return false;
 
     int parity = s_queue[0].slot_id & 1;
 
     int last = -1;
-    for (int i = 1; i < s_queue_size; ++i) {
+    for (int i = 1; i < s_active_count; ++i) {
         if ((s_queue[i].slot_id & 1) == parity) last = i;
         else break; // optional: only rotate within the front same-parity run
     }
@@ -132,14 +141,16 @@ bool autoseq_rotate_same_parity() {
 }
 
 void autoseq_start_cq(int slot_parity) {
-    // Don't add duplicate CQ at bottom of active entries
-    for (int i = 0; i < s_queue_size; ++i) {
-        if (!s_queue[i].inactive && s_queue[i].state == AutoseqState::CALLING) {
+    // Don't add duplicate CQ in active zone
+    for (int i = 0; i < s_active_count; ++i) {
+        if (s_queue[i].state == AutoseqState::CALLING) {
             return;
         }
     }
-    if (s_queue_size >= AUTOSEQ_MAX_QUEUE) {
-        return;
+    if (s_inactive_start <= s_active_count) {
+        // No free space — try to evict an inactive entry
+        evict_oldest_inactive();
+        if (s_inactive_start <= s_active_count) return;  // Still no room
     }
 
     QsoContext* ctx = append_ctx();
@@ -153,19 +164,11 @@ void autoseq_start_cq(int slot_parity) {
     ESP_LOGI(TAG, "Started CQ on slot %d", slot_parity);
 }
 
-// Count active (non-inactive) entries in the queue
-static int active_count() {
-    int n = 0;
-    for (int i = 0; i < s_queue_size; ++i) {
-        if (!s_queue[i].inactive) ++n;
-    }
-    return n;
-}
-
 void autoseq_on_touch(const UiRxLine& msg) {
-    // If queue is completely full, remove the last entry (oldest inactive or lowest priority)
-    if (s_queue_size == AUTOSEQ_MAX_QUEUE) {
-        --s_queue_size;
+    // If no free space, evict an inactive entry to make room
+    if (s_inactive_start <= s_active_count) {
+        evict_oldest_inactive();
+        if (s_inactive_start <= s_active_count) return;  // Still no room
     }
 
     QsoContext* ctx = append_ctx();
@@ -228,15 +231,16 @@ void autoseq_on_touch(const UiRxLine& msg) {
 }
 
 void autoseq_on_decodes(const std::vector<UiRxLine>& to_me_messages) {
-    ESP_LOGI(TAG, "on_decodes: %d messages, queue_size=%d",
-             (int)to_me_messages.size(), s_queue_size);
+    ESP_LOGI(TAG, "on_decodes: %d messages, active=%d inactive=%d",
+             (int)to_me_messages.size(), s_active_count,
+             AUTOSEQ_MAX_QUEUE - s_inactive_start);
     for (const auto& msg : to_me_messages) {
         ESP_LOGI(TAG, "  msg: %s %s %s snr=%d",
                  msg.field1.c_str(), msg.field2.c_str(), msg.field3.c_str(), msg.snr);
         on_decode(msg);
     }
     sort_and_clean();
-    if (s_queue_size > 0) {
+    if (s_active_count > 0) {
         ESP_LOGI(TAG, "on_decodes done: queue[0] state=%d, next_tx=%d, dxcall=%s",
                  (int)s_queue[0].state, (int)s_queue[0].next_tx, s_queue[0].dxcall.c_str());
     }
@@ -247,10 +251,9 @@ void autoseq_on_decodes(const std::vector<UiRxLine>& to_me_messages) {
 void autoseq_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
     (void)slot_idx; (void)slot_parity; (void)ms_to_boundary;  // unused for now
 
-    if (s_queue_size == 0) return;
+    if (s_active_count == 0) return;
 
     QsoContext* ctx = &s_queue[0];
-    if (ctx->inactive) return;  // Front is inactive — nothing to tick
 
     // Advance retry counter or move to inactive zone
     switch (ctx->state) {
@@ -271,9 +274,7 @@ void autoseq_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
             } else if (has_exchanged(ctx)) {
                 // Retries exhausted but we exchanged data with DX — move to
                 // inactive zone to preserve metadata in case DX retries.
-                ctx->inactive = true;
-                ctx->next_tx = TxMsgType::TX_UNDEF;
-                sort_and_clean();
+                move_to_inactive(0);
             } else {
                 // No exchange happened (e.g. sent TX1 but got nothing back).
                 // Safe to evict.
@@ -296,15 +297,15 @@ void autoseq_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
             break;
     }
 
-    if (ctx->state == AutoseqState::IDLE) {
+    if (s_active_count > 0 && s_queue[0].state == AutoseqState::IDLE) {
         pop_front();
     }
 
-    ESP_LOGI(TAG, "Tick: queue_size=%d, state=%d, next_tx=%d, retry=%d/%d",
-             s_queue_size, s_queue_size > 0 ? (int)s_queue[0].state : -1,
-             s_queue_size > 0 ? (int)s_queue[0].next_tx : -1,
-             s_queue_size > 0 ? s_queue[0].retry_counter : 0,
-             s_queue_size > 0 ? s_queue[0].retry_limit : 0);
+    ESP_LOGI(TAG, "Tick: active=%d, state=%d, next_tx=%d, retry=%d/%d",
+             s_active_count, s_active_count > 0 ? (int)s_queue[0].state : -1,
+             s_active_count > 0 ? (int)s_queue[0].next_tx : -1,
+             s_active_count > 0 ? s_queue[0].retry_counter : 0,
+             s_active_count > 0 ? s_queue[0].retry_limit : 0);
 }
 
 // Get the next TX message text based on current state (does NOT modify state)
@@ -312,10 +313,10 @@ void autoseq_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
 bool autoseq_get_next_tx(std::string& out_text) {
     out_text.clear();
 
-    if (s_queue_size == 0) return false;
+    if (s_active_count == 0) return false;
 
     QsoContext* ctx = &s_queue[0];
-    if (ctx->inactive || ctx->state == AutoseqState::IDLE || ctx->next_tx == TxMsgType::TX_UNDEF) {
+    if (ctx->state == AutoseqState::IDLE || ctx->next_tx == TxMsgType::TX_UNDEF) {
         return false;
     }
 
@@ -326,10 +327,10 @@ bool autoseq_get_next_tx(std::string& out_text) {
 // Get the pending TX entry - populates from current context state
 // Does NOT modify state - just reads current next_tx
 bool autoseq_fetch_pending_tx(AutoseqTxEntry& out) {
-    if (s_queue_size == 0) return false;
+    if (s_active_count == 0) return false;
 
     QsoContext* ctx = &s_queue[0];
-    if (ctx->inactive || ctx->state == AutoseqState::IDLE || ctx->next_tx == TxMsgType::TX_UNDEF) {
+    if (ctx->state == AutoseqState::IDLE || ctx->next_tx == TxMsgType::TX_UNDEF) {
         return false;
     }
 
@@ -351,7 +352,7 @@ bool autoseq_fetch_pending_tx(AutoseqTxEntry& out) {
 }
 
 void autoseq_mark_sent(int64_t slot_idx) {
-    if (s_queue_size == 0) return;
+    if (s_active_count == 0) return;
 
     s_last_tx_slot_idx = slot_idx;
     s_last_tx_parity = s_queue[0].slot_id & 1;
@@ -366,10 +367,9 @@ void autoseq_get_qso_states(std::vector<std::string>& out) {
         "CALL", "RPLY", "RPRT", "RRPT", "RGRS", "SOFF", "", "ZZZ"
     };
 
-    for (int i = 0; i < s_queue_size; ++i) {
+    for (int i = 0; i < s_active_count; ++i) {
         const QsoContext* ctx = &s_queue[i];
         if (ctx->state == AutoseqState::IDLE) continue;
-        if (ctx->inactive) continue;  // Don't show inactive entries in UI
 
         char buf[32];
         snprintf(buf, sizeof(buf), "%-8.8s %.4s %d/%d",
@@ -381,8 +381,7 @@ void autoseq_get_qso_states(std::vector<std::string>& out) {
 }
 
 bool autoseq_has_active_qso() {
-    for (int i = 0; i < s_queue_size; ++i) {
-        if (s_queue[i].inactive) continue;
+    for (int i = 0; i < s_active_count; ++i) {
         if (s_queue[i].state != AutoseqState::IDLE &&
             s_queue[i].state != AutoseqState::CALLING) {
             return true;
@@ -392,7 +391,7 @@ bool autoseq_has_active_qso() {
 }
 
 int autoseq_queue_size() {
-    return active_count();
+    return s_active_count;
 }
 
 void autoseq_set_adif_callback(AdifLogCallback cb) {
@@ -647,13 +646,6 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
         return false;
     }
 
-    // Reactivate inactive (dormant) contexts when DX retries
-    if (ctx->inactive) {
-        ESP_LOGI(TAG, "generate_response: reactivating dormant ctx for %s (rcvd=%d)",
-                 ctx->dxcall.c_str(), (int)rcvd);
-        ctx->inactive = false;
-    }
-
     // Update SNR we report to them on initial messages
     if (rcvd == TxMsgType::TX1 || rcvd == TxMsgType::TX2) {
         ctx->snr_tx = msg.snr;
@@ -821,19 +813,31 @@ static void on_decode(const UiRxLine& msg) {
     std::string dxcall = normalize_call_token(msg.field2);
     if (dxcall.empty()) return;
 
-    // Check if it matches an existing context (case-insensitive)
-    for (int i = 0; i < s_queue_size; ++i) {
+    // Check active zone for matching context (case-insensitive)
+    for (int i = 0; i < s_active_count; ++i) {
         QsoContext* ctx = &s_queue[i];
         std::string ctx_dxcall = ctx->dxcall;
         for (auto& ch : ctx_dxcall) ch = toupper((unsigned char)ch);
         if (ctx_dxcall == dxcall) {
-            ESP_LOGI(TAG, "on_decode: found ctx for %s, state=%d, next_tx=%d",
+            ESP_LOGI(TAG, "on_decode: found active ctx for %s, state=%d, next_tx=%d",
                      dxcall.c_str(), (int)ctx->state, (int)ctx->next_tx);
             generate_response(ctx, msg, false);
             ESP_LOGI(TAG, "on_decode: after response, state=%d, next_tx=%d",
                      (int)ctx->state, (int)ctx->next_tx);
             return;
         }
+    }
+
+    // Check inactive zone for matching context — reactivate if found
+    int inact_idx = find_inactive_by_dxcall(dxcall);
+    if (inact_idx >= 0) {
+        ESP_LOGI(TAG, "on_decode: reactivating inactive ctx for %s", dxcall.c_str());
+        reactivate(inact_idx);
+        // After reactivation, the entry is at s_queue[s_active_count - 1]
+        QsoContext* ctx = &s_queue[s_active_count - 1];
+        generate_response(ctx, msg, false);
+        sort_and_clean();
+        return;
     }
 
     // No matching context (active or inactive) for this DX.
@@ -859,12 +863,13 @@ static void on_decode(const UiRxLine& msg) {
         }
     }
 
-    ESP_LOGI(TAG, "on_decode: new QSO from %s (field3=%s, queue_size=%d)",
-             dxcall.c_str(), f3.c_str(), s_queue_size);
+    ESP_LOGI(TAG, "on_decode: new QSO from %s (field3=%s, active=%d)",
+             dxcall.c_str(), f3.c_str(), s_active_count);
 
-    // No matching context - create new if queue not full
-    if (s_queue_size >= AUTOSEQ_MAX_QUEUE) {
-        return;
+    // No matching context — create new if there's room
+    if (s_inactive_start <= s_active_count) {
+        evict_oldest_inactive();
+        if (s_inactive_start <= s_active_count) return;  // Still no room
     }
 
     QsoContext* ctx = append_ctx();
@@ -874,14 +879,9 @@ static void on_decode(const UiRxLine& msg) {
 }
 
 // Comparison for std::sort: IDLE at top (to be popped), CALLING at bottom
+// Only used on the active zone [0 .. s_active_count)
 // Returns true if left should come before right
 static bool compare_ctx(const QsoContext& left, const QsoContext& right) {
-    // Inactive entries always sort AFTER active entries
-    if (left.inactive != right.inactive) {
-        return !left.inactive;  // active before inactive
-    }
-
-    // Among active entries (or among inactive): same rules as before
     // Same state? Lower retry count gets priority — round-robin among
     // contacts so we probe for viable propagation paths rather than
     // burning all retries on one potentially dead contact.
@@ -896,32 +896,110 @@ static bool compare_ctx(const QsoContext& left, const QsoContext& right) {
 }
 
 static void pop_front() {
-    if (s_queue_size <= 0) return;
+    if (s_active_count <= 0) return;
 
-    // Shift array
-    for (int i = 0; i < s_queue_size - 1; ++i) {
+    // Shift active zone left
+    for (int i = 0; i + 1 < s_active_count; ++i) {
         s_queue[i] = s_queue[i + 1];
     }
-    --s_queue_size;
+    --s_active_count;
 }
 
 static QsoContext* append_ctx() {
-    if (s_queue_size >= AUTOSEQ_MAX_QUEUE) return nullptr;
+    if (s_inactive_start <= s_active_count) return nullptr;  // No free space
 
-    QsoContext* ctx = &s_queue[s_queue_size++];
+    QsoContext* ctx = &s_queue[s_active_count++];
     *ctx = QsoContext{};  // Reset to defaults
     return ctx;
 }
 
-static void sort_and_clean() {
-    if (s_queue_size == 0) return;
+// Move active entry at index idx to the inactive zone (back of array)
+static void move_to_inactive(int idx) {
+    if (idx < 0 || idx >= s_active_count) return;
 
+    // Make room in inactive zone if needed
+    if (s_inactive_start <= s_active_count) {
+        evict_oldest_inactive();
+        // If still no room (queue is entirely active), just drop the entry
+        if (s_inactive_start <= s_active_count) {
+            // Remove from active by shifting, entry is lost
+            for (int i = idx; i + 1 < s_active_count; ++i) {
+                s_queue[i] = s_queue[i + 1];
+            }
+            --s_active_count;
+            return;
+        }
+    }
+
+    // Copy to inactive zone (grows leftward)
+    QsoContext saved = s_queue[idx];
+    saved.next_tx = TxMsgType::TX_UNDEF;
+
+    // Remove from active zone by shifting
+    for (int i = idx; i + 1 < s_active_count; ++i) {
+        s_queue[i] = s_queue[i + 1];
+    }
+    --s_active_count;
+
+    // Place into inactive zone
+    s_queue[--s_inactive_start] = saved;
+}
+
+// Evict an inactive entry to free one slot.
+// Evicts the entry at s_inactive_start (left edge of inactive zone) — O(1).
+static void evict_oldest_inactive() {
+    if (s_inactive_start >= AUTOSEQ_MAX_QUEUE) return;  // No inactive entries
+
+    // To evict the oldest (rightmost, at AUTOSEQ_MAX_QUEUE-1) without shifting,
+    // overwrite it with the newest (leftmost, at s_inactive_start), then shrink
+    // the zone from the left.
+    if (s_inactive_start < AUTOSEQ_MAX_QUEUE - 1) {
+        s_queue[AUTOSEQ_MAX_QUEUE - 1] = s_queue[s_inactive_start];
+    }
+    ++s_inactive_start;
+}
+
+// Find an inactive entry by dxcall (case-insensitive). Returns array index or -1.
+static int find_inactive_by_dxcall(const std::string& dxcall) {
+    for (int i = s_inactive_start; i < AUTOSEQ_MAX_QUEUE; ++i) {
+        std::string ctx_dxcall = s_queue[i].dxcall;
+        for (auto& ch : ctx_dxcall) ch = toupper((unsigned char)ch);
+        if (ctx_dxcall == dxcall) return i;
+    }
+    return -1;
+}
+
+// Move an inactive entry back to the active zone (appended at end of active zone).
+// Always succeeds because removing the entry from inactive frees one slot for active.
+static void reactivate(int inactive_idx) {
+    if (inactive_idx < s_inactive_start || inactive_idx >= AUTOSEQ_MAX_QUEUE) return;
+
+    QsoContext saved = s_queue[inactive_idx];
+
+    // Remove from inactive zone by shifting remaining inactive entries right
+    for (int i = inactive_idx; i > s_inactive_start; --i) {
+        s_queue[i] = s_queue[i - 1];
+    }
+    ++s_inactive_start;  // Shrink inactive zone from left
+
+    // Append to active zone — there's now room because we freed one slot
+    s_queue[s_active_count++] = saved;
+    // Reset retry counter for fresh attempts
+    s_queue[s_active_count - 1].retry_counter = 0;
+    ESP_LOGI(TAG, "Reactivated %s into active zone (active=%d)",
+             saved.dxcall.c_str(), s_active_count);
+}
+
+static void sort_and_clean() {
+    if (s_active_count == 0) return;
+
+    // Sort only the active zone
     // Use std::sort instead of qsort - qsort does byte-wise swap which
     // corrupts std::string members in QsoContext
-    std::sort(s_queue, s_queue + s_queue_size, compare_ctx);
+    std::sort(s_queue, s_queue + s_active_count, compare_ctx);
 
     // Pop IDLE entries from front
-    while (s_queue_size > 0 && s_queue[0].state == AutoseqState::IDLE) {
+    while (s_active_count > 0 && s_queue[0].state == AutoseqState::IDLE) {
         pop_front();
     }
 }

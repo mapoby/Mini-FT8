@@ -7,8 +7,6 @@
 
 // Queue size: active + inactive entries. 120 supports a full 1-hour activation.
 constexpr int AUTOSEQ_MAX_QUEUE = 120;
-// Maximum active QSOs (front of queue, get scheduled by tick)
-constexpr int AUTOSEQ_MAX_ACTIVE = 9;
 // Maximum retries before moving to inactive zone
 constexpr int AUTOSEQ_MAX_RETRY = 5;
 
@@ -51,7 +49,6 @@ struct QsoContext {
     int retry_limit = AUTOSEQ_MAX_RETRY;
     bool logged = false;    // Prevents duplicate ADIF logging
     bool is_fd = false;
-    bool inactive = false;  // Retries exhausted, kept for metadata preservation
 
     int offset_hz = 1500;   // TX audio offset
     int slot_id = 0;        // TX slot (0=even, 1=odd)
