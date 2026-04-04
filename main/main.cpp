@@ -806,6 +806,26 @@ static std::vector<std::string> g_startup_lines = {
 
 // Runtime latch: when true, we keep showing the startup screen until any key is pressed.
 static bool g_startup_active = true;
+
+static bool is_startup_direct_mode_key(char c) {
+  const char k = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  switch (k) {
+    case 'S':
+    case 'R':
+    case 'T':
+    case 'Q':
+    case 'M':
+    case 'N':
+    case 'O':
+    case 'B':
+    case 'C':
+    case 'D':
+      return true;
+    default:
+      return false;
+  }
+}
+
 static std::vector<std::string> g_q_lines;
 static std::vector<std::string> g_q_files;
 static bool g_q_show_entries = false;
@@ -857,8 +877,10 @@ static std::string g_grid = "CM97";
 bool g_decode_enabled = true;
 static OffsetSrc g_offset_src = OffsetSrc::RANDOM;
 static RadioType g_radio = RadioType::QMX;
-static std::string g_ant = "EFHW";
-static std::string g_comment1 = "MiniFT8 /Radio /Ant";
+static constexpr size_t kIgnorePrefixTextMaxLen = 64;
+static std::string g_comment1 = "MiniFT8 /Radio";
+static std::string g_ignore_prefix_text;
+static std::vector<std::string> g_ignore_prefixes;
 static bool g_rxtx_log = true;
 static RadioType canonical_radio_type(RadioType r);
 static RadioProfileBinding get_radio_profile_binding(RadioType r);
@@ -881,7 +903,7 @@ static int menu_page = 0;
 static int menu_edit_idx = -1;
 static std::string menu_edit_buf;
 static bool menu_long_edit = false;
-static enum { LONG_NONE, LONG_FT, LONG_COMMENT, LONG_ACTIVE } menu_long_kind = LONG_NONE;
+static enum { LONG_NONE, LONG_FT, LONG_COMMENT, LONG_ACTIVE, LONG_IGNORE } menu_long_kind = LONG_NONE;
 static std::string menu_long_buf;
 static std::string menu_long_backup;
 static int menu_flash_idx = -1;          // absolute index to flash highlight
@@ -1252,12 +1274,11 @@ static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
       pos += to.size();
     }
   };
-  // Expand placeholders using current radio/ant strings
+  // Expand placeholders using current radio string
   auto radio_name_local = [](RadioType r) {
     return (r == RadioType::KH1) ? "KH1" : "QMX";
   };
   repl(comment_expanded, "/Radio", radio_name_local(g_radio));
-  repl(comment_expanded, "/Ant", g_ant);
   // Build rst_sent/rst_rcvd fragments — omit when -99 (no data),
   // matching DXFT8 reference behavior (ADIF.c omits when value is 0).
   char rst_sent_buf[32] = "";
@@ -1579,8 +1600,38 @@ static std::string expand_comment1() {
     }
   };
   repl(out, "/Radio", radio_name(g_radio));
-  repl(out, "/Ant", g_ant);
   return out;
+}
+
+static void rebuild_ignore_prefixes() {
+  g_ignore_prefixes.clear();
+  std::istringstream iss(g_ignore_prefix_text);
+  std::string tok;
+  while (iss >> tok) {
+    std::string norm = normalize_call_token(tok);
+    if (norm.empty()) continue;
+    bool duplicate = false;
+    for (const auto& existing : g_ignore_prefixes) {
+      if (existing == norm) {
+        duplicate = true;
+        break;
+      }
+    }
+    if (!duplicate) g_ignore_prefixes.push_back(norm);
+  }
+}
+
+static bool ignorelist_matches_normalized_dxcall(const std::string& dxcall_norm) {
+  if (dxcall_norm.empty()) return false;
+  for (const auto& prefix : g_ignore_prefixes) {
+    if (!prefix.empty() && dxcall_norm.rfind(prefix, 0) == 0) return true;
+  }
+  return false;
+}
+
+static std::string clamp_ignore_prefix_text(const std::string& s) {
+  if (s.size() <= kIgnorePrefixTextMaxLen) return s;
+  return s.substr(0, kIgnorePrefixTextMaxLen);
 }
 
 static std::string battery_status_line() {
@@ -2275,10 +2326,21 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
 
   // ---- autoseq trigger logic (unchanged idea) ----
   if (!g_was_txing) {
-    if (!to_me.empty()) {
-      autoseq_on_decodes(to_me);
+    std::vector<UiRxLine> to_me_auto;
+    to_me_auto.reserve(to_me.size());
+    for (const auto& msg : to_me) {
+      const std::string dxcall_norm = normalize_call_token(msg.field2);
+      if (ignorelist_matches_normalized_dxcall(dxcall_norm)) {
+        ESP_LOGI(TAG, "IgnoreList: skip auto reply to %s", dxcall_norm.c_str());
+        continue;
+      }
+      to_me_auto.push_back(msg);
+    }
+
+    if (!to_me_auto.empty()) {
+      autoseq_on_decodes(to_me_auto);
       g_tx_view_dirty = true;
-      g_last_reply_text = to_me.front().text;
+      g_last_reply_text = to_me_auto.front().text;
     }
 
     AutoseqTxEntry pending;
@@ -2622,7 +2684,7 @@ static void draw_menu_view() {
     lines.push_back(std::string("Cursor:") + std::to_string(g_offset_hz));
   }
   lines.push_back(std::string("Radio:") + radio_name(g_radio));
-  lines.push_back(std::string("Antenna:") + elide_right(menu_edit_idx == 9 ? menu_edit_buf : g_ant));
+  lines.push_back(std::string("IgnoreList:") + head_trim(g_ignore_prefix_text, 10));
   lines.push_back(std::string("C:") + head_trim(expand_comment1(), 16));
   lines.push_back(battery_status_line());
 
@@ -3171,7 +3233,7 @@ static void load_station_data() {
 
   FILE* f = fopen(STATION_FILE, "r");
   if (!f) return;
-  char line[64];
+  char line[128];
   while (fgets(line, sizeof(line), f)) {
     int idx = -1;
     int val = 0;
@@ -3204,10 +3266,10 @@ static void load_station_data() {
       g_call = trim_copy(line + 5);
     } else if (strncmp(line, "grid=", 5) == 0) {
       g_grid = trim_copy(line + 5);
-    } else if (strncmp(line, "ant=", 4) == 0) {
-      g_ant = trim_copy(line + 4);
     } else if (strncmp(line, "comment1=", 9) == 0) {
       g_comment1 = trim_copy(line + 9);
+    } else if (strncmp(line, "ignore_prefixes=", 16) == 0) {
+      g_ignore_prefix_text = clamp_ignore_prefix_text(trim_copy(line + 16));
     } else if (sscanf(line, "rxtx_log=%d", &val) == 1) {
       g_rxtx_log = (val != 0);
     } else if (sscanf(line, "skiptx1=%d", &val) == 1) {
@@ -3232,6 +3294,7 @@ static void load_station_data() {
     rtc_set_from_strings();
   }
   rebuild_active_bands();
+  rebuild_ignore_prefixes();
   g_beacon = BeaconMode::OFF; // force off on load
 }
 
@@ -3257,8 +3320,8 @@ static void save_station_data() {
   fprintf(f, "grid=%s\n", g_grid.c_str());
   fprintf(f, "offset_src=%d\n", (int)g_offset_src);
   fprintf(f, "radio=%d\n", (int)canonical_radio_type(g_radio));
-  fprintf(f, "ant=%s\n", g_ant.c_str());
   fprintf(f, "comment1=%s\n", g_comment1.c_str());
+  fprintf(f, "ignore_prefixes=%s\n", g_ignore_prefix_text.c_str());
   fprintf(f, "rxtx_log=%d\n", g_rxtx_log ? 1 : 0);
   fprintf(f, "active_bands=%s\n", g_active_band_text.c_str());
   fprintf(f, "rtc_sleep_epoch=%lld\n", (long long)g_rtc_sleep_epoch);
@@ -3464,17 +3527,22 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         vTaskDelay(pdMS_TO_TICKS(10));
         continue;
       }
-      last_key = c;
+      const bool direct_mode_entry = is_startup_direct_mode_key(c);
 
       g_startup_active = false;
       save_station_data();
 
-      // Now show the real RX page; consume this key so it doesn't trigger actions.
-      ui_force_redraw_rx();
-      ui_draw_rx();
+      if (!direct_mode_entry) {
+        // Non-mode startup dismissal keeps prior behavior: show RX and consume key.
+        last_key = c;
+        ui_force_redraw_rx();
+        ui_draw_rx();
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
+      }
 
-      vTaskDelay(pdMS_TO_TICKS(10));
-      continue;
+      // Let the first mode key both dismiss startup and perform normal mode switch.
+      last_key = 0;
     }
 
     rtc_tick();
@@ -3953,6 +4021,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 } else if (menu_long_kind == LONG_ACTIVE) {
                   g_active_band_text = menu_long_buf;
                   rebuild_active_bands();
+                } else if (menu_long_kind == LONG_IGNORE) {
+                  g_ignore_prefix_text = clamp_ignore_prefix_text(menu_long_buf);
+                  rebuild_ignore_prefixes();
                 }
                 save_station_data();
                 menu_long_edit = false;
@@ -3971,8 +4042,13 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 draw_menu_view();
               } else if (c >= 32 && c < 127) {
                 char ch = c;
-                if (menu_long_kind == LONG_FT) ch = toupper((unsigned char)ch);
-                menu_long_buf.push_back(ch);
+                if (menu_long_kind == LONG_FT || menu_long_kind == LONG_IGNORE) {
+                  ch = toupper((unsigned char)ch);
+                }
+                if (!(menu_long_kind == LONG_IGNORE &&
+                      menu_long_buf.size() >= kIgnorePrefixTextMaxLen)) {
+                  menu_long_buf.push_back(ch);
+                }
                 draw_menu_view();
               }
               break;
@@ -3982,7 +4058,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 if (menu_edit_idx == 3) { g_call = menu_edit_buf; autoseq_set_station(g_call, g_grid); }
                 else if (menu_edit_idx == 4) { g_grid = menu_edit_buf; autoseq_set_station(g_call, g_grid); }
                 else if (menu_edit_idx == 7) { g_offset_hz = atoi(menu_edit_buf.c_str()); }
-                else if (menu_edit_idx == 9) { g_ant = menu_edit_buf; }
                 else if (menu_edit_idx == 10) { g_comment1 = menu_edit_buf; }
                 else if (menu_edit_idx == 15) { g_rtc_comp = atoi(menu_edit_buf.c_str()); }
                 save_station_data();
@@ -4105,8 +4180,10 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   save_station_data();
                   draw_menu_view();
                 } else if (c == '4') {
-                  menu_edit_idx = 9; // Antenna line
-                  menu_edit_buf = g_ant;
+                  menu_long_edit = true;
+                  menu_long_kind = LONG_IGNORE;
+                  menu_long_buf = g_ignore_prefix_text;
+                  menu_long_backup = g_ignore_prefix_text;
                   draw_menu_view();
                 } else if (c == '5') {
                   menu_long_edit = true;
