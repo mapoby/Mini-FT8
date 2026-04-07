@@ -1363,6 +1363,16 @@ static void qso_load_entries(const std::string& path) {
   qso_rebuild_entry_lines();
 }
 
+static void qso_draw_page() {
+  if (g_q_show_entries) {
+    // Entry view: render raw QSO lines without "1..6 " prefixes.
+    ui_draw_debug(g_q_lines, q_page);
+  } else {
+    // File list view: keep numbered selection rows.
+    ui_draw_list(g_q_lines, q_page, -1);
+  }
+}
+
 static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd) {
   // Protect ADIF file access with the same mutex used for RxTxLog.
   // log_qso_if_needed can be called from the UAC streaming task (core 1)
@@ -3730,7 +3740,7 @@ static void enter_mode(UIMode new_mode) {
       g_q_show_entries = false;
       q_page = 0;
       qso_load_file_list();
-      ui_draw_list(g_q_lines, q_page, -1);
+      qso_draw_page();
       break;
     case UIMode::STATUS:
       g_status_beacon_temp = g_beacon;
@@ -4296,9 +4306,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         case UIMode::QSO: {
           if (!g_q_show_entries) {
             if (c == ';') {
-              if (q_page > 0) { q_page--; ui_draw_list(g_q_lines, q_page, -1); }
+              if (q_page > 0) { q_page--; qso_draw_page(); }
             } else if (c == '.') {
-              if ((q_page + 1) * 6 < (int)g_q_lines.size()) { q_page++; ui_draw_list(g_q_lines, q_page, -1); }
+              if ((q_page + 1) * 6 < (int)g_q_lines.size()) { q_page++; qso_draw_page(); }
             } else if (c >= '1' && c <= '6') {
               int idx = q_page * 6 + (c - '1');
               if (idx >= 0 && idx < (int)g_q_files.size()) {
@@ -4310,7 +4320,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 qso_load_entries(g_q_current_file);
                 g_q_show_entries = true;
                 q_page = 0;
-                ui_draw_list(g_q_lines, q_page, -1);
+                qso_draw_page();
               }
             }
           } else {
@@ -4318,24 +4328,24 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
               if (g_q_page_view != QPageView::Default) {
                 g_q_page_view = QPageView::Default;
                 qso_rebuild_entry_lines();
-                ui_draw_list(g_q_lines, q_page, -1);
+                qso_draw_page();
               }
             } else if (c == '/') {  // right: alternate view (call / R-SNR / S-SNR)
               if (g_q_page_view != QPageView::Alternate) {
                 g_q_page_view = QPageView::Alternate;
                 qso_rebuild_entry_lines();
-                ui_draw_list(g_q_lines, q_page, -1);
+                qso_draw_page();
               }
             } else if (c == ';') {
-              if (q_page > 0) { q_page--; ui_draw_list(g_q_lines, q_page, -1); }
+              if (q_page > 0) { q_page--; qso_draw_page(); }
             } else if (c == '.') {
-              if ((q_page + 1) * 6 < (int)g_q_lines.size()) { q_page++; ui_draw_list(g_q_lines, q_page, -1); }
+              if ((q_page + 1) * 6 < (int)g_q_lines.size()) { q_page++; qso_draw_page(); }
             } else if (c == '`') {
               // back to file list
               g_q_show_entries = false;
               q_page = 0;
               qso_load_file_list();
-              ui_draw_list(g_q_lines, q_page, -1);
+              qso_draw_page();
             }
           }
           break;
