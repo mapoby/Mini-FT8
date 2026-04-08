@@ -88,6 +88,12 @@ static const ble_uuid16_t ble_ui_rx_uuid = BLE_UUID16_INIT(BLE_UI_RX_UUID);
 static const ble_uuid16_t ble_ui_tx_uuid = BLE_UUID16_INIT(BLE_UI_TX_UUID);
 #endif
 
+static constexpr size_t BLE_UI_INPUT_MAX = 160;
+struct BleUiInput {
+    uint16_t len = 0;
+    char data[BLE_UI_INPUT_MAX] = {};
+};
+
 
 #if ENABLE_BLE
 
@@ -98,7 +104,9 @@ static bool g_ble_synced = false;
 static bool g_ble_force_send = false;
 static std::string g_ble_adv_name;
 static std::string g_ble_last_payload;
-static int g_ble_last_countdown = -1;
+static int64_t g_ble_last_tick_slot = -1;
+static int g_ble_last_tick_sec = -1;
+static bool g_ble_text_mode = false;
 static const char* BT_TAG = "BLE_INIT";
 
 static int gap_cb(struct ble_gap_event *event, void *arg);
@@ -108,10 +116,19 @@ static void ble_app_advertise(void);
 static void ble_update_name_from_station(bool restart_adv);
 static void ble_countdown_tick();
 
-static char ble_parse_ui_command(const uint8_t* data, uint16_t len)
+static std::string ble_trim_trailing_crlf(const char* data, uint16_t len)
 {
-    if (!data || len != 1) return 0;  // ignore multi-character payloads
-    char c = static_cast<char>(data[0]);
+    if (!data || len == 0) return std::string();
+    size_t used = len;
+    while (used > 0 && (data[used - 1] == '\r' || data[used - 1] == '\n')) used--;
+    return std::string(data, data + used);
+}
+
+static char ble_parse_ui_command(const char* data, uint16_t len)
+{
+    const std::string payload = ble_trim_trailing_crlf(data, len);
+    if (payload.size() != 1) return 0;  // command mode is single-character only
+    char c = payload[0];
     if (c >= 'a' && c <= 'z') c = static_cast<char>(c - ('a' - 'A'));
 
     if (c >= '1' && c <= '6') return c;
@@ -121,11 +138,22 @@ static char ble_parse_ui_command(const uint8_t* data, uint16_t len)
       case 'T':
       case 'M':
       case 'Q':
+      case 'B':
+      case 'C':
+      case 'D':
+      case 'N':
+      case 'O':
         return c;
       case 'U':  // page up
         return ';';
       case 'V':  // page down
         return '.';
+      case 'Z':  // left (Zuo)
+        return ',';
+      case 'X':  // right (You)
+        return '/';
+      case 'E':  // ESC / TX cancel
+        return '`';
       default:
         return 0;
     }
@@ -140,10 +168,14 @@ static int ble_ui_rx_cb(uint16_t conn_handle,
     (void)attr_handle;
     (void)arg;
     if (!ble_cmd_queue || !ctxt || !ctxt->om) return 0;
-    char cmd = ble_parse_ui_command(ctxt->om->om_data, ctxt->om->om_len);
-    if (cmd != 0) {
-      xQueueSend(ble_cmd_queue, &cmd, 0);
+    BleUiInput input{};
+    size_t copy_len = ctxt->om->om_len;
+    if (copy_len > BLE_UI_INPUT_MAX) copy_len = BLE_UI_INPUT_MAX;
+    input.len = static_cast<uint16_t>(copy_len);
+    if (copy_len > 0) {
+      std::memcpy(input.data, ctxt->om->om_data, copy_len);
     }
+    xQueueSend(ble_cmd_queue, &input, 0);
     return 0;  // ignore unsupported input silently
 }
 
@@ -237,7 +269,7 @@ static void init_bluetooth(void)
     ble_svc_gatt_init();
     ESP_LOGI(BT_TAG, "GAP/GATT init done");
 
-    ble_cmd_queue = xQueueCreate(32, sizeof(char));
+    ble_cmd_queue = xQueueCreate(32, sizeof(BleUiInput));
     assert(ble_cmd_queue);
     ble_update_name_from_station(false);
 
@@ -267,7 +299,9 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
         if (event->connect.status == 0) {
             g_conn_handle = event->connect.conn_handle;
             g_ble_force_send = true;
-            g_ble_last_countdown = -1;
+            g_ble_last_tick_slot = -1;
+            g_ble_last_tick_sec = -1;
+            g_ble_text_mode = false;
             ESP_LOGI(BT_TAG, "Connected, handle=%u", g_conn_handle);
         } else {
             g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -279,7 +313,10 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISCONNECT:
         g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         g_ble_last_payload.clear();
-        g_ble_last_countdown = -1;
+        g_ble_last_tick_slot = -1;
+        g_ble_last_tick_sec = -1;
+        g_ble_text_mode = false;
+        if (ble_cmd_queue) xQueueReset(ble_cmd_queue);
         ESP_LOGW(BT_TAG, "Disconnected; restarting adv");
         ble_app_advertise();
         break;
@@ -291,7 +328,7 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
 }
 
 
-static bool ble_pop_command(char& out) {
+static bool ble_pop_input(BleUiInput& out) {
     if (!ble_cmd_queue) return false;
     return xQueueReceive(ble_cmd_queue, &out, 0) == pdTRUE;
 }
@@ -809,12 +846,18 @@ static bool g_pending_tx_valid = false;
 static volatile bool g_tx_cancel_requested = false;
 static void host_process_bytes(const uint8_t* buf, size_t len);
 static void poll_host_uart();
-static bool ble_pop_command(char& out);
+static bool ble_pop_input(BleUiInput& out);
 static void ble_update_name_from_station(bool restart_adv);
 static void ble_mirror_tick();
 static void ble_countdown_tick();
 static void enter_mode(UIMode new_mode);
 static bool g_rx_dirty = false;
+#if ENABLE_BLE
+static void ble_enter_text_mode();
+static void ble_exit_text_mode();
+static bool ble_text_target_active();
+static void ble_commit_text_input(const BleUiInput& input);
+#endif
 
 
 
@@ -3063,20 +3106,79 @@ static std::string ble_meta_line() {
   int total = 1;
   ble_page_meta(cur, total);
 
-  char meta[48];
+  char meta[96];
   const char up = (cur > 1) ? 'u' : '-';
   const char down = (cur < total) ? 'v' : '-';
-  std::snprintf(meta, sizeof(meta), "[%s %c/%c]", ble_page_label(ui_mode), up, down);
+  std::snprintf(meta, sizeof(meta), "[%s %c%c]", ble_page_label(ui_mode), up, down);
   return std::string(meta);
 }
 
-static int ble_countdown_value() {
-  int64_t slot_ms = rtc_now_ms() % 15000;
+static const char* menu_edit_label(int idx) {
+  switch (idx) {
+    case 3:  return "Call";
+    case 4:  return "Grid";
+    case 7:  return "Cursor";
+    case 9:  return "IgnoreList";
+    case 10: return "Comment";
+    case 15: return "Max Retry";
+    default: return "Edit";
+  }
+}
+
+static std::string ble_menu_long_edit_label() {
+  switch (menu_long_kind) {
+    case LONG_FT:
+      return "F";
+    case LONG_COMMENT:
+      return "C";
+    case LONG_ACTIVE:
+      return "ActiveBand";
+    case LONG_IGNORE:
+      return "IgnoreList";
+    case LONG_NONE:
+    default:
+      return "Edit";
+  }
+}
+
+static std::string ble_text_mode_line7() {
+  std::string item = "Edit";
+
+  if (menu_delete_confirm) {
+    item = "Delete Logs";
+  } else if (menu_long_edit) {
+    item = ble_menu_long_edit_label();
+  } else if (menu_edit_idx >= 0) {
+    item = menu_edit_label(menu_edit_idx);
+  } else if (band_edit_idx >= 0 && band_edit_idx < (int)g_bands.size()) {
+    item = std::string("Band ") + g_bands[band_edit_idx].name;
+  } else if (status_edit_idx == 4) {
+    item = "Date";
+  } else if (status_edit_idx == 5) {
+    item = "Time";
+  }
+
+  return std::string("[Edit ") + item + "]";
+}
+
+static void ble_slot_second_now(int64_t& slot_idx, int& sec, bool& even_slot) {
+  int64_t now_ms = rtc_now_ms();
+  int64_t slot_ms = now_ms % 15000;
   if (slot_ms < 0) slot_ms += 15000;
-  int sec = (int)(slot_ms / 1000);
+  slot_idx = (now_ms - slot_ms) / 15000;
+  sec = (int)(slot_ms / 1000);
   if (sec < 0) sec = 0;
   if (sec > 14) sec = 14;
-  return sec;
+  even_slot = ((slot_idx & 1) == 0);
+}
+
+static std::string ble_timing_token(int sec, bool even_slot, bool txing) {
+  if (sec == 0) return "|";
+  if (sec == 4) return "4";
+  if (sec == 8) return "8";
+  if (sec == 12) return "12";
+  if (txing && (sec == 2 || sec == 6 || sec == 10 || sec == 14)) return "o";
+  return even_slot ? ":" : ".";
 }
 
 static void ble_mirror_tick() {
@@ -3086,7 +3188,7 @@ static void ble_mirror_tick() {
   ui_get_visible_text_lines(lines);
   while ((int)lines.size() < 6) lines.push_back("");
 
-  const std::string meta = ble_meta_line();
+  const std::string line7 = g_ble_text_mode ? ble_text_mode_line7() : ble_meta_line();
 
   std::string screen_key;
   screen_key.reserve(256);
@@ -3094,35 +3196,46 @@ static void ble_mirror_tick() {
     screen_key += lines[i];
     screen_key.push_back('\n');
   }
-  screen_key += meta;
-  screen_key += " ";
-
-  const int countdown = ble_countdown_value();
-  char cd_buf[4];
-  std::snprintf(cd_buf, sizeof(cd_buf), "%d", countdown);
+  screen_key += line7;
 
   if (g_ble_force_send || screen_key != g_ble_last_payload) {
     g_ble_force_send = false;
     g_ble_last_payload = screen_key;
-    g_ble_last_countdown = countdown;
+    if (g_ble_last_tick_slot < 0 || g_ble_last_tick_sec < 0) {
+      int64_t slot_idx = 0;
+      int sec = 0;
+      bool even_slot = true;
+      ble_slot_second_now(slot_idx, sec, even_slot);
+      (void)even_slot;
+      g_ble_last_tick_slot = slot_idx;
+      g_ble_last_tick_sec = sec;
+    }
     std::string out;
     out.reserve(screen_key.size() + 40);
     out += "\n==========================\n";
     out += screen_key;
-    out += cd_buf;
     ble_notify_payload(out);
   }
 }
 
 static void ble_countdown_tick() {
   if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
-  if (g_ble_last_countdown < 0) return;
 
-  const int countdown = ble_countdown_value();
-  if (countdown == g_ble_last_countdown) return;
+  int64_t slot_idx = 0;
+  int sec = 0;
+  bool even_slot = true;
+  ble_slot_second_now(slot_idx, sec, even_slot);
 
-  ble_notify_payload(std::to_string(countdown));
-  g_ble_last_countdown = countdown;
+  if (g_ble_last_tick_slot == slot_idx && g_ble_last_tick_sec == sec) return;
+  if (g_ble_last_tick_slot < 0 || g_ble_last_tick_sec < 0) {
+    g_ble_last_tick_slot = slot_idx;
+    g_ble_last_tick_sec = sec;
+    return;
+  }
+
+  g_ble_last_tick_slot = slot_idx;
+  g_ble_last_tick_sec = sec;
+  ble_notify_payload(ble_timing_token(sec, even_slot, g_tx_active));
 }
 
 static void ble_on_sync(void) {
@@ -3177,7 +3290,7 @@ static void ble_app_advertise(void) {
 }
 
 #else  // ENABLE_BLE
-static bool ble_pop_command(char& out) { (void)out; return false; }
+static bool ble_pop_input(BleUiInput& out) { (void)out; return false; }
 static void ble_update_name_from_station(bool restart_adv) { (void)restart_adv; }
 static void ble_mirror_tick() {}
 static void ble_countdown_tick() {}
@@ -3751,6 +3864,138 @@ static void enter_mode(UIMode new_mode) {
   }
 }
 
+#if ENABLE_BLE
+static void ble_enter_text_mode() {
+  g_ble_text_mode = true;
+}
+
+static void ble_exit_text_mode() {
+  g_ble_text_mode = false;
+}
+
+static bool ble_text_target_active() {
+  return menu_delete_confirm ||
+         menu_long_edit ||
+         menu_edit_idx >= 0 ||
+         band_edit_idx >= 0 ||
+         status_edit_idx == 4 ||
+         status_edit_idx == 5;
+}
+
+static void ble_commit_text_input(const BleUiInput& input) {
+  std::string value = ble_trim_trailing_crlf(input.data, input.len);
+
+  if (menu_delete_confirm) {
+    const char ans = value.empty() ? '\0' : value[0];
+    if (ans == 'Y' || ans == 'y') {
+      esp_err_t err = delete_logs_on_spiffs_keep_stationdata();
+      menu_delete_confirm = false;
+      menu_flash_idx = 17; // abs index of line 6 on page 2
+      menu_flash_deadline = rtc_now_ms() + 500;
+      debug_log_line(err == ESP_OK ? "Logs deleted" : "Delete failed");
+      draw_menu_view();
+    } else {
+      menu_delete_confirm = false;
+      draw_menu_view();
+    }
+    ble_exit_text_mode();
+    return;
+  }
+
+  if (menu_long_edit) {
+    if (menu_long_kind == LONG_IGNORE && value.size() > kIgnorePrefixTextMaxLen) {
+      value.resize(kIgnorePrefixTextMaxLen);
+    }
+    menu_long_buf = value;
+    if (menu_long_kind == LONG_FT) {
+      g_free_text = menu_long_buf;
+      if (g_cq_type == CqType::CQFREETEXT) g_cq_freetext = g_free_text;
+      update_autoseq_cq_type();
+    } else if (menu_long_kind == LONG_COMMENT) {
+      g_comment1 = menu_long_buf;
+    } else if (menu_long_kind == LONG_ACTIVE) {
+      g_active_band_text = menu_long_buf;
+      rebuild_active_bands();
+    } else if (menu_long_kind == LONG_IGNORE) {
+      g_ignore_prefix_text = clamp_ignore_prefix_text(menu_long_buf);
+      rebuild_ignore_prefixes();
+    }
+    save_station_data();
+    menu_long_edit = false;
+    menu_long_kind = LONG_NONE;
+    menu_long_buf.clear();
+    menu_long_backup.clear();
+    draw_menu_view();
+    ble_exit_text_mode();
+    return;
+  }
+
+  if (menu_edit_idx >= 0) {
+    if (menu_edit_idx == 7 && value.size() > 10) value.resize(10);
+    if (menu_edit_idx == 15 && value.size() > 10) value.resize(10);
+    menu_edit_buf = value;
+
+    // Absolute indices across pages
+    if (menu_edit_idx == 3) { g_call = menu_edit_buf; autoseq_set_station(g_call, g_grid); }
+    else if (menu_edit_idx == 4) { g_grid = menu_edit_buf; autoseq_set_station(g_call, g_grid); }
+    else if (menu_edit_idx == 7) { g_offset_hz = atoi(menu_edit_buf.c_str()); redraw_countdown_now(); }
+    else if (menu_edit_idx == 10) { g_comment1 = menu_edit_buf; }
+    else if (menu_edit_idx == 15) {
+      int v = atoi(menu_edit_buf.c_str());
+      if (v < 0) v = 0;
+      g_autoseq_max_retry = v;
+      autoseq_set_max_retry(g_autoseq_max_retry);
+    }
+    if (menu_edit_idx == 3) {
+      ble_update_name_from_station(true);
+    }
+    save_station_data();
+    menu_edit_idx = -1;
+    menu_edit_buf.clear();
+    draw_menu_view();
+    ble_exit_text_mode();
+    return;
+  }
+
+  if (band_edit_idx >= 0) {
+    if (value.size() > 10) value.resize(10);
+    band_edit_buffer = value;
+    if (!band_edit_buffer.empty()) {
+      char* end = nullptr;
+      long v = std::strtol(band_edit_buffer.c_str(), &end, 10);
+      if (end != band_edit_buffer.c_str() && *end == '\0') {
+        g_bands[band_edit_idx].freq = (int)v;
+        save_station_data();
+      }
+    }
+    band_edit_idx = -1;
+    band_edit_buffer.clear();
+    draw_band_view();
+    ble_exit_text_mode();
+    return;
+  }
+
+  if (status_edit_idx == 4 || status_edit_idx == 5) {
+    const size_t max_len = status_edit_buffer.size();
+    if (value.size() > max_len) value.resize(max_len);
+    status_edit_buffer = value;
+    if (status_edit_idx == 4) g_date = status_edit_buffer;
+    else g_time = status_edit_buffer;
+    save_station_data();
+    rtc_set_from_strings();
+    rtc_sync_to_hw();  // Persist to hardware RTC
+    status_edit_idx = -1;
+    status_cursor_pos = -1;
+    status_edit_buffer.clear();
+    draw_status_view();
+    ble_exit_text_mode();
+    return;
+  }
+
+  ble_exit_text_mode();
+}
+#endif
+
 static void app_task_core0(void* /*param*/) {
   esp_vfs_spiffs_conf_t conf = {
     .base_path = "/spiffs",
@@ -3837,11 +4082,18 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       }
     }
     if (c == 0) {
-      char ble_cmd = 0;
-      if (ble_pop_command(ble_cmd)) {
-        c = ble_cmd;
+      BleUiInput ble_input{};
+      if (ble_pop_input(ble_input)) {
         c_from_ble = true;
         last_key = 0;  // allow repeated BLE commands without local debounce suppression
+#if ENABLE_BLE
+        if (g_ble_text_mode) {
+          ble_commit_text_input(ble_input);
+        } else {
+          c = ble_parse_ui_command(ble_input.data, ble_input.len);
+          if (c == 0) c_from_ble = false;
+        }
+#endif
       }
     }
 
@@ -4147,9 +4399,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         break;
       }
         case UIMode::BAND: {
-          if (c_from_ble && band_edit_idx >= 0) {
-            break;  // BLE does not participate in band frequency text edit.
-          }
           if (band_edit_idx >= 0) {
             if (c >= '0' && c <= '9') { band_edit_buffer.push_back(c); draw_band_view(); }
             else if (c == 0x08 || c == 0x7f) {
@@ -4170,21 +4419,20 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
             } else if (c == '.') {
               if ((band_page + 1) * 6 < (int)g_bands.size()) { band_page++; draw_band_view(); }
             } else if (c >= '1' && c <= '6') {
-              if (c_from_ble) break;  // BLE must not enter band frequency text edit.
               int idx = band_page * 6 + (c - '1');
               if (idx >= 0 && idx < (int)g_bands.size()) {
                 band_edit_idx = idx;
                 band_edit_buffer = std::to_string(g_bands[idx].freq);
                 draw_band_view();
+#if ENABLE_BLE
+                if (c_from_ble) ble_enter_text_mode();
+#endif
               }
             }
           }
           break;
         }
         case UIMode::STATUS: {
-        if (c_from_ble && status_edit_idx != -1) {
-          break;  // BLE does not participate in status text edit flow.
-        }
         if (status_edit_idx == -1) {
           if (c == '1') { g_status_beacon_temp = (BeaconMode)(((int)g_status_beacon_temp + 1) % 3); draw_status_view(); }
           else if (c == '2') {
@@ -4232,14 +4480,16 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 draw_status_view();
               }
               else if (c == '5') {
-                if (!c_from_ble) {
-                  status_edit_idx = 4; status_edit_buffer = g_date; status_cursor_pos = 0; while (status_cursor_pos < (int)status_edit_buffer.size() && (status_edit_buffer[status_cursor_pos] == '-')) status_cursor_pos++; draw_status_view();
-                }
+                status_edit_idx = 4; status_edit_buffer = g_date; status_cursor_pos = 0; while (status_cursor_pos < (int)status_edit_buffer.size() && (status_edit_buffer[status_cursor_pos] == '-')) status_cursor_pos++; draw_status_view();
+#if ENABLE_BLE
+                if (c_from_ble) ble_enter_text_mode();
+#endif
               }
               else if (c == '6') {
-                if (!c_from_ble) {
-                  status_edit_idx = 5; status_edit_buffer = g_time; status_cursor_pos = 0; while (status_cursor_pos < (int)status_edit_buffer.size() && (status_edit_buffer[status_cursor_pos] == ':')) status_cursor_pos++; draw_status_view();
-                }
+                status_edit_idx = 5; status_edit_buffer = g_time; status_cursor_pos = 0; while (status_cursor_pos < (int)status_edit_buffer.size() && (status_edit_buffer[status_cursor_pos] == ':')) status_cursor_pos++; draw_status_view();
+#if ENABLE_BLE
+                if (c_from_ble) ble_enter_text_mode();
+#endif
               }
             } else {
               if (status_edit_idx == 1) {
@@ -4355,9 +4605,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         case UIMode::HOST:
         case UIMode::MENU: {
           if (ui_mode == UIMode::MENU) {
-            if (c_from_ble && (menu_long_edit || menu_edit_idx >= 0)) {
-              break;  // BLE does not support text edit input.
-            }
             if (menu_long_edit) {
               if (c == '\n' || c == '\r') {
                 if (menu_long_kind == LONG_FT) {
@@ -4516,22 +4763,28 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   }
                 }
               } else if (c == '3') {
-                if (c_from_ble) break;  // BLE must not enter free-text edit.
                 menu_long_edit = true;
                 menu_long_kind = LONG_FT;
                 menu_long_buf = g_free_text;
                 menu_long_backup = g_free_text;
                 draw_menu_view();
+#if ENABLE_BLE
+                if (c_from_ble) ble_enter_text_mode();
+#endif
               } else if (c == '4') {
-                if (c_from_ble) break;  // BLE must not enter callsign edit.
                 menu_edit_idx = 3; // Call (line index 3)
                 menu_edit_buf = g_call;
                 draw_menu_view();
+#if ENABLE_BLE
+                if (c_from_ble) ble_enter_text_mode();
+#endif
               } else if (c == '5') {
-                if (c_from_ble) break;  // BLE must not enter grid edit.
                 menu_edit_idx = 4; // Grid (line index 4)
                 menu_edit_buf = g_grid;
                 draw_menu_view();
+#if ENABLE_BLE
+                if (c_from_ble) ble_enter_text_mode();
+#endif
               } else if (c == '6') {
                   if (M5.Power.isCharging()) {
                     ESP_LOGI(TAG, "Entering deep sleep (GPIO0 wake)");
@@ -4560,11 +4813,13 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   save_station_data();
                   draw_menu_view();
                 } else if (c == '2') {
-                  if (c_from_ble) break;  // BLE must not enter cursor edit.
                   menu_edit_idx = 7; // Cursor line
                   menu_cursor_edit_original = g_offset_hz;
                   menu_edit_buf = std::to_string(g_offset_hz);
                   draw_menu_view();
+#if ENABLE_BLE
+                  if (c_from_ble) ble_enter_text_mode();
+#endif
                 } else if (c == '3') {
                   g_radio = (canonical_radio_type(g_radio) == RadioType::KH1)
                               ? RadioType::QMX
@@ -4573,19 +4828,23 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   save_station_data();
                   draw_menu_view();
                 } else if (c == '4') {
-                  if (c_from_ble) break;  // BLE must not enter ignore-prefix edit.
                   menu_long_edit = true;
                   menu_long_kind = LONG_IGNORE;
                   menu_long_buf = g_ignore_prefix_text;
                   menu_long_backup = g_ignore_prefix_text;
                   draw_menu_view();
+#if ENABLE_BLE
+                  if (c_from_ble) ble_enter_text_mode();
+#endif
                 } else if (c == '5') {
-                  if (c_from_ble) break;  // BLE must not enter comment edit.
                   menu_long_edit = true;
                   menu_long_kind = LONG_COMMENT;
                   menu_long_buf = g_comment1;
                   menu_long_backup = g_comment1;
                   draw_menu_view();
+#if ENABLE_BLE
+                  if (c_from_ble) ble_enter_text_mode();
+#endif
                 }
             } else if (menu_page == 2) {
               if (c == '1') {
@@ -4598,17 +4857,21 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 save_station_data();
                 draw_menu_view();
               } else if (c == '3') {
-                if (c_from_ble) break;  // BLE must not enter active-band edit.
                 menu_long_edit = true;
                 menu_long_kind = LONG_ACTIVE;
                 menu_long_buf = g_active_band_text;
                 menu_long_backup = g_active_band_text;
                 draw_menu_view();
+#if ENABLE_BLE
+                if (c_from_ble) ble_enter_text_mode();
+#endif
               } else if (c == '4') {
-                if (c_from_ble) break;  // BLE must not enter max-retry edit.
                 menu_edit_idx = 15; // Max Retry line
                 menu_edit_buf = std::to_string(g_autoseq_max_retry);
                 draw_menu_view();
+#if ENABLE_BLE
+                if (c_from_ble) ble_enter_text_mode();
+#endif
               } else if (c == '5') {
                 esp_err_t err = copy_logs_spiffs_to_sd_overwrite();
                 menu_flash_idx = 16; // abs index of page 2 line 5
@@ -4625,6 +4888,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
               } else if (c == '6') {
                 menu_delete_confirm = true;
                 draw_menu_view();
+#if ENABLE_BLE
+                if (c_from_ble) ble_enter_text_mode();
+#endif
               }
             }
           }
@@ -4632,6 +4898,12 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         }
       }
     }
+
+#if ENABLE_BLE
+    if (g_ble_text_mode && !ble_text_target_active()) {
+      ble_exit_text_mode();
+    }
+#endif
 
     vTaskDelay(pdMS_TO_TICKS(10));
   }
