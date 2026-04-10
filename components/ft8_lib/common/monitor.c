@@ -7,13 +7,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Static buffer sizing for default FT8/FT4 settings at 12 kHz sample rate
-#define WINDOW_BUF_SIZE 3840
-#define LAST_FRAME_BUF_SIZE 3840
-// Allow ~480 base bins (covers ~200-3200 Hz at 6.25 Hz/bin with margin) with time_osr=2, freq_osr=2, 93 blocks
-#define WATERFALL_MAG_BUF_SIZE (93 * 2 * 2 * 480)
-
-#define FFT_WORK_MAX 80000
+// Maximum nfft for static buffer sizing.
+// FT8 at 6kHz, freq_osr=1: nfft = 6000 * 0.160 * 1 = 960
+// FT8 at 12kHz, freq_osr=1: nfft = 12000 * 0.160 * 1 = 1920
+// Set to 1920 to cover both configurations.
+#define MONITOR_NFFT_MAX 1920
 
 static float* window_buf = NULL;
 static float* last_frame_buf = NULL;
@@ -130,15 +128,18 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
     me->wf.mag = waterfall_mag_buf;
     me->wf.protocol = cfg->protocol;
 
-    // Allocate window and analysis frame last
-    window_buf = (float*)malloc(sizeof(float) * me->nfft);
-    last_frame_buf = (float*)calloc(me->nfft, sizeof(float));
-    if (window_buf == NULL || last_frame_buf == NULL)
+    // Static window and analysis frame — avoids heap fragmentation
+    static float window_static[MONITOR_NFFT_MAX];
+    static float last_frame_static[MONITOR_NFFT_MAX];
+    if (me->nfft > MONITOR_NFFT_MAX)
     {
-        LOG(LOG_ERROR, "Monitor alloc failed (window/frame)\n");
+        LOG(LOG_ERROR, "Monitor nfft %d exceeds static buffer %d\n", me->nfft, MONITOR_NFFT_MAX);
         monitor_free(me);
         return;
     }
+    window_buf = window_static;
+    last_frame_buf = last_frame_static;
+    memset(last_frame_buf, 0, sizeof(float) * me->nfft);
 
     me->window = window_buf;
     for (int i = 0; i < me->nfft; ++i)
@@ -170,8 +171,9 @@ void monitor_free(monitor_t* me)
 {
     waterfall_free(&me->wf);
     fft_plan_free(&me->fft_plan);
-    if (window_buf) { free(window_buf); window_buf = NULL; }
-    if (last_frame_buf) { free(last_frame_buf); last_frame_buf = NULL; }
+    // window_buf and last_frame_buf are static arrays — just NULL the pointers
+    window_buf = NULL;
+    last_frame_buf = NULL;
     if (fft_work_buf) { free(fft_work_buf); fft_work_buf = NULL; }
 }
 
@@ -191,27 +193,12 @@ void monitor_process(monitor_t* me, const float* frame)
     int offset = me->wf.num_blocks * me->wf.block_stride;
     int frame_pos = 0;
 
-    // Heap buffers to avoid large stack use
-    static kiss_fft_scalar* timedata = NULL;
-    static int timedata_len = 0;
-    static kiss_fft_cpx* freqdata = NULL;
-    static int freqdata_len = 0;
-
-    if (me->nfft > timedata_len)
+    // Static FFT work buffers — avoids heap allocation in the hot path
+    static kiss_fft_scalar timedata[MONITOR_NFFT_MAX];
+    static kiss_fft_cpx   freqdata[MONITOR_NFFT_MAX / 2 + 1];
+    if (me->nfft > MONITOR_NFFT_MAX)
     {
-        free(timedata);
-        timedata = (kiss_fft_scalar*)malloc(sizeof(kiss_fft_scalar) * me->nfft);
-        timedata_len = me->nfft;
-    }
-    if ((me->nfft / 2 + 1) > freqdata_len)
-    {
-        free(freqdata);
-        freqdata = (kiss_fft_cpx*)malloc(sizeof(kiss_fft_cpx) * (me->nfft / 2 + 1));
-        freqdata_len = me->nfft / 2 + 1;
-    }
-    if (timedata == NULL || freqdata == NULL)
-    {
-        LOG(LOG_ERROR, "monitor_process alloc failed\n");
+        LOG(LOG_ERROR, "nfft %d exceeds static buffer %d\n", me->nfft, MONITOR_NFFT_MAX);
         return;
     }
 
