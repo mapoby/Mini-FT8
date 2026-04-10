@@ -29,6 +29,7 @@ static int last_page = -1;
 static std::string g_visible_rows[RX_LINES];
 
 static SemaphoreHandle_t g_disp_mutex = nullptr;
+static SemaphoreHandle_t g_waterfall_mutex = nullptr;
 
 static void disp_lock() {
     if (g_disp_mutex) {
@@ -39,6 +40,18 @@ static void disp_lock() {
 static void disp_unlock() {
     if (g_disp_mutex) {
         xSemaphoreGive(g_disp_mutex);
+    }
+}
+
+static void waterfall_lock() {
+    if (g_waterfall_mutex) {
+        xSemaphoreTake(g_waterfall_mutex, portMAX_DELAY);
+    }
+}
+
+static void waterfall_unlock() {
+    if (g_waterfall_mutex) {
+        xSemaphoreGive(g_waterfall_mutex);
     }
 }
 
@@ -54,8 +67,13 @@ static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
 void ui_set_paused(bool paused) { ui_paused = paused; }
 bool ui_is_paused() { return ui_paused; }
 
-bool ui_waterfall_dirty() { return waterfall_dirty; }
-void ui_draw_waterfall_if_dirty() { if (waterfall_dirty) ui_draw_waterfall(); }
+bool ui_waterfall_dirty() {
+    waterfall_lock();
+    bool dirty = waterfall_dirty;
+    waterfall_unlock();
+    return dirty;
+}
+void ui_draw_waterfall_if_dirty() { if (ui_waterfall_dirty()) ui_draw_waterfall(); }
 
 // Draw TX view: line 1 = next, lines 2-6 from queue/page
 // slot_colors: optional per-line slot parity (0 even, 1 odd) for coloring text
@@ -105,6 +123,7 @@ void ui_draw_tx(const std::string& next, const std::vector<std::string>& queue, 
 
 void ui_init() {
     g_disp_mutex = xSemaphoreCreateMutex();
+    g_waterfall_mutex = xSemaphoreCreateMutex();
     auto cfg = M5.config();
     cfg.output_power = true;
     cfg.external_rtc = false;
@@ -117,38 +136,50 @@ void ui_init() {
 void ui_set_waterfall_row(int row, const uint8_t* bins, int len) {
     if (len > SCREEN_W) len = SCREEN_W;
     if (row < 0 || row >= WATERFALL_H) return;
+    waterfall_lock();
     memcpy(waterfall[row], bins, len);
+    waterfall_unlock();
 }
 
 void ui_push_waterfall_row(const uint8_t* bins, int len) {
     if (ui_paused) return;
     if (len > SCREEN_W) len = SCREEN_W;
+    waterfall_lock();
     memcpy(waterfall[waterfall_head], bins, len);
     if (len < SCREEN_W) {
         memset(waterfall[waterfall_head] + len, 0, SCREEN_W - len);
     }
     waterfall_head = (waterfall_head + 1) % WATERFALL_H;
     waterfall_dirty = true;
+    waterfall_unlock();
 }
 
 void ui_clear_waterfall() {
+    waterfall_lock();
     for (int r = 0; r < WATERFALL_H; ++r) {
         memset(waterfall[r], 0, SCREEN_W);
     }
     waterfall_head = 0;
     waterfall_dirty = true;
+    waterfall_unlock();
     ui_draw_waterfall();
 }
 
 void ui_draw_waterfall() {
+    uint8_t snapshot[WATERFALL_H][SCREEN_W];
+    int snapshot_head = 0;
+    waterfall_lock();
+    memcpy(snapshot, waterfall, sizeof(snapshot));
+    snapshot_head = waterfall_head;
     waterfall_dirty = false;
+    waterfall_unlock();
     if (ui_paused) return;
     DispGuard guard;
     int dst_y = 0;
     for (int i = 0; i < WATERFALL_H; ++i) {
-        int src = (waterfall_head + i) % WATERFALL_H;
+        int src = (snapshot_head + i) % WATERFALL_H;
         for (int x = 0; x < SCREEN_W; ++x) {
-            uint8_t v = waterfall[src][x];
+            uint8_t v = snapshot[src][x];
             // Yellow gradient on black background
             uint8_t r = v;
             uint8_t g = v;

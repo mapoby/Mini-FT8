@@ -22,13 +22,15 @@ extern "C" {
 #include <cstring>
 #include <cmath>
 #include <inttypes.h>
+#include <cstdarg>
+#include <atomic>
 
 static const char* TAG = "UAC_STREAM";
 extern void log_heap(const char* tag);
 
 // External references from main.cpp
-extern bool g_streaming;
-extern bool g_decode_enabled;
+extern std::atomic_bool g_streaming;
+extern std::atomic_bool g_decode_enabled;
 extern int g_time_osr;
 extern int g_freq_osr;
 extern int64_t g_decode_slot_idx;
@@ -87,7 +89,8 @@ static cdc_acm_dev_hdl_t s_cdc_handle = NULL;
 static TaskHandle_t s_usb_task_handle = NULL;
 static TaskHandle_t s_uac_task_handle = NULL;
 static TaskHandle_t s_stream_task_handle = NULL;
-static volatile bool s_stop_requested = false;
+static std::atomic_bool s_stop_requested{false};
+static SemaphoreHandle_t s_state_mutex = NULL;
 static char s_status_string[64] = "Idle";
 static uac_stream_profile_t s_profile = UAC_PROFILE_QMX;
 static uac_active_format_t s_format = {
@@ -105,6 +108,48 @@ static constexpr uint16_t k_qmx_pid = 0xA34C;
 // Debug display buffers
 static char s_debug_line1[64] = "";
 static char s_debug_line2[64] = "";
+
+static bool uac_state_take(TickType_t timeout = portMAX_DELAY) {
+    return s_state_mutex && (xSemaphoreTake(s_state_mutex, timeout) == pdTRUE);
+}
+
+static void uac_state_give() {
+    if (s_state_mutex) xSemaphoreGive(s_state_mutex);
+}
+
+static bool uac_stop_requested(void) {
+    return s_stop_requested.load(std::memory_order_acquire);
+}
+
+static void uac_set_stop_requested(bool requested) {
+    s_stop_requested.store(requested, std::memory_order_release);
+}
+
+static void uac_set_statusf(const char* fmt, ...) {
+    if (!uac_state_take()) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(s_status_string, sizeof(s_status_string), fmt, ap);
+    va_end(ap);
+    uac_state_give();
+}
+
+static void uac_set_state_statusf(uac_stream_state_t state, const char* fmt, ...) {
+    if (!uac_state_take()) return;
+    va_list ap;
+    va_start(ap, fmt);
+    s_state = state;
+    vsnprintf(s_status_string, sizeof(s_status_string), fmt, ap);
+    va_end(ap);
+    uac_state_give();
+}
+
+static uac_stream_state_t uac_get_state_locked(void) {
+    if (!uac_state_take()) return UAC_STATE_IDLE;
+    uac_stream_state_t state = s_state;
+    uac_state_give();
+    return state;
+}
 
 // Resampler state
 static resample_state_t s_resample_state;
@@ -309,8 +354,7 @@ static void uac_device_callback(uac_host_device_handle_t handle,
         cdc_close();
         if (handle == s_mic_handle) {
             s_mic_handle = NULL;
-            s_state = UAC_STATE_WAITING;
-            snprintf(s_status_string, sizeof(s_status_string), "Disconnected");
+            uac_set_state_statusf(UAC_STATE_WAITING, "Disconnected");
         }
         uac_host_device_close(handle);
         return;
@@ -346,8 +390,7 @@ static void usb_lib_task(void* arg) {
     esp_err_t err = usb_host_install(&host_config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to install USB host: %s", esp_err_to_name(err));
-        s_state = UAC_STATE_ERROR;
-        snprintf(s_status_string, sizeof(s_status_string), "USB init failed");
+        uac_set_state_statusf(UAC_STATE_ERROR, "USB init failed");
         vTaskDelete(NULL);
         return;
     }
@@ -371,7 +414,7 @@ static void usb_lib_task(void* arg) {
 
     xTaskNotifyGive((TaskHandle_t)arg);
 
-    while (!s_stop_requested) {
+    while (!uac_stop_requested()) {
         uint32_t event_flags;
         err = usb_host_lib_handle_events(pdMS_TO_TICKS(100), &event_flags);
         if (err == ESP_OK) {
@@ -412,18 +455,16 @@ static void uac_lib_task(void* arg) {
     esp_err_t err = uac_host_install(&uac_config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to install UAC driver: %s", esp_err_to_name(err));
-        s_state = UAC_STATE_ERROR;
-        snprintf(s_status_string, sizeof(s_status_string), "UAC init failed");
+        uac_set_state_statusf(UAC_STATE_ERROR, "UAC init failed");
         vTaskDelete(NULL);
         return;
     }
 
     ESP_LOGI(TAG, "UAC driver installed");
-    s_state = UAC_STATE_WAITING;
-    snprintf(s_status_string, sizeof(s_status_string), "Waiting for device");
+    uac_set_state_statusf(UAC_STATE_WAITING, "Waiting for device");
 
     uac_event_t evt;
-    while (!s_stop_requested) {
+    while (!uac_stop_requested()) {
         if (xQueueReceive(s_event_queue, &evt, pdMS_TO_TICKS(100))) {
             if (evt.type == UAC_EVT_STOP) {
                 break;
@@ -450,7 +491,7 @@ static void uac_lib_task(void* arg) {
                     err = uac_host_device_open(&dev_config, &handle);
                     if (err != ESP_OK) {
                         ESP_LOGE(TAG, "Failed to open device: %s", esp_err_to_name(err));
-                        snprintf(s_status_string, sizeof(s_status_string), "Open failed");
+                        uac_set_statusf("Open failed");
                         continue;
                     }
 
@@ -499,20 +540,18 @@ static void uac_lib_task(void* arg) {
 
                     if (!started) {
                         ESP_LOGE(TAG, "Failed to start stream for profile=%s", profile_name(s_profile));
-                        snprintf(s_status_string, sizeof(s_status_string), "Format not supported");
+                        uac_set_statusf("Format not supported");
                         uac_host_device_close(handle);
                         continue;
                     }
 
                     s_mic_handle = handle;
-                    s_state = UAC_STATE_STREAMING;
-                    g_streaming = true;
-                    snprintf(s_status_string, sizeof(s_status_string),
-                             "Streaming %s %luk/%u/%u",
-                             profile_name(s_profile),
-                             (unsigned long)(s_format.sample_freq / 1000),
-                             s_format.bit_resolution,
-                             s_format.channels);
+                    g_streaming.store(true, std::memory_order_release);
+                    uac_set_state_statusf(UAC_STATE_STREAMING, "Streaming %s %luk/%u/%u",
+                                          profile_name(s_profile),
+                                          (unsigned long)(s_format.sample_freq / 1000),
+                                          s_format.bit_resolution,
+                                          s_format.channels);
 
                     // Try to open companion CDC-ACM interface (CAT)
                     cdc_try_open();
@@ -602,7 +641,7 @@ static void stream_uac_task(void* arg) {
     int64_t slot_start_ms = slot_idx * 15000;
     (void)slot_start_ms; // silence unused warning
 
-    while (!s_stop_requested && s_mic_handle != NULL) {
+    while (!uac_stop_requested() && s_mic_handle != NULL) {
         // Read USB audio data
         uint32_t bytes_read = 0;
         esp_err_t ret = uac_host_device_read(s_mic_handle, usb_buffer,
@@ -635,14 +674,17 @@ static void stream_uac_task(void* arg) {
                 int16_t v16 = (int16_t)(usb_buffer[0] | (usb_buffer[1] << 8));
                 val = v16;
             }
-            snprintf(s_debug_line1, sizeof(s_debug_line1),
-                     "fmt=%lu/%u/%u v=%ld",
-                     (unsigned long)s_format.sample_freq,
-                     s_format.bit_resolution,
-                     s_format.channels,
-                     (long)val);
-            snprintf(s_debug_line2, sizeof(s_debug_line2),
-                     "rd=%lu fb=%d rem=%d", (unsigned long)bytes_read, frame_bytes, remainder);
+            if (uac_state_take()) {
+                snprintf(s_debug_line1, sizeof(s_debug_line1),
+                         "fmt=%lu/%u/%u v=%ld",
+                         (unsigned long)s_format.sample_freq,
+                         s_format.bit_resolution,
+                         s_format.channels,
+                         (long)val);
+                snprintf(s_debug_line2, sizeof(s_debug_line2),
+                         "rd=%lu fb=%d rem=%d", (unsigned long)bytes_read, frame_bytes, remainder);
+                uac_state_give();
+            }
         }
 
         if (num_frames == 0) continue;
@@ -654,7 +696,7 @@ static void stream_uac_task(void* arg) {
                                                  s_format.channels);
 
         // Accumulate into ft8_buffer
-        for (int i = 0; i < samples_12k && !s_stop_requested; i++) {
+        for (int i = 0; i < samples_12k && !uac_stop_requested(); i++) {
             ft8_buffer[ft8_buffer_idx++] = temp_12k[i];
 
             // When we have a full block (1920 samples = 160ms)
@@ -705,7 +747,7 @@ static void stream_uac_task(void* arg) {
                 } else if (slot_blocks >= 79 && mon.wf.num_blocks >= 79) {
                     ESP_LOGI(TAG, "Triggering decode at slot %lld blocks=%d wf=%d",
                              (long long)slot_idx, slot_blocks, mon.wf.num_blocks);
-                    if (g_decode_enabled) {
+                    if (g_decode_enabled.load(std::memory_order_acquire)) {
                         g_decode_slot_idx = slot_idx;
                         g_decode_in_progress = true;  // Block TX trigger until decode finishes
                         decode_monitor_results(&mon, &mon_cfg, false);
@@ -728,7 +770,7 @@ static void stream_uac_task(void* arg) {
     free(temp_12k);
     monitor_free(&mon);
 
-    g_streaming = false;
+    g_streaming.store(false, std::memory_order_release);
     s_stream_task_handle = NULL;
     ESP_LOGI(TAG, "Audio streaming task stopped");
     vTaskDelete(NULL);
@@ -736,15 +778,23 @@ static void stream_uac_task(void* arg) {
 
 // Public API implementation
 uac_stream_state_t uac_get_state(void) {
-    return s_state;
+    return uac_get_state_locked();
 }
 
 bool uac_is_streaming(void) {
-    return s_state == UAC_STATE_STREAMING && s_mic_handle != NULL;
+    return uac_get_state_locked() == UAC_STATE_STREAMING && s_mic_handle != NULL;
 }
 
 bool uac_start_with_profile(uac_stream_profile_t profile) {
-    if (s_state != UAC_STATE_IDLE) {
+    if (!s_state_mutex) {
+        s_state_mutex = xSemaphoreCreateMutex();
+        if (!s_state_mutex) {
+            ESP_LOGE(TAG, "Failed to create state mutex");
+            return false;
+        }
+    }
+
+    if (uac_get_state_locked() != UAC_STATE_IDLE) {
         ESP_LOGW(TAG, "UAC already started");
         return false;
     }
@@ -758,7 +808,7 @@ bool uac_start_with_profile(uac_stream_profile_t profile) {
     s_format.channels = UAC_CHANNELS;
 
     ESP_LOGI(TAG, "Starting UAC host profile=%s", profile_name(s_profile));
-    s_stop_requested = false;
+    uac_set_stop_requested(false);
     resample_init(&s_resample_state);
 
     // Create event queue
@@ -787,7 +837,7 @@ bool uac_start_with_profile(uac_stream_profile_t profile) {
                                    &s_usb_task_handle, 0);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create USB task");
-        s_stop_requested = true;
+        uac_set_stop_requested(true);
         vTaskDelete(s_uac_task_handle);
         s_uac_task_handle = NULL;
         vQueueDelete(s_event_queue);
@@ -795,8 +845,7 @@ bool uac_start_with_profile(uac_stream_profile_t profile) {
         return false;
     }
 
-    s_state = UAC_STATE_WAITING;
-    snprintf(s_status_string, sizeof(s_status_string), "Waiting for %s", profile_name(s_profile));
+    uac_set_state_statusf(UAC_STATE_WAITING, "Waiting for %s", profile_name(s_profile));
     return true;
 }
 
@@ -805,13 +854,13 @@ bool uac_start(void) {
 }
 
 void uac_stop(void) {
-    if (s_state == UAC_STATE_IDLE) {
+    if (uac_get_state_locked() == UAC_STATE_IDLE) {
         return;
     }
 
     ESP_LOGI(TAG, "Stopping UAC host");
-    s_stop_requested = true;
-    g_streaming = false;
+    uac_set_stop_requested(true);
+    g_streaming.store(false, std::memory_order_release);
     cdc_close();
 
     // Send stop event
@@ -833,21 +882,35 @@ void uac_stop(void) {
         s_event_queue = NULL;
     }
 
-    s_state = UAC_STATE_IDLE;
-    snprintf(s_status_string, sizeof(s_status_string), "Idle");
+    uac_set_state_statusf(UAC_STATE_IDLE, "Idle");
     ESP_LOGI(TAG, "UAC host stopped");
 }
 
 const char* uac_get_status_string(void) {
-    return s_status_string;
+    static char snapshot[sizeof(s_status_string)] = "Idle";
+    if (uac_state_take()) {
+        snprintf(snapshot, sizeof(snapshot), "%s", s_status_string);
+        uac_state_give();
+    }
+    return snapshot;
 }
 
 const char* uac_get_debug_line1(void) {
-    return s_debug_line1;
+    static char snapshot[sizeof(s_debug_line1)] = "";
+    if (uac_state_take()) {
+        snprintf(snapshot, sizeof(snapshot), "%s", s_debug_line1);
+        uac_state_give();
+    }
+    return snapshot;
 }
 
 const char* uac_get_debug_line2(void) {
-    return s_debug_line2;
+    static char snapshot[sizeof(s_debug_line2)] = "";
+    if (uac_state_take()) {
+        snprintf(snapshot, sizeof(snapshot), "%s", s_debug_line2);
+        uac_state_give();
+    }
+    return snapshot;
 }
 
 bool cat_cdc_ready(void) {

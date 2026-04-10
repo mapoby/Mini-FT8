@@ -44,6 +44,7 @@ extern "C" {
 #include <cctype>
 #include <cstdlib>
 #include <ctime>
+#include <atomic>
 #include <sys/time.h>
 #include "esp_timer.h"
 #include "esp_sleep.h"
@@ -58,7 +59,7 @@ extern "C" {
 static const char* STATION_FILE = "/spiffs/Station.ini";
 static sdmmc_card_t* g_sd_card = NULL;
 static bool g_sd_mounted = false;
-static bool g_ble_enabled = true;
+static std::atomic_bool g_ble_enabled{true};
 static bool g_ble_qso_pick_mode = false;
 static bool g_ble_dump_in_progress = false;
 
@@ -101,10 +102,11 @@ struct BleUiInput {
 #if ENABLE_BLE
 
 static QueueHandle_t ble_cmd_queue = nullptr;
+static SemaphoreHandle_t g_ble_state_mutex = nullptr;
 static uint16_t gatt_tx_handle = 0;
 static uint16_t g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static bool g_ble_synced = false;
-static bool g_ble_stack_active = false;
+static std::atomic_bool g_ble_stack_active{false};
 static bool g_ble_nvs_ready = false;
 static bool g_ble_force_send = false;
 static std::string g_ble_adv_name;
@@ -136,6 +138,34 @@ static volatile bool g_ble_tx_indicate_enabled = false;
 static volatile bool g_ble_indicate_waiting = false;
 static volatile int g_ble_indicate_status = 0;
 static volatile uint16_t g_ble_att_mtu = 23;
+
+static bool ble_state_take(TickType_t timeout = portMAX_DELAY) {
+    return g_ble_state_mutex && (xSemaphoreTake(g_ble_state_mutex, timeout) == pdTRUE);
+}
+
+static void ble_state_give() {
+    if (g_ble_state_mutex) xSemaphoreGive(g_ble_state_mutex);
+}
+
+static bool ble_state_is_text_mode() {
+    if (!ble_state_take()) return false;
+    bool v = g_ble_text_mode;
+    ble_state_give();
+    return v;
+}
+
+static bool ble_state_is_qso_pick_mode() {
+    if (!ble_state_take()) return false;
+    bool v = g_ble_qso_pick_mode;
+    ble_state_give();
+    return v;
+}
+
+static void ble_state_set_qso_pick_mode(bool enabled) {
+    if (!ble_state_take()) return;
+    g_ble_qso_pick_mode = enabled;
+    ble_state_give();
+}
 
 static constexpr int kBleDumpIndicateAckTimeoutMs = 1500;
 static constexpr int kBleDumpIndicateMaxRetries = 3;
@@ -295,6 +325,7 @@ static void ble_delete_cmd_queue(void) {
 }
 
 static void ble_reset_runtime_state(void) {
+    if (g_ble_state_mutex && !ble_state_take()) return;
     gatt_tx_handle = 0;
     g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
     g_ble_synced = false;
@@ -312,6 +343,7 @@ static void ble_reset_runtime_state(void) {
     g_ble_indicate_status = 0;
     g_ble_att_mtu = 23;
     g_ble_dump_xfer = BleDumpTransferState{};
+    if (g_ble_state_mutex) ble_state_give();
 }
 
 static bool ble_ensure_nvs_ready(void) {
@@ -331,7 +363,7 @@ static bool ble_ensure_nvs_ready(void) {
 }
 
 static bool ble_stack_start(void) {
-    if (g_ble_stack_active) return true;
+    if (g_ble_stack_active.load(std::memory_order_acquire)) return true;
     ESP_LOGI(BT_TAG, "BLE stack start");
 
     if (!ble_ensure_nvs_ready()) return false;
@@ -350,11 +382,11 @@ static bool ble_stack_start(void) {
     ble_svc_gatt_init();
     ESP_LOGI(BT_TAG, "GAP/GATT init done");
 
-    g_ble_stack_active = true;
+    g_ble_stack_active.store(true, std::memory_order_release);
     ble_cmd_queue = xQueueCreate(32, sizeof(BleUiInput));
     if (!ble_cmd_queue) {
         ESP_LOGE(BT_TAG, "xQueueCreate failed");
-        g_ble_stack_active = false;
+        g_ble_stack_active.store(false, std::memory_order_release);
         nimble_port_deinit();
         return false;
     }
@@ -364,7 +396,7 @@ static bool ble_stack_start(void) {
     if (rc != 0) {
         ESP_LOGE(BT_TAG, "ble_gatts_count_cfg failed: %d", rc);
         ble_delete_cmd_queue();
-        g_ble_stack_active = false;
+        g_ble_stack_active.store(false, std::memory_order_release);
         nimble_port_deinit();
         return false;
     }
@@ -372,7 +404,7 @@ static bool ble_stack_start(void) {
     if (rc != 0) {
         ESP_LOGE(BT_TAG, "ble_gatts_add_svcs failed: %d", rc);
         ble_delete_cmd_queue();
-        g_ble_stack_active = false;
+        g_ble_stack_active.store(false, std::memory_order_release);
         nimble_port_deinit();
         return false;
     }
@@ -380,13 +412,16 @@ static bool ble_stack_start(void) {
 
     ble_hs_cfg.sync_cb = ble_on_sync;
     nimble_port_freertos_init(nimble_host_task);
-    g_ble_force_send = true;
+    if (ble_state_take()) {
+        g_ble_force_send = true;
+        ble_state_give();
+    }
     ESP_LOGI(BT_TAG, "Host task started");
     return true;
 }
 
 static bool ble_stack_stop(void) {
-    if (!g_ble_stack_active) {
+    if (!g_ble_stack_active.load(std::memory_order_acquire)) {
         ble_delete_cmd_queue();
         ble_reset_runtime_state();
         return true;
@@ -394,13 +429,21 @@ static bool ble_stack_stop(void) {
 
     ESP_LOGI(BT_TAG, "BLE stack stop");
 
-    if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-        int rc = ble_gap_terminate(g_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    uint16_t conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    bool ble_synced = false;
+    if (ble_state_take()) {
+        conn_handle = g_conn_handle;
+        ble_synced = g_ble_synced;
+        ble_state_give();
+    }
+
+    if (conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        int rc = ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         if (rc != 0) {
             ESP_LOGW(BT_TAG, "ble_gap_terminate rc=%d", rc);
         }
     }
-    if (g_ble_synced) {
+    if (ble_synced) {
         int rc = ble_gap_adv_stop();
         if (rc != 0) {
             ESP_LOGW(BT_TAG, "ble_gap_adv_stop rc=%d", rc);
@@ -421,7 +464,7 @@ static bool ble_stack_stop(void) {
 
     ble_delete_cmd_queue();
     ble_reset_runtime_state();
-    g_ble_stack_active = false;
+    g_ble_stack_active.store(false, std::memory_order_release);
     ESP_LOGI(BT_TAG, "BLE stack stopped");
     return true;
 }
@@ -432,13 +475,42 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
-            g_conn_handle = event->connect.conn_handle;
-            if (!g_ble_enabled) {
-              ble_gap_terminate(g_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-              g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            if (!g_ble_enabled.load(std::memory_order_acquire)) {
+              ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+              if (ble_state_take()) {
+                  g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+                  ble_state_give();
+              }
               return 0;
             }
-            g_ble_force_send = true;
+            if (ble_state_take()) {
+                g_conn_handle = event->connect.conn_handle;
+                g_ble_force_send = true;
+                g_ble_last_tick_slot = -1;
+                g_ble_last_tick_sec = -1;
+                g_ble_text_mode = false;
+                g_ble_tx_notify_enabled = false;
+                g_ble_tx_indicate_enabled = false;
+                g_ble_indicate_waiting = false;
+                g_ble_indicate_status = 0;
+                g_ble_att_mtu = 23;
+                ble_state_give();
+            }
+            ESP_LOGI(BT_TAG, "Connected, handle=%u", event->connect.conn_handle);
+        } else {
+            if (ble_state_take()) {
+                g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+                ble_state_give();
+            }
+            ESP_LOGW(BT_TAG, "Connect failed; restarting adv");
+            ble_app_advertise();
+        }
+        break;
+
+    case BLE_GAP_EVENT_DISCONNECT:
+        if (ble_state_take()) {
+            g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            g_ble_last_payload.clear();
             g_ble_last_tick_slot = -1;
             g_ble_last_tick_sec = -1;
             g_ble_text_mode = false;
@@ -447,58 +519,53 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
             g_ble_indicate_waiting = false;
             g_ble_indicate_status = 0;
             g_ble_att_mtu = 23;
-            ESP_LOGI(BT_TAG, "Connected, handle=%u", g_conn_handle);
-        } else {
-            g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-            ESP_LOGW(BT_TAG, "Connect failed; restarting adv");
-            ble_app_advertise();
+            ble_state_give();
         }
-        break;
-
-    case BLE_GAP_EVENT_DISCONNECT:
-        g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-        g_ble_last_payload.clear();
-        g_ble_last_tick_slot = -1;
-        g_ble_last_tick_sec = -1;
-        g_ble_text_mode = false;
-        g_ble_tx_notify_enabled = false;
-        g_ble_tx_indicate_enabled = false;
-        g_ble_indicate_waiting = false;
-        g_ble_indicate_status = 0;
-        g_ble_att_mtu = 23;
         if (ble_cmd_queue) xQueueReset(ble_cmd_queue);
         ESP_LOGW(BT_TAG, "Disconnected; restarting adv");
         ble_app_advertise();
         break;
 
     case BLE_GAP_EVENT_SUBSCRIBE:
-        if (event->subscribe.conn_handle == g_conn_handle &&
-            event->subscribe.attr_handle == gatt_tx_handle) {
-            g_ble_tx_notify_enabled = event->subscribe.cur_notify != 0;
-            g_ble_tx_indicate_enabled = event->subscribe.cur_indicate != 0;
+        if (ble_state_take()) {
+            if (event->subscribe.conn_handle == g_conn_handle &&
+                event->subscribe.attr_handle == gatt_tx_handle) {
+                g_ble_tx_notify_enabled = event->subscribe.cur_notify != 0;
+                g_ble_tx_indicate_enabled = event->subscribe.cur_indicate != 0;
+            }
+            ble_state_give();
+        }
+        if (ble_state_take()) {
             ESP_LOGI(BT_TAG, "TX subscribe: notify=%d indicate=%d",
                      g_ble_tx_notify_enabled ? 1 : 0,
                      g_ble_tx_indicate_enabled ? 1 : 0);
+            ble_state_give();
         }
         break;
 
     case BLE_GAP_EVENT_NOTIFY_TX:
-        if (event->notify_tx.conn_handle == g_conn_handle &&
-            event->notify_tx.attr_handle == gatt_tx_handle &&
-            event->notify_tx.indication &&
-            g_ble_indicate_waiting) {
-            const int st = event->notify_tx.status;
-            if (st != 0) {
-                g_ble_indicate_status = st;
-                g_ble_indicate_waiting = false;
+        if (ble_state_take()) {
+            if (event->notify_tx.conn_handle == g_conn_handle &&
+                event->notify_tx.attr_handle == gatt_tx_handle &&
+                event->notify_tx.indication &&
+                g_ble_indicate_waiting) {
+                const int st = event->notify_tx.status;
+                if (st != 0) {
+                    g_ble_indicate_status = st;
+                    g_ble_indicate_waiting = false;
+                }
             }
+            ble_state_give();
         }
         break;
 
     case BLE_GAP_EVENT_MTU:
-        if (event->mtu.conn_handle == g_conn_handle && event->mtu.value > 0) {
-            g_ble_att_mtu = event->mtu.value;
-            ESP_LOGI(BT_TAG, "ATT MTU=%u", (unsigned)g_ble_att_mtu);
+        if (ble_state_take()) {
+            if (event->mtu.conn_handle == g_conn_handle && event->mtu.value > 0) {
+                g_ble_att_mtu = event->mtu.value;
+                ESP_LOGI(BT_TAG, "ATT MTU=%u", (unsigned)g_ble_att_mtu);
+            }
+            ble_state_give();
         }
         break;
 
@@ -740,16 +807,28 @@ static struct
 } callsign_hashtable[CALLSIGN_HASHTABLE_SIZE];
 
 static int callsign_hashtable_size;
+static SemaphoreHandle_t g_hash_mutex = NULL;   // Protects callsign hash table state
+
+static bool hashtable_take(TickType_t timeout = portMAX_DELAY) {
+    return g_hash_mutex && (xSemaphoreTake(g_hash_mutex, timeout) == pdTRUE);
+}
+
+static void hashtable_give() {
+    if (g_hash_mutex) xSemaphoreGive(g_hash_mutex);
+}
 
 void hashtable_init(void)
 {
+    if (g_hash_mutex && !hashtable_take()) return;
     callsign_hashtable_size = 0;
     memset(callsign_hashtable, 0, sizeof(callsign_hashtable));
+    if (g_hash_mutex) hashtable_give();
 }
 
 // Increment age for all existing entries (saturate at 255). Call once per slot.
 static void hashtable_age_all(void)
 {
+    if (!hashtable_take()) return;
     for (int i = 0; i < CALLSIGN_HASHTABLE_SIZE; ++i)
     {
         if (callsign_hashtable[i].callsign[0] != '\0')
@@ -763,10 +842,11 @@ static void hashtable_age_all(void)
             }
         }
     }
+    hashtable_give();
 }
 
 // Trim the hash table if it grows too large by evicting the oldest entries
-void hashtable_trim_size(int max_size)
+static void hashtable_trim_size_unlocked(int max_size)
 {
     while (callsign_hashtable_size > max_size)
     {
@@ -802,6 +882,8 @@ void hashtable_add(const char* callsign, uint32_t hash)
 {
     if (!callsign || !callsign[0])
         return;
+    if (!hashtable_take())
+        return;
 
     uint32_t hash_payload = hash & 0x003FFFFFu;   // 22-bit value
     uint16_t hash10 = (hash_payload >> 12) & 0x03FFu;
@@ -810,10 +892,11 @@ void hashtable_add(const char* callsign, uint32_t hash)
 
     while (callsign_hashtable_size >= CALLSIGN_HASHTABLE_SIZE)
     {
-        hashtable_trim_size(CALLSIGN_HASHTABLE_SIZE - 50);
+        hashtable_trim_size_unlocked(CALLSIGN_HASHTABLE_SIZE - 50);
         if (callsign_hashtable_size >= CALLSIGN_HASHTABLE_SIZE)
         {
             LOG(LOG_INFO, "Hash table full; ignoring new callsign [%s]\n", callsign);
+            hashtable_give();
             return;
         }
     }
@@ -829,6 +912,7 @@ void hashtable_add(const char* callsign, uint32_t hash)
             // Refresh age to 0, keep same callsign/hash
             callsign_hashtable[idx].hash = hash_payload;
             LOG(LOG_DEBUG, "Found duplicate [%s], refreshed age\n", callsign);
+            hashtable_give();
             return;
         }
 
@@ -841,6 +925,7 @@ void hashtable_add(const char* callsign, uint32_t hash)
             strncpy(callsign_hashtable[idx].callsign, callsign, 11);
             callsign_hashtable[idx].callsign[11] = '\0';
             callsign_hashtable[idx].hash = hash_payload;
+            hashtable_give();
             return;
         }
 
@@ -848,6 +933,7 @@ void hashtable_add(const char* callsign, uint32_t hash)
         if (idx == start_idx)
         {
             LOG(LOG_INFO, "Hash table probe wrapped; abort insert for [%s]\n", callsign);
+            hashtable_give();
             return;
         }
     }
@@ -856,12 +942,17 @@ void hashtable_add(const char* callsign, uint32_t hash)
     callsign_hashtable[idx].callsign[11] = '\0';
     callsign_hashtable[idx].hash = hash_payload;  // age=0
     callsign_hashtable_size++;
+    hashtable_give();
 }
 
 bool hashtable_lookup(ftx_callsign_hash_type_t hash_type, uint32_t hash, char* callsign)
 {
     if (!callsign)
         return false;
+    if (!hashtable_take()) {
+        callsign[0] = '\0';
+        return false;
+    }
 
     uint8_t hash_shift =
         (hash_type == FTX_CALLSIGN_HASH_10_BITS) ? 12 :
@@ -894,11 +985,13 @@ bool hashtable_lookup(ftx_callsign_hash_type_t hash_type, uint32_t hash, char* c
 
             // Reset age to 0 on successful hit, preserve 22-bit payload.
             callsign_hashtable[scan_idx].hash = existing_hash;
+            hashtable_give();
             return true;
         }
     }
 
     callsign[0] = '\0';
+    hashtable_give();
     return false;
 }
 
@@ -952,9 +1045,9 @@ int64_t g_decode_slot_idx = -1; // set at decode trigger to tag RX lines with sl
 
 // State machine variables (matching reference project architecture)
 // TX is scheduled by setting these flags; actual TX starts at slot boundary
-static volatile bool g_qso_xmit = false;        // TX is pending
-static volatile int g_target_slot_parity = 0;   // 0=even, 1=odd - parity of slot to TX on
-static volatile bool g_was_txing = false;       // We were transmitting (for tick timing)
+static bool g_qso_xmit = false;                 // TX is pending
+static int g_target_slot_parity = 0;            // 0=even, 1=odd - parity of slot to TX on
+static bool g_was_txing = false;                // We were transmitting (for tick timing)
 volatile bool g_decode_in_progress = false; // Block TX trigger while decoding
 static int g_last_slot_parity = -1;             // For slot boundary detection (just parity, like reference)
 
@@ -1002,6 +1095,8 @@ static void save_station_data();
 // TX entry for display and scheduling (populated by autoseq)
 static AutoseqTxEntry g_pending_tx;
 static bool g_pending_tx_valid = false;
+static SemaphoreHandle_t g_tx_handoff_mutex = NULL;  // Protects g_pending_tx + TX handoff flags
+static SemaphoreHandle_t g_autoseq_mutex = NULL;     // Protects all autoseq_* API calls
 static volatile bool g_tx_cancel_requested = false;
 static void host_process_bytes(const uint8_t* buf, size_t len);
 static void poll_host_uart();
@@ -1013,6 +1108,7 @@ static void enter_mode(UIMode new_mode);
 static void apply_ble_enabled_policy(bool runtime_apply);
 static std::string menu_sleep_batt_line();
 static bool g_rx_dirty = false;
+static SemaphoreHandle_t g_rx_lines_mutex = NULL;   // Protects g_rx_lines cross-core access
 #if ENABLE_BLE
 static void ble_enter_text_mode();
 static void ble_exit_text_mode();
@@ -1132,7 +1228,7 @@ static int g_autoseq_max_retry = AUTOSEQ_MAX_RETRY;
 static std::string g_free_text = "TNX 73";
 static std::string g_call = "YOURCALL";
 static std::string g_grid = "CM97";
-bool g_decode_enabled = true;
+std::atomic_bool g_decode_enabled{true};
 int g_time_osr = 1;
 int g_freq_osr = 1;
 static OffsetSrc g_offset_src = OffsetSrc::RANDOM;
@@ -1172,7 +1268,7 @@ static int64_t menu_flash_deadline = 0;  // ms timestamp when flash ends
 static bool menu_delete_confirm = false;  // confirmation state for Delete Logs
 static int rx_flash_idx = -1;
 static int64_t rx_flash_deadline = 0;
-bool g_streaming = false;
+std::atomic_bool g_streaming{false};
 static void draw_menu_view();
 static void draw_battery_icon(int x, int y, int w, int h, int level, bool charging);
 static void draw_status_view();
@@ -1197,6 +1293,243 @@ static void qso_draw_page();
 
 static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text, int repeat_counter = -1);
 static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd);
+
+static bool autoseq_take(TickType_t timeout = portMAX_DELAY) {
+  return g_autoseq_mutex && (xSemaphoreTake(g_autoseq_mutex, timeout) == pdTRUE);
+}
+
+static void autoseq_give() {
+  if (g_autoseq_mutex) xSemaphoreGive(g_autoseq_mutex);
+}
+
+static void autoseq_safe_init() {
+  if (!autoseq_take()) return;
+  autoseq_init();
+  autoseq_give();
+}
+
+static void autoseq_safe_set_adif_callback(AdifLogCallback cb) {
+  if (!autoseq_take()) return;
+  autoseq_set_adif_callback(cb);
+  autoseq_give();
+}
+
+static void autoseq_safe_set_cabrillo_fd_callback(CabrilloFdLogCallback cb) {
+  if (!autoseq_take()) return;
+  autoseq_set_cabrillo_fd_callback(cb);
+  autoseq_give();
+}
+
+static void autoseq_safe_set_station(const std::string& call, const std::string& grid) {
+  if (!autoseq_take()) return;
+  autoseq_set_station(call, grid);
+  autoseq_give();
+}
+
+static void autoseq_safe_set_skip_tx1(bool skip) {
+  if (!autoseq_take()) return;
+  autoseq_set_skip_tx1(skip);
+  autoseq_give();
+}
+
+static void autoseq_safe_set_max_retry(int retry) {
+  if (!autoseq_take()) return;
+  autoseq_set_max_retry(retry);
+  autoseq_give();
+}
+
+static void autoseq_safe_set_cq_type(AutoseqCqType type, const std::string& freetext) {
+  if (!autoseq_take()) return;
+  autoseq_set_cq_type(type, freetext);
+  autoseq_give();
+}
+
+static void autoseq_safe_get_qso_states(std::vector<std::string>& out) {
+  if (!autoseq_take()) {
+    out.clear();
+    return;
+  }
+  autoseq_get_qso_states(out);
+  autoseq_give();
+}
+
+static bool autoseq_safe_get_next_tx(std::string& out_text) {
+  if (!autoseq_take()) {
+    out_text.clear();
+    return false;
+  }
+  bool ok = autoseq_get_next_tx(out_text);
+  autoseq_give();
+  return ok;
+}
+
+static bool autoseq_safe_fetch_pending_tx(AutoseqTxEntry& out) {
+  if (!autoseq_take()) return false;
+  bool ok = autoseq_fetch_pending_tx(out);
+  autoseq_give();
+  return ok;
+}
+
+static void autoseq_safe_on_decodes(const std::vector<UiRxLine>& to_me_messages) {
+  if (!autoseq_take()) return;
+  autoseq_on_decodes(to_me_messages);
+  autoseq_give();
+}
+
+static void autoseq_safe_on_touch(const UiRxLine& msg) {
+  if (!autoseq_take()) return;
+  autoseq_on_touch(msg);
+  autoseq_give();
+}
+
+static void autoseq_safe_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
+  if (!autoseq_take()) return;
+  autoseq_tick(slot_idx, slot_parity, ms_to_boundary);
+  autoseq_give();
+}
+
+static void autoseq_safe_mark_sent(int64_t slot_idx) {
+  if (!autoseq_take()) return;
+  autoseq_mark_sent(slot_idx);
+  autoseq_give();
+}
+
+static void autoseq_safe_start_cq(int slot_parity) {
+  if (!autoseq_take()) return;
+  autoseq_start_cq(slot_parity);
+  autoseq_give();
+}
+
+static int autoseq_safe_queue_size() {
+  if (!autoseq_take()) return 0;
+  int n = autoseq_queue_size();
+  autoseq_give();
+  return n;
+}
+
+static bool autoseq_safe_drop_index(int idx) {
+  if (!autoseq_take()) return false;
+  bool ok = autoseq_drop_index(idx);
+  autoseq_give();
+  return ok;
+}
+
+static bool autoseq_safe_rotate_same_parity() {
+  if (!autoseq_take()) return false;
+  bool ok = autoseq_rotate_same_parity();
+  autoseq_give();
+  return ok;
+}
+
+static bool tx_handoff_take(TickType_t timeout = portMAX_DELAY) {
+  return g_tx_handoff_mutex && (xSemaphoreTake(g_tx_handoff_mutex, timeout) == pdTRUE);
+}
+
+static void tx_handoff_give() {
+  if (g_tx_handoff_mutex) xSemaphoreGive(g_tx_handoff_mutex);
+}
+
+static bool tx_handoff_is_was_txing() {
+  if (!tx_handoff_take()) return false;
+  bool v = g_was_txing;
+  tx_handoff_give();
+  return v;
+}
+
+static void tx_handoff_set_was_txing(bool v) {
+  if (!tx_handoff_take()) return;
+  g_was_txing = v;
+  tx_handoff_give();
+}
+
+static bool tx_handoff_get_pending_snapshot(AutoseqTxEntry& out) {
+  if (!tx_handoff_take()) return false;
+  const bool valid = g_pending_tx_valid;
+  if (valid) out = g_pending_tx;
+  tx_handoff_give();
+  return valid;
+}
+
+static bool tx_handoff_is_tx_queued() {
+  if (!tx_handoff_take()) return false;
+  bool queued = g_qso_xmit;
+  tx_handoff_give();
+  return queued;
+}
+
+static void tx_handoff_store_pending(const AutoseqTxEntry& pending) {
+  if (!tx_handoff_take()) return;
+  g_pending_tx = pending;
+  g_pending_tx_valid = true;
+  g_qso_xmit = true;
+  g_target_slot_parity = pending.slot_id & 1;
+  tx_handoff_give();
+}
+
+static void tx_handoff_clear_pending() {
+  if (!tx_handoff_take()) return;
+  g_pending_tx_valid = false;
+  g_qso_xmit = false;
+  tx_handoff_give();
+}
+
+static bool tx_handoff_prepare_tx_start(int slot_parity, AutoseqTxEntry& pending_out) {
+  if (!tx_handoff_take()) return false;
+  const bool ready = g_qso_xmit &&
+                     (g_target_slot_parity == slot_parity) &&
+                     g_pending_tx_valid &&
+                     !g_pending_tx.text.empty();
+  if (ready) {
+    pending_out = g_pending_tx;
+    g_qso_xmit = false;
+    g_was_txing = true;
+  }
+  tx_handoff_give();
+  return ready;
+}
+
+static void tx_handoff_update_pending_offset(int offset_hz) {
+  if (!tx_handoff_take()) return;
+  if (g_pending_tx_valid) g_pending_tx.offset_hz = offset_hz;
+  tx_handoff_give();
+}
+
+static bool rx_lines_take(TickType_t timeout = portMAX_DELAY) {
+  return g_rx_lines_mutex && (xSemaphoreTake(g_rx_lines_mutex, timeout) == pdTRUE);
+}
+
+static void rx_lines_give() {
+  if (g_rx_lines_mutex) xSemaphoreGive(g_rx_lines_mutex);
+}
+
+static void rx_lines_set(const std::vector<UiRxLine>& lines) {
+  if (!rx_lines_take()) return;
+  g_rx_lines = lines;
+  rx_lines_give();
+}
+
+static void rx_lines_clear() {
+  if (!rx_lines_take()) return;
+  g_rx_lines.clear();
+  rx_lines_give();
+}
+
+static void rx_lines_snapshot(std::vector<UiRxLine>& out) {
+  if (!rx_lines_take()) {
+    out.clear();
+    return;
+  }
+  out = g_rx_lines;
+  rx_lines_give();
+}
+
+static bool rx_lines_get_item(int idx, UiRxLine& out) {
+  if (!rx_lines_take()) return false;
+  bool ok = (idx >= 0 && idx < (int)g_rx_lines.size());
+  if (ok) out = g_rx_lines[idx];
+  rx_lines_give();
+  return ok;
+}
 #if !MIC_PROBE_APP
 void log_heap(const char* tag) {
   size_t free_sz = heap_caps_get_free_size(MALLOC_CAP_8BIT);
@@ -1850,25 +2183,28 @@ struct WAVHeader {
 static void redraw_tx_view() {
   // Get QSO states from autoseq for display
   std::vector<std::string> qtext;
-  autoseq_get_qso_states(qtext);
+  autoseq_safe_get_qso_states(qtext);
+
+  AutoseqTxEntry pending{};
+  const bool pending_valid = tx_handoff_get_pending_snapshot(pending);
 
   std::vector<bool> marks(qtext.size(), false);  // No delete marks with autoseq
   std::vector<int> slots;
 
   // Slot color for pending TX
-  slots.push_back(g_pending_tx_valid ? (g_pending_tx.slot_id & 1) : 0);
+  slots.push_back(pending_valid ? (pending.slot_id & 1) : 0);
   // All QSO entries use their context's slot
   for (size_t i = 0; i < qtext.size(); ++i) {
     slots.push_back(0);  // Default to even; autoseq manages internally
   }
 
   std::string next_line;
-  if (g_pending_tx_valid && !g_pending_tx.text.empty()) {
+  if (pending_valid && !pending.text.empty()) {
     // Use scheduled TX text if available
-    next_line = g_pending_tx.text;
+    next_line = pending.text;
   } else {
     // Fall back to autoseq's next TX (for display when TX not yet scheduled)
-    autoseq_get_next_tx(next_line);
+    autoseq_safe_get_next_tx(next_line);
   }
 
   ui_draw_tx(next_line, qtext, tx_page, -1, marks, slots);
@@ -2225,7 +2561,7 @@ static void redraw_countdown_now() {
 }
 
 // Forward declarations for single-threaded TX state machine
-static void tx_start(int skip_tones);
+static void tx_start(const AutoseqTxEntry& pending, int skip_tones);
 static void tx_tick();
 
 // Slot boundary check - called from main loop
@@ -2243,22 +2579,25 @@ static void check_slot_boundary() {
 
   // Call tick AFTER TX has completed (not while TX is still active)
   // This ensures autoseq_tick() operates on the correct completed TX entry
-  if (g_was_txing && !g_tx_active) {
+  if (tx_handoff_is_was_txing() && !g_tx_active) {
     ESP_LOGI(TAG, "TX completed, calling tick (slot %lld, parity %d)",
              (long long)slot_idx, slot_parity);
-    autoseq_tick(slot_idx, slot_parity, 0);
-    g_was_txing = false;
+    autoseq_safe_tick(slot_idx, slot_parity, 0);
+    tx_handoff_set_was_txing(false);
     g_tx_view_dirty = true;
   }
 
   // TX trigger: check if we should start TX in this slot
   // Conditions: qso_xmit flag set, correct parity, early enough in slot, not already TXing,
   // and decode must be complete (TX is always triggered by decode results)
-  if (g_qso_xmit &&
-      g_target_slot_parity == slot_parity &&
-      slot_ms < 4000 &&
+  if (slot_ms < 4000 &&
       !g_tx_active &&
       !g_decode_in_progress) {
+
+    AutoseqTxEntry pending{};
+    if (!tx_handoff_prepare_tx_start(slot_parity, pending)) {
+      return;
+    }
 
     ESP_LOGI(TAG, "TX trigger: starting TX in slot %lld (parity %d)",
              (long long)slot_idx, slot_parity);
@@ -2266,30 +2605,22 @@ static void check_slot_boundary() {
     // Calculate skip_tones for partial slot
     int skip_tones = slot_ms / 160;
     if (skip_tones < 79) {
-      // Only proceed if we have a valid pending TX
-      // NOTE: Don't clear g_qso_xmit until we're sure g_pending_tx is valid.
-      // This avoids a race condition where decode_monitor_results is still
-      // writing g_pending_tx on core 1 while we read it on core 0.
-      if (g_pending_tx_valid && !g_pending_tx.text.empty()) {
-        g_qso_xmit = false;  // Clear flag only AFTER validation succeeds
-        g_was_txing = true;  // Set IMMEDIATELY when TX starts (prevents decode_monitor_results from re-setting flags)
-
-        // Compute actual TX offset now (before logging) based on offset_src setting
-        int actual_offset;
-        if (g_offset_src == OffsetSrc::CURSOR) {
-          actual_offset = g_offset_hz;
-        } else if (g_offset_src == OffsetSrc::RX &&
-                   g_pending_tx.offset_hz > 0 &&
-                   g_pending_tx.text.rfind("CQ ", 0) != 0) {
-          actual_offset = g_pending_tx.offset_hz;
-        } else {
-          // RANDOM mode or CQ in RX mode: generate random offset
-          actual_offset = 500 + (int)(esp_random() % 2001);
-        }
-        g_pending_tx.offset_hz = actual_offset;  // Store for tx_start to use
-        log_rxtx_line('T', 0, actual_offset, g_pending_tx.text, g_pending_tx.repeat_counter);
-        tx_start(skip_tones);
+      // Compute actual TX offset now (before logging) based on offset_src setting
+      int actual_offset;
+      if (g_offset_src == OffsetSrc::CURSOR) {
+        actual_offset = g_offset_hz;
+      } else if (g_offset_src == OffsetSrc::RX &&
+                 pending.offset_hz > 0 &&
+                 pending.text.rfind("CQ ", 0) != 0) {
+        actual_offset = pending.offset_hz;
+      } else {
+        // RANDOM mode or CQ in RX mode: generate random offset
+        actual_offset = 500 + (int)(esp_random() % 2001);
       }
+      pending.offset_hz = actual_offset;
+      tx_handoff_update_pending_offset(actual_offset);
+      log_rxtx_line('T', 0, actual_offset, pending.text, pending.repeat_counter);
+      tx_start(pending, skip_tones);
     }
   }
 }
@@ -2381,7 +2712,7 @@ static void update_autoseq_cq_type() {
   }
   const std::string& ft =
     (g_cq_type == CqType::CQFREETEXT || g_cq_type == CqType::CQFD) ? g_free_text : g_cq_freetext;
-  autoseq_set_cq_type(t, ft);
+  autoseq_safe_set_cq_type(t, ft);
 }
 
 static void advance_active_band(int delta) {
@@ -2568,8 +2899,12 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
 
   if (num_candidates <= 0) {
     ESP_LOGW(TAG, "No candidates found");
-    g_rx_lines.clear();
-    if (update_ui) { ui_set_rx_list(g_rx_lines); ui_draw_rx(); }
+    rx_lines_clear();
+    if (update_ui) {
+      std::vector<UiRxLine> empty_lines;
+      ui_set_rx_list(empty_lines);
+      ui_draw_rx();
+    }
     else g_rx_dirty = true;
     g_decode_in_progress = false;  // Clear flag before early return
     return;
@@ -2751,7 +3086,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   }
 
   // ---- autoseq trigger logic (unchanged idea) ----
-  if (!g_was_txing) {
+  if (!tx_handoff_is_was_txing()) {
     std::vector<UiRxLine> to_me_auto;
     to_me_auto.reserve(to_me.size());
     for (const auto& msg : to_me) {
@@ -2764,26 +3099,20 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     }
 
     if (!to_me_auto.empty()) {
-      autoseq_on_decodes(to_me_auto);
+      autoseq_safe_on_decodes(to_me_auto);
       g_tx_view_dirty = true;
       g_last_reply_text = to_me_auto.front().text;
     }
 
     AutoseqTxEntry pending;
-    if (autoseq_fetch_pending_tx(pending)) {
-      g_qso_xmit = true;
-      g_target_slot_parity = pending.slot_id & 1;
-      g_pending_tx = pending;
-      g_pending_tx_valid = true;
-      ESP_LOGI(TAG, "TX ready: %s parity=%d", pending.text.c_str(), g_target_slot_parity);
+    if (autoseq_safe_fetch_pending_tx(pending)) {
+      tx_handoff_store_pending(pending);
+      ESP_LOGI(TAG, "TX ready: %s parity=%d", pending.text.c_str(), pending.slot_id & 1);
     } else if (g_beacon != BeaconMode::OFF) {
       enqueue_beacon_cq();
-      if (autoseq_fetch_pending_tx(pending)) {
-        g_qso_xmit = true;
-        g_target_slot_parity = pending.slot_id & 1;
-        g_pending_tx = pending;
-        g_pending_tx_valid = true;
-        ESP_LOGI(TAG, "Beacon CQ ready: %s parity=%d", pending.text.c_str(), g_target_slot_parity);
+      if (autoseq_safe_fetch_pending_tx(pending)) {
+        tx_handoff_store_pending(pending);
+        ESP_LOGI(TAG, "Beacon CQ ready: %s parity=%d", pending.text.c_str(), pending.slot_id & 1);
       }
     }
   }
@@ -2794,10 +3123,10 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   merged.insert(merged.end(), cqs.begin(), cqs.end());
   merged.insert(merged.end(), others.begin(), others.end());
 
-  g_rx_lines = merged;
+  rx_lines_set(merged);
 
   if (update_ui) {
-    ui_set_rx_list(g_rx_lines);
+    ui_set_rx_list(merged);
     ui_draw_rx();
     char buf[64];
     snprintf(buf, sizeof(buf), "Heap %u", heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
@@ -2850,19 +3179,20 @@ static void log_tones(const uint8_t* tones, size_t n) {
 }
 
 static void encode_and_log_pending_tx() {
-  if (!g_pending_tx_valid || g_pending_tx.text.empty()) {
+  AutoseqTxEntry pending{};
+  if (!tx_handoff_get_pending_snapshot(pending) || pending.text.empty()) {
     debug_log_line("No pending TX to encode");
     return;
   }
   ftx_message_t msg;
-  ftx_message_rc_t rc = ftx_message_encode(&msg, &hash_if, g_pending_tx.text.c_str());
+  ftx_message_rc_t rc = ftx_message_encode(&msg, &hash_if, pending.text.c_str());
   if (rc != FTX_MESSAGE_RC_OK) {
     debug_log_line("Encode failed");
     return;
   }
   uint8_t tones[79] = {0};
   ft8_encode(msg.payload, tones);
-  debug_log_line(std::string("Tones for '") + g_pending_tx.text + "'");
+  debug_log_line(std::string("Tones for '") + pending.text + "'");
   log_tones(tones, 79);
 }
 
@@ -2893,13 +3223,13 @@ static void encode_and_log_pending_tx() {
 // TX trigger happens at slot boundary via check_slot_boundary().
 static void enqueue_beacon_cq() {
   int target_parity = (g_beacon == BeaconMode::EVEN) ? 0 : 1;
-  autoseq_start_cq(target_parity);
+  autoseq_safe_start_cq(target_parity);
   g_tx_view_dirty = true;
 }
 
 static bool autoseq_has_pending_tx() {
   AutoseqTxEntry tmp;
-  return autoseq_fetch_pending_tx(tmp);
+  return autoseq_safe_fetch_pending_tx(tmp);
 }
 
 // Schedule a one-off pending TX (e.g., manual FreeText) without touching autoseq state.
@@ -2907,22 +3237,13 @@ static bool autoseq_has_pending_tx() {
 // Uses the single-threaded state machine - TX will trigger at next matching slot boundary.
 static bool schedule_manual_pending_tx(const AutoseqTxEntry& pending) {
   // Already transmitting or TX pending?
-  if (g_tx_active || g_qso_xmit) {
+  if (g_tx_active || tx_handoff_is_tx_queued()) {
     return false;
   }
-
-  int target_parity = pending.slot_id & 1;
-
-  // Set up pending TX
-  g_pending_tx = pending;
-  g_pending_tx_valid = true;
-
-  // Set flags for check_slot_boundary() to trigger TX
-  g_qso_xmit = true;
-  g_target_slot_parity = target_parity;
+  tx_handoff_store_pending(pending);
 
   ESP_LOGI(TAG, "schedule_manual_pending_tx: queued TX=%s for parity=%d",
-           pending.text.c_str(), target_parity);
+           pending.text.c_str(), pending.slot_id & 1);
   return true;
 }
 
@@ -2948,16 +3269,15 @@ static void tx_send_ta(float tone_hz) {
 }
 
 // Start TX (single-threaded state machine initialization)
-// Called from check_slot_boundary at the right time
-// Uses g_pending_tx which was prepared by check_slot_boundary with correct offset
-static void tx_start(int skip_tones) {
+// Called from check_slot_boundary at the right time.
+// Uses the snapshot prepared under tx handoff lock in check_slot_boundary().
+static void tx_start(const AutoseqTxEntry& pending, int skip_tones) {
   // Already transmitting?
   if (g_tx_active) {
     return;
   }
 
-  // Use g_pending_tx which was prepared by check_slot_boundary
-  if (!g_pending_tx_valid || g_pending_tx.text.empty()) {
+  if (pending.text.empty()) {
     ESP_LOGW(TAG, "tx_start: no pending TX");
     return;
   }
@@ -2967,11 +3287,11 @@ static void tx_start(int skip_tones) {
   g_tx_slot_idx = now_ms / 15000;
 
   ESP_LOGI(TAG, "tx_start: TX=%s offset=%d skip=%d slot=%lld",
-           g_pending_tx.text.c_str(), g_pending_tx.offset_hz, skip_tones, (long long)g_tx_slot_idx);
+           pending.text.c_str(), pending.offset_hz, skip_tones, (long long)g_tx_slot_idx);
 
   // Encode message to tones
   ftx_message_t msg;
-  ftx_message_rc_t rc = ftx_message_encode(&msg, &hash_if, g_pending_tx.text.c_str());
+  ftx_message_rc_t rc = ftx_message_encode(&msg, &hash_if, pending.text.c_str());
   if (rc != FTX_MESSAGE_RC_OK) {
     ESP_LOGE(TAG, "Encode failed for TX");
     return;
@@ -2982,7 +3302,7 @@ static void tx_start(int skip_tones) {
   // IMPORTANT: Tone timing must be based on slot boundary, not TX start time.
   // This ensures TX ends at the correct time even if TX started late,
   // allowing RX to start cleanly at the next slot boundary.
-  g_tx_base_hz = g_pending_tx.offset_hz;
+  g_tx_base_hz = pending.offset_hz;
   g_tx_slot_start_ms = (now_ms / 15000) * 15000;  // Slot boundary time
   g_tx_tone_idx = (skip_tones >= 79) ? 79 : skip_tones;
   // Next tone time = slot_start + tone_idx * 160ms
@@ -2991,7 +3311,7 @@ static void tx_start(int skip_tones) {
   g_tx_last_ta_int = -1;
   g_tx_last_ta_frac = -1;
 
-  ESP_LOGI(TAG, "TX base_hz=%d (from pre-computed offset, text=%s)", g_tx_base_hz, g_pending_tx.text.c_str());
+  ESP_LOGI(TAG, "TX base_hz=%d (from pre-computed offset, text=%s)", g_tx_base_hz, pending.text.c_str());
 
   // Send CAT setup commands
   g_tx_cat_ok = radio_control_ready();
@@ -3034,9 +3354,9 @@ static void tx_tick() {
       radio_control_end_tx();
     }
     g_tx_active = false;
-    g_pending_tx_valid = false;
+    tx_handoff_clear_pending();
     g_tx_cancel_requested = false;
-    g_was_txing = false;  // TX was cancelled - don't call tick at slot boundary
+    tx_handoff_set_was_txing(false);  // TX was cancelled - don't call tick at slot boundary
     g_tx_view_dirty = true;
     return;
   }
@@ -3054,11 +3374,11 @@ static void tx_tick() {
     }
     // Record slot index for spacing and notify autoseq
     s_last_tx_slot_idx = g_tx_slot_idx;
-    autoseq_mark_sent(g_tx_slot_idx);
+    autoseq_safe_mark_sent(g_tx_slot_idx);
     // g_was_txing stays true - tick will be called at slot boundary
 
     g_tx_active = false;
-    g_pending_tx_valid = false;
+    tx_handoff_clear_pending();
     g_tx_cancel_requested = false;
     g_tx_view_dirty = true;
     return;
@@ -3106,7 +3426,7 @@ static void draw_menu_view() {
   lines.push_back(std::string("Radio:") + radio_name(g_radio));
   lines.push_back(std::string("IgnoreList:") + head_trim(g_ignore_prefix_text, 10));
   lines.push_back(std::string("C:") + head_trim(expand_comment1(), 16));
-  lines.push_back(std::string("BLE ") + (g_ble_enabled ? "ON" : "OFF"));
+  lines.push_back(std::string("BLE ") + (g_ble_enabled.load(std::memory_order_acquire) ? "ON" : "OFF"));
 
   // Page 2 content (index 12+)
   lines.push_back(std::string("RxTxLog:") + (g_rxtx_log ? "ON" : "OFF"));
@@ -3225,15 +3545,20 @@ static int page_count(int items, int page_size) {
 }
 
 static int ble_send_payload_raw(const std::string& payload, bool indicate) {
-  if (!g_ble_stack_active) return BLE_HS_EINVAL;
-  if (!g_ble_enabled) return BLE_HS_EINVAL;
-  if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return BLE_HS_ENOTCONN;
+  if (!g_ble_stack_active.load(std::memory_order_acquire)) return BLE_HS_EINVAL;
+  if (!g_ble_enabled.load(std::memory_order_acquire)) return BLE_HS_EINVAL;
+  uint16_t conn_handle = BLE_HS_CONN_HANDLE_NONE;
+  if (ble_state_take()) {
+    conn_handle = g_conn_handle;
+    ble_state_give();
+  }
+  if (conn_handle == BLE_HS_CONN_HANDLE_NONE) return BLE_HS_ENOTCONN;
   if (!gatt_tx_handle) return BLE_HS_EINVAL;
   struct os_mbuf* om = ble_hs_mbuf_from_flat(payload.data(), payload.size());
   if (!om) return BLE_HS_ENOMEM;
   int rc = indicate
-             ? ble_gatts_indicate_custom(g_conn_handle, gatt_tx_handle, om)
-             : ble_gatts_notify_custom(g_conn_handle, gatt_tx_handle, om);
+             ? ble_gatts_indicate_custom(conn_handle, gatt_tx_handle, om)
+             : ble_gatts_notify_custom(conn_handle, gatt_tx_handle, om);
   if (rc != 0) {
     ESP_LOGD(BT_TAG, "%s failed rc=%d", indicate ? "indicate" : "notify", rc);
   }
@@ -3247,20 +3572,38 @@ static void ble_notify_payload(const std::string& payload) {
 static bool ble_wait_for_indicate_ack(int timeout_ms) {
   const int step_ms = 10;
   int waited = 0;
-  while (g_ble_indicate_waiting && waited < timeout_ms) {
-    if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
-      g_ble_indicate_status = BLE_HS_ENOTCONN;
-      g_ble_indicate_waiting = false;
+  while (true) {
+    bool indicate_waiting = false;
+    uint16_t conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    if (ble_state_take()) {
+      indicate_waiting = g_ble_indicate_waiting;
+      conn_handle = g_conn_handle;
+      ble_state_give();
+    }
+    if (!indicate_waiting || waited >= timeout_ms) break;
+    if (conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+      if (ble_state_take()) {
+        g_ble_indicate_status = BLE_HS_ENOTCONN;
+        g_ble_indicate_waiting = false;
+        ble_state_give();
+      }
       break;
     }
     vTaskDelay(pdMS_TO_TICKS(step_ms));
     waited += step_ms;
   }
-  if (g_ble_indicate_waiting) {
-    g_ble_indicate_status = BLE_HS_ETIMEOUT;
-    g_ble_indicate_waiting = false;
+  bool indicate_waiting = false;
+  int indicate_status = 0;
+  if (ble_state_take()) {
+    indicate_waiting = g_ble_indicate_waiting;
+    if (indicate_waiting) {
+      g_ble_indicate_status = BLE_HS_ETIMEOUT;
+      g_ble_indicate_waiting = false;
+    }
+    indicate_status = g_ble_indicate_status;
+    ble_state_give();
   }
-  return g_ble_indicate_status == BLE_HS_EDONE;
+  return indicate_status == BLE_HS_EDONE;
 }
 
 static void ble_dump_reset_transfer_state(bool use_indicate) {
@@ -3268,9 +3611,12 @@ static void ble_dump_reset_transfer_state(bool use_indicate) {
   g_ble_dump_xfer.active = true;
   g_ble_dump_xfer.mode = use_indicate ? BleDumpTxMode::Indicate : BleDumpTxMode::Notify;
   g_ble_dump_xfer.notify_pace_ms = kBleDumpNotifyPaceMinMs;
-  g_ble_dump_xfer.mtu = g_ble_att_mtu;
-  g_ble_indicate_waiting = false;
-  g_ble_indicate_status = 0;
+  if (ble_state_take()) {
+    g_ble_dump_xfer.mtu = g_ble_att_mtu;
+    g_ble_indicate_waiting = false;
+    g_ble_indicate_status = 0;
+    ble_state_give();
+  }
 }
 
 static bool ble_dump_send_line(const std::string& raw) {
@@ -3282,16 +3628,22 @@ static bool ble_dump_send_line(const std::string& raw) {
 
   if (g_ble_dump_xfer.mode == BleDumpTxMode::Indicate) {
     for (int attempt = 0; attempt <= kBleDumpIndicateMaxRetries; ++attempt) {
-      g_ble_indicate_status = 0;
-      g_ble_indicate_waiting = true;
+      if (ble_state_take()) {
+        g_ble_indicate_status = 0;
+        g_ble_indicate_waiting = true;
+        ble_state_give();
+      }
       const int rc = ble_send_payload_raw(payload, true);
       if (rc == 0) {
         if (ble_wait_for_indicate_ack(kBleDumpIndicateAckTimeoutMs)) {
           return true;
         }
       } else {
-        g_ble_indicate_waiting = false;
-        g_ble_indicate_status = rc;
+        if (ble_state_take()) {
+          g_ble_indicate_waiting = false;
+          g_ble_indicate_status = rc;
+          ble_state_give();
+        }
       }
       if (attempt < kBleDumpIndicateMaxRetries) {
         g_ble_dump_xfer.retries++;
@@ -3329,30 +3681,38 @@ static bool ble_dump_send_line(const std::string& raw) {
 }
 
 static void apply_ble_enabled_policy(bool runtime_apply) {
-  g_time_osr = g_ble_enabled ? 1 : 2;
+  g_time_osr = g_ble_enabled.load(std::memory_order_acquire) ? 1 : 2;
   g_freq_osr = 1;
   if (!runtime_apply) return;
 
-  if (!g_ble_enabled) {
+  if (!g_ble_enabled.load(std::memory_order_acquire)) {
     if (!ble_stack_stop()) {
       ESP_LOGE(BT_TAG, "BLE OFF rejected: stop failed");
-      g_ble_enabled = true;
+      g_ble_enabled.store(true, std::memory_order_release);
     }
     return;
   }
 
-  if (!g_ble_stack_active) {
+  if (!g_ble_stack_active.load(std::memory_order_acquire)) {
     if (!ble_stack_start()) {
       ESP_LOGE(BT_TAG, "BLE ON rejected: start failed");
-      g_ble_enabled = false;
+      g_ble_enabled.store(false, std::memory_order_release);
       return;
     }
   }
 
-  g_ble_force_send = true;
-  g_ble_last_tick_slot = -1;
-  g_ble_last_tick_sec = -1;
-  if (g_ble_stack_active && g_ble_synced && g_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+  uint16_t conn_handle = BLE_HS_CONN_HANDLE_NONE;
+  bool ble_synced = false;
+  if (ble_state_take()) {
+    g_ble_force_send = true;
+    g_ble_last_tick_slot = -1;
+    g_ble_last_tick_sec = -1;
+    conn_handle = g_conn_handle;
+    ble_synced = g_ble_synced;
+    ble_state_give();
+  }
+  if (g_ble_stack_active.load(std::memory_order_acquire) &&
+      ble_synced && conn_handle == BLE_HS_CONN_HANDLE_NONE) {
     ble_app_advertise();
   }
 }
@@ -3389,14 +3749,26 @@ static void ble_update_name_from_station(bool restart_adv) {
   if (desired.size() > 24) desired.resize(24);
   if (desired.empty()) desired = "Mini-FT8";
 
-  g_ble_adv_name = desired;
-  if (!g_ble_stack_active) return;
-  int rc = ble_svc_gap_device_name_set(g_ble_adv_name.c_str());
+  if (ble_state_take()) {
+    g_ble_adv_name = desired;
+    ble_state_give();
+  }
+  if (!g_ble_stack_active.load(std::memory_order_acquire)) return;
+  int rc = ble_svc_gap_device_name_set(desired.c_str());
   if (rc != 0) {
     ESP_LOGW(BT_TAG, "ble_svc_gap_device_name_set rc=%d", rc);
   }
 
-  if (restart_adv && g_ble_stack_active && g_ble_enabled && g_ble_synced && g_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+  bool ble_synced = false;
+  uint16_t conn_handle = BLE_HS_CONN_HANDLE_NONE;
+  if (ble_state_take()) {
+    ble_synced = g_ble_synced;
+    conn_handle = g_conn_handle;
+    ble_state_give();
+  }
+  if (restart_adv && g_ble_stack_active.load(std::memory_order_acquire) &&
+      g_ble_enabled.load(std::memory_order_acquire) &&
+      ble_synced && conn_handle == BLE_HS_CONN_HANDLE_NONE) {
     ble_app_advertise();
   }
 }
@@ -3423,7 +3795,7 @@ static void ble_page_meta(int& cur, int& total) {
       ui_get_rx_page_info(cur, total);
       break;
     case UIMode::TX:
-      total = page_count(autoseq_queue_size(), 5);
+      total = page_count(autoseq_safe_queue_size(), 5);
       cur = tx_page + 1;
       break;
     case UIMode::BAND:
@@ -3539,30 +3911,40 @@ static void ble_notify_line(const std::string& raw) {
 }
 
 static void ble_start_qso_pick_mode() {
-  if (g_ble_qso_pick_mode) return;
+  if (ble_state_is_qso_pick_mode()) return;
   g_ble_qso_return_mode = ui_mode;
-  g_ble_qso_pick_mode = true;
+  ble_state_set_qso_pick_mode(true);
   g_ble_dump_in_progress = false;
   g_q_show_entries = false;
   g_q_page_view = QPageView::Default;
   q_page = 0;
   enter_mode(UIMode::QSO);
   qso_draw_page();
-  g_ble_force_send = true;
+  if (ble_state_take()) {
+    g_ble_force_send = true;
+    ble_state_give();
+  }
 }
 
 static void ble_cancel_qso_pick_mode() {
-  if (!g_ble_qso_pick_mode) return;
-  g_ble_qso_pick_mode = false;
+  if (!ble_state_is_qso_pick_mode()) return;
+  ble_state_set_qso_pick_mode(false);
   g_ble_dump_in_progress = false;
   if (ble_cmd_queue) xQueueReset(ble_cmd_queue);
   enter_mode(g_ble_qso_return_mode);
-  g_ble_force_send = true;
+  if (ble_state_take()) {
+    g_ble_force_send = true;
+    ble_state_give();
+  }
 }
 
 static void ble_dump_qso_file(const std::string& file_name) {
   g_ble_dump_in_progress = true;
-  const bool use_indicate = g_ble_tx_indicate_enabled;
+  bool use_indicate = false;
+  if (ble_state_take()) {
+    use_indicate = g_ble_tx_indicate_enabled;
+    ble_state_give();
+  }
   ble_dump_reset_transfer_state(use_indicate);
   std::string full_path = std::string("/spiffs/") + file_name;
   if (!use_indicate) {
@@ -3595,12 +3977,18 @@ static void ble_dump_qso_file(const std::string& file_name) {
   }
 
   g_ble_dump_in_progress = false;
-  g_ble_indicate_waiting = false;
+  if (ble_state_take()) {
+    g_ble_indicate_waiting = false;
+    ble_state_give();
+  }
   g_ble_dump_xfer.active = false;
   if (ui_mode == UIMode::QSO) {
     qso_draw_page();
   }
-  g_ble_force_send = true;
+  if (ble_state_take()) {
+    g_ble_force_send = true;
+    ble_state_give();
+  }
 }
 
 static void ble_try_dump_qso_file_by_key(char key) {
@@ -3611,15 +3999,31 @@ static void ble_try_dump_qso_file_by_key(char key) {
 }
 
 static void ble_mirror_tick() {
-  if (!g_ble_enabled) return;
+  if (!g_ble_enabled.load(std::memory_order_acquire)) return;
   if (g_ble_dump_in_progress) return;
-  if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
+
+  bool text_mode = false;
+  bool force_send = false;
+  std::string last_payload;
+  int64_t last_tick_slot = -1;
+  int last_tick_sec = -1;
+  uint16_t conn_handle = BLE_HS_CONN_HANDLE_NONE;
+  if (ble_state_take()) {
+    conn_handle = g_conn_handle;
+    text_mode = g_ble_text_mode;
+    force_send = g_ble_force_send;
+    last_payload = g_ble_last_payload;
+    last_tick_slot = g_ble_last_tick_slot;
+    last_tick_sec = g_ble_last_tick_sec;
+    ble_state_give();
+  }
+  if (conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
 
   std::vector<std::string> lines;
   ui_get_visible_text_lines(lines);
   while ((int)lines.size() < 6) lines.push_back("");
 
-  const std::string line7 = g_ble_text_mode ? ble_text_mode_line7() : ble_meta_line();
+  const std::string line7 = text_mode ? ble_text_mode_line7() : ble_meta_line();
 
   std::string screen_key;
   screen_key.reserve(256);
@@ -3629,17 +4033,28 @@ static void ble_mirror_tick() {
   }
   screen_key += line7;
 
-  if (g_ble_force_send || screen_key != g_ble_last_payload) {
-    g_ble_force_send = false;
-    g_ble_last_payload = screen_key;
-    if (g_ble_last_tick_slot < 0 || g_ble_last_tick_sec < 0) {
+  if (force_send || screen_key != last_payload) {
+    if (ble_state_take()) {
+      g_ble_force_send = false;
+      g_ble_last_payload = screen_key;
+      if (g_ble_last_tick_slot < 0 || g_ble_last_tick_sec < 0) {
+        int64_t slot_idx = 0;
+        int sec = 0;
+        bool even_slot = true;
+        ble_slot_second_now(slot_idx, sec, even_slot);
+        (void)even_slot;
+        g_ble_last_tick_slot = slot_idx;
+        g_ble_last_tick_sec = sec;
+      }
+      ble_state_give();
+    } else if (last_tick_slot < 0 || last_tick_sec < 0) {
       int64_t slot_idx = 0;
       int sec = 0;
       bool even_slot = true;
       ble_slot_second_now(slot_idx, sec, even_slot);
       (void)even_slot;
-      g_ble_last_tick_slot = slot_idx;
-      g_ble_last_tick_sec = sec;
+      (void)slot_idx;
+      (void)sec;
     }
     std::string out;
     out.reserve(screen_key.size() + 40);
@@ -3650,24 +4065,40 @@ static void ble_mirror_tick() {
 }
 
 static void ble_countdown_tick() {
-  if (!g_ble_enabled) return;
+  if (!g_ble_enabled.load(std::memory_order_acquire)) return;
   if (g_ble_dump_in_progress) return;
-  if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
+
+  uint16_t conn_handle = BLE_HS_CONN_HANDLE_NONE;
+  int64_t last_tick_slot = -1;
+  int last_tick_sec = -1;
+  if (ble_state_take()) {
+    conn_handle = g_conn_handle;
+    last_tick_slot = g_ble_last_tick_slot;
+    last_tick_sec = g_ble_last_tick_sec;
+    ble_state_give();
+  }
+  if (conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
 
   int64_t slot_idx = 0;
   int sec = 0;
   bool even_slot = true;
   ble_slot_second_now(slot_idx, sec, even_slot);
 
-  if (g_ble_last_tick_slot == slot_idx && g_ble_last_tick_sec == sec) return;
-  if (g_ble_last_tick_slot < 0 || g_ble_last_tick_sec < 0) {
-    g_ble_last_tick_slot = slot_idx;
-    g_ble_last_tick_sec = sec;
+  if (last_tick_slot == slot_idx && last_tick_sec == sec) return;
+  if (last_tick_slot < 0 || last_tick_sec < 0) {
+    if (ble_state_take()) {
+      g_ble_last_tick_slot = slot_idx;
+      g_ble_last_tick_sec = sec;
+      ble_state_give();
+    }
     return;
   }
 
-  g_ble_last_tick_slot = slot_idx;
-  g_ble_last_tick_sec = sec;
+  if (ble_state_take()) {
+    g_ble_last_tick_slot = slot_idx;
+    g_ble_last_tick_sec = sec;
+    ble_state_give();
+  }
   ble_notify_payload(ble_timing_token(sec, even_slot, g_tx_active));
 }
 
@@ -3677,12 +4108,17 @@ static void ble_on_sync(void) {
     ESP_LOGE(BT_TAG, "ensure addr failed: %d", rc);
     return;
   }
-  rc = ble_hs_id_infer_auto(0, &g_own_addr_type);
+  uint8_t own_addr_type = 0;
+  rc = ble_hs_id_infer_auto(0, &own_addr_type);
   if (rc != 0) {
     ESP_LOGE(BT_TAG, "infer auto addr failed: %d", rc);
     return;
   }
-  g_ble_synced = true;
+  if (ble_state_take()) {
+    g_own_addr_type = own_addr_type;
+    g_ble_synced = true;
+    ble_state_give();
+  }
   ble_update_name_from_station(false);
   ble_app_advertise();
 }
@@ -3694,10 +4130,22 @@ static void nimble_host_task(void* param) {
 }
 
 static void ble_app_advertise(void) {
-  if (!g_ble_stack_active) return;
-  if (!g_ble_enabled) return;
-  if (!g_ble_synced) return;
-  if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE) return;
+  if (!g_ble_stack_active.load(std::memory_order_acquire)) return;
+  if (!g_ble_enabled.load(std::memory_order_acquire)) return;
+
+  bool ble_synced = false;
+  uint16_t conn_handle = BLE_HS_CONN_HANDLE_NONE;
+  uint8_t own_addr_type = 0;
+  std::string adv_name;
+  if (ble_state_take()) {
+    ble_synced = g_ble_synced;
+    conn_handle = g_conn_handle;
+    own_addr_type = g_own_addr_type;
+    adv_name = g_ble_adv_name;
+    ble_state_give();
+  }
+  if (!ble_synced) return;
+  if (conn_handle != BLE_HS_CONN_HANDLE_NONE) return;
 
   struct ble_gap_adv_params adv{};
   adv.conn_mode = BLE_GAP_CONN_MODE_UND;
@@ -3705,7 +4153,7 @@ static void ble_app_advertise(void) {
 
   struct ble_hs_adv_fields fields{};
   fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-  const std::string name = g_ble_adv_name.empty() ? std::string("Mini-FT8") : g_ble_adv_name;
+  const std::string name = adv_name.empty() ? std::string("Mini-FT8") : adv_name;
   fields.name = (uint8_t*)name.c_str();
   fields.name_len = name.size();
   fields.name_is_complete = 1;
@@ -3716,7 +4164,7 @@ static void ble_app_advertise(void) {
     ESP_LOGE(BT_TAG, "adv_set_fields failed: %d", rc);
     return;
   }
-  rc = ble_gap_adv_start(g_own_addr_type, nullptr, BLE_HS_FOREVER, &adv, gap_cb, nullptr);
+  rc = ble_gap_adv_start(own_addr_type, nullptr, BLE_HS_FOREVER, &adv, gap_cb, nullptr);
   if (rc != 0) {
     ESP_LOGE(BT_TAG, "adv_start failed: %d", rc);
   } else {
@@ -3729,7 +4177,7 @@ static bool ble_pop_input(BleUiInput& out) { (void)out; return false; }
 static void ble_update_name_from_station(bool restart_adv) { (void)restart_adv; }
 static void apply_ble_enabled_policy(bool runtime_apply) {
   (void)runtime_apply;
-  g_time_osr = g_ble_enabled ? 1 : 2;
+  g_time_osr = g_ble_enabled.load(std::memory_order_acquire) ? 1 : 2;
   g_freq_osr = 1;
 }
 static void ble_mirror_tick() {}
@@ -4105,11 +4553,11 @@ static void load_station_data() {
   // Load-time defaults for fixed/runtime settings.
   g_rtc_comp = kRtcCompFixed;
   g_autoseq_max_retry = AUTOSEQ_MAX_RETRY;
-  g_ble_enabled = true;
+  g_ble_enabled.store(true, std::memory_order_release);
 
   FILE* f = fopen(STATION_FILE, "r");
   if (!f) {
-    autoseq_set_max_retry(g_autoseq_max_retry);
+    autoseq_safe_set_max_retry(g_autoseq_max_retry);
     apply_ble_enabled_policy(false);
     return;
   }
@@ -4153,7 +4601,7 @@ static void load_station_data() {
     } else if (sscanf(line, "rxtx_log=%d", &val) == 1) {
       g_rxtx_log = (val != 0);
     } else if (sscanf(line, "skiptx1=%d", &val) == 1) {
-      g_skip_tx1 = (val != 0); autoseq_set_skip_tx1(g_skip_tx1);
+      g_skip_tx1 = (val != 0); autoseq_safe_set_skip_tx1(g_skip_tx1);
     } else if (sscanf(line, "active_band=%d", &val) == 1) { // legacy single value
       g_active_band_text = std::to_string(val);
     } else if (strncmp(line, "active_bands=", 13) == 0) {
@@ -4161,7 +4609,7 @@ static void load_station_data() {
     } else if (sscanf(line, "autoseq_max_retry=%d", &val) == 1) {
       if (val >= 0) g_autoseq_max_retry = val;
     } else if (sscanf(line, "ble_enabled=%d", &val) == 1) {
-      g_ble_enabled = (val != 0);
+      g_ble_enabled.store((val != 0), std::memory_order_release);
     } else if (sscanf(line, "rtc_comp=%d", &val) == 1) {
       // Legacy key kept for file compatibility; ignored (fixed to kRtcCompFixed).
     } else {
@@ -4172,7 +4620,7 @@ static void load_station_data() {
     }
   }
   fclose(f);
-  autoseq_set_max_retry(g_autoseq_max_retry);
+  autoseq_safe_set_max_retry(g_autoseq_max_retry);
   // Try hardware RTC first (persists through deep sleep), fall back to saved strings
   if (!rtc_init_from_hw()) {
     ESP_LOGI(TAG, "Hardware RTC not valid, using saved time strings");
@@ -4213,7 +4661,7 @@ static void save_station_data() {
   fprintf(f, "rtc_sleep_epoch=%lld\n", (long long)g_rtc_sleep_epoch);
   fprintf(f, "rtc_comp=%d\n", kRtcCompFixed);
   fprintf(f, "autoseq_max_retry=%d\n", g_autoseq_max_retry);
-  fprintf(f, "ble_enabled=%d\n", g_ble_enabled ? 1 : 0);
+  fprintf(f, "ble_enabled=%d\n", g_ble_enabled.load(std::memory_order_acquire) ? 1 : 0);
   fclose(f);
 }
 
@@ -4233,11 +4681,8 @@ static void enter_mode(UIMode new_mode) {
       if (was_off && g_beacon != BeaconMode::OFF) {
         enqueue_beacon_cq();
         AutoseqTxEntry pending;
-        if (autoseq_fetch_pending_tx(pending)) {
-          g_qso_xmit = true;
-          g_target_slot_parity = pending.slot_id & 1;
-          g_pending_tx = pending;
-          g_pending_tx_valid = true;
+        if (autoseq_safe_fetch_pending_tx(pending)) {
+          tx_handoff_store_pending(pending);
         }
       }
     }
@@ -4245,7 +4690,7 @@ static void enter_mode(UIMode new_mode) {
     status_edit_buffer.clear();
   }
   if (new_mode != UIMode::QSO) {
-    g_ble_qso_pick_mode = false;
+    ble_state_set_qso_pick_mode(false);
     g_ble_dump_in_progress = false;
   }
   ui_mode = new_mode;
@@ -4290,7 +4735,7 @@ static void enter_mode(UIMode new_mode) {
     case UIMode::QSO:
       g_q_show_entries = false;
       q_page = 0;
-      if (g_ble_qso_pick_mode) {
+      if (ble_state_is_qso_pick_mode()) {
         qso_load_fetch_file_list();
       } else {
         qso_load_file_list();
@@ -4308,11 +4753,17 @@ static void enter_mode(UIMode new_mode) {
 
 #if ENABLE_BLE
 static void ble_enter_text_mode() {
-  g_ble_text_mode = true;
+  if (ble_state_take()) {
+    g_ble_text_mode = true;
+    ble_state_give();
+  }
 }
 
 static void ble_exit_text_mode() {
-  g_ble_text_mode = false;
+  if (ble_state_take()) {
+    g_ble_text_mode = false;
+    ble_state_give();
+  }
 }
 
 static bool ble_text_target_active() {
@@ -4384,15 +4835,15 @@ static void ble_commit_text_input(const BleUiInput& input) {
     menu_edit_buf = value;
 
     // Absolute indices across pages
-    if (menu_edit_idx == 3) { g_call = menu_edit_buf; autoseq_set_station(g_call, g_grid); }
-    else if (menu_edit_idx == 4) { g_grid = menu_edit_buf; autoseq_set_station(g_call, g_grid); }
+    if (menu_edit_idx == 3) { g_call = menu_edit_buf; autoseq_safe_set_station(g_call, g_grid); }
+    else if (menu_edit_idx == 4) { g_grid = menu_edit_buf; autoseq_safe_set_station(g_call, g_grid); }
     else if (menu_edit_idx == 7) { g_offset_hz = atoi(menu_edit_buf.c_str()); redraw_countdown_now(); }
     else if (menu_edit_idx == 10) { g_comment1 = menu_edit_buf; }
     else if (menu_edit_idx == 15) {
       int v = atoi(menu_edit_buf.c_str());
       if (v < 0) v = 0;
       g_autoseq_max_retry = v;
-      autoseq_set_max_retry(g_autoseq_max_retry);
+      autoseq_safe_set_max_retry(g_autoseq_max_retry);
     }
     if (menu_edit_idx == 3) {
       ble_update_name_from_station(true);
@@ -4455,19 +4906,25 @@ static void app_task_core0(void* /*param*/) {
 
   // Initialize mutexes for thread-safe operations
   log_mutex = xSemaphoreCreateMutex();
+  g_tx_handoff_mutex = xSemaphoreCreateMutex();
+  g_autoseq_mutex = xSemaphoreCreateMutex();
+  g_rx_lines_mutex = xSemaphoreCreateMutex();
+  g_hash_mutex = xSemaphoreCreateMutex();
+  g_ble_state_mutex = xSemaphoreCreateMutex();
+  if (!log_mutex || !g_tx_handoff_mutex || !g_autoseq_mutex || !g_rx_lines_mutex ||
+      !g_hash_mutex || !g_ble_state_mutex) {
+    ESP_LOGE(TAG, "Failed to create runtime mutexes");
+    vTaskDelete(nullptr);
+    return;
+  }
 
   ui_init();
   hashtable_init();
 
   // Initialize autoseq engine
-  autoseq_init();
-  
-// Cabrillo Field Day log callback (implemented in autoseq.cpp; declared here to avoid header churn)
-using CabrilloFdLogCallback = void (*)(const std::string& dxcall, const std::string& their_fd_exchange);
-extern void autoseq_set_cabrillo_fd_callback(CabrilloFdLogCallback cb);
-
-autoseq_set_adif_callback(log_adif_entry);
-autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
+  autoseq_safe_init();
+  autoseq_safe_set_adif_callback(log_adif_entry);
+  autoseq_safe_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
 
   ui_mode = UIMode::RX;
@@ -4477,7 +4934,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   update_autoseq_cq_type();
 
   // Update autoseq with station info after loading
-  autoseq_set_station(g_call, g_grid);
+  autoseq_safe_set_station(g_call, g_grid);
 
   // Prepare RX list (but don't draw yet - startup screen may be shown)
   std::vector<UiRxLine> empty;
@@ -4542,12 +4999,12 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       BleUiInput ble_input{};
       if (ble_pop_input(ble_input)) {
 #if ENABLE_BLE
-        if (!g_ble_enabled || g_ble_dump_in_progress) {
+        if (!g_ble_enabled.load(std::memory_order_acquire) || g_ble_dump_in_progress) {
           c_from_ble = false;
         } else {
           c_from_ble = true;
           last_key = 0;  // allow repeated BLE commands without local debounce suppression
-          if (g_ble_text_mode) {
+          if (ble_state_is_text_mode()) {
             ble_commit_text_input(ble_input);
           } else {
             c = ble_parse_ui_command(ble_input.data, ble_input.len);
@@ -4646,7 +5103,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
     if (c == 0) {
       if (g_rx_dirty && ui_mode == UIMode::RX) {
-        ui_set_rx_list(g_rx_lines);
+        std::vector<UiRxLine> rx_snapshot;
+        rx_lines_snapshot(rx_snapshot);
+        ui_set_rx_list(rx_snapshot);
         ui_draw_rx(rx_flash_idx);
         g_rx_dirty = false;
       }
@@ -4707,13 +5166,15 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   }
 
   // Ensure decode is enabled whenever streaming becomes active.
-  if (audio_source_is_streaming() && !g_decode_enabled) {
-    g_decode_enabled = true;
+  if (audio_source_is_streaming() && !g_decode_enabled.load(std::memory_order_acquire)) {
+    g_decode_enabled.store(true, std::memory_order_release);
     ui_set_paused(false);
   }
 
   if (g_rx_dirty && ui_mode == UIMode::RX) {
-      ui_set_rx_list(g_rx_lines);
+      std::vector<UiRxLine> rx_snapshot;
+      rx_lines_snapshot(rx_snapshot);
+      ui_set_rx_list(rx_snapshot);
       ui_draw_rx(rx_flash_idx);
       g_rx_dirty = false;
   }
@@ -4809,17 +5270,15 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     switch (ui_mode) {
       case UIMode::RX: {
         int sel = ui_handle_rx_key(c);
-        if (sel >= 0 && sel < (int)g_rx_lines.size()) {
+        UiRxLine selected_line;
+        if (rx_lines_get_item(sel, selected_line)) {
           // User tapped on a decoded message - let autoseq handle it
-          autoseq_on_touch(g_rx_lines[sel]);
+          autoseq_safe_on_touch(selected_line);
           g_tx_view_dirty = true;
           // Set TX flags - actual TX at slot boundary
           AutoseqTxEntry pending;
-          if (autoseq_fetch_pending_tx(pending)) {
-            g_qso_xmit = true;
-            g_target_slot_parity = pending.slot_id & 1;
-            g_pending_tx = pending;
-            g_pending_tx_valid = true;
+          if (autoseq_safe_fetch_pending_tx(pending)) {
+            tx_handoff_store_pending(pending);
           }
           rx_flash_idx = sel;
           rx_flash_deadline = rtc_now_ms() + 500;
@@ -4830,7 +5289,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       case UIMode::TX: {
         // TX view shows QSO states from autoseq
         // Pagination through QSO list (max 9 QSOs)
-        int qso_count = autoseq_queue_size();
+        int qso_count = autoseq_safe_queue_size();
         int start_idx = tx_page * 5;
         if (c == ';') {
           if (tx_page > 0) { tx_page--; redraw_tx_view(); }
@@ -4838,29 +5297,23 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
           if (start_idx + 5 < qso_count) { tx_page++; redraw_tx_view(); }
         } else if (c >= '2' && c <= '6') {
           int idx = start_idx + (c - '2');
-          if (autoseq_drop_index(idx)) {
-            g_pending_tx_valid = false;
+          if (autoseq_safe_drop_index(idx)) {
+            tx_handoff_clear_pending();
             redraw_tx_view();
             // Re-evaluate TX after queue change
             AutoseqTxEntry pending;
-            if (autoseq_fetch_pending_tx(pending)) {
-              g_qso_xmit = true;
-              g_target_slot_parity = pending.slot_id & 1;
-              g_pending_tx = pending;
-              g_pending_tx_valid = true;
+            if (autoseq_safe_fetch_pending_tx(pending)) {
+              tx_handoff_store_pending(pending);
             }
           }
         } else if (c == '1') {
-          if (autoseq_rotate_same_parity()) {
-            g_pending_tx_valid = false;
+          if (autoseq_safe_rotate_same_parity()) {
+            tx_handoff_clear_pending();
             redraw_tx_view();
             // Re-evaluate TX after queue change
             AutoseqTxEntry pending;
-            if (autoseq_fetch_pending_tx(pending)) {
-              g_qso_xmit = true;
-              g_target_slot_parity = pending.slot_id & 1;
-              g_pending_tx = pending;
-              g_pending_tx_valid = true;
+            if (autoseq_safe_fetch_pending_tx(pending)) {
+              tx_handoff_store_pending(pending);
             }
           }
         } else if (c == 'e' || c == 'E') {
@@ -4916,7 +5369,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 debug_log_line("UAC2 afail");
               } else {
                 debug_log_line("UAC2 aok");
-                g_decode_enabled = true;
+                g_decode_enabled.store(true, std::memory_order_release);
                 ui_set_paused(false);
                 ui_clear_waterfall();
                 esp_err_t rc = radio_control_on_audio_start();
@@ -5020,7 +5473,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         }
         case UIMode::QSO: {
 #if ENABLE_BLE
-          if (g_ble_qso_pick_mode && c_from_ble) {
+          if (ble_state_is_qso_pick_mode() && c_from_ble) {
             if (c == ';') {
               if (q_page > 0) { q_page--; qso_draw_page(); }
             } else if (c == '.') {
@@ -5128,15 +5581,15 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
             } else if (menu_edit_idx >= 0) {
               if (c == '\n' || c == '\r') {
                 // Absolute indices across pages
-                if (menu_edit_idx == 3) { g_call = menu_edit_buf; autoseq_set_station(g_call, g_grid); }
-                else if (menu_edit_idx == 4) { g_grid = menu_edit_buf; autoseq_set_station(g_call, g_grid); }
+                if (menu_edit_idx == 3) { g_call = menu_edit_buf; autoseq_safe_set_station(g_call, g_grid); }
+                else if (menu_edit_idx == 4) { g_grid = menu_edit_buf; autoseq_safe_set_station(g_call, g_grid); }
                 else if (menu_edit_idx == 7) { g_offset_hz = atoi(menu_edit_buf.c_str()); redraw_countdown_now(); }
                 else if (menu_edit_idx == 10) { g_comment1 = menu_edit_buf; }
                 else if (menu_edit_idx == 15) {
                   int v = atoi(menu_edit_buf.c_str());
                   if (v < 0) v = 0;
                   g_autoseq_max_retry = v;
-                  autoseq_set_max_retry(g_autoseq_max_retry);
+                  autoseq_safe_set_max_retry(g_autoseq_max_retry);
                 }
                 if (menu_edit_idx == 3) {
                   ble_update_name_from_station(true);
@@ -5319,7 +5772,8 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   if (c_from_ble) ble_enter_text_mode();
 #endif
                 } else if (c == '6') {
-                  g_ble_enabled = !g_ble_enabled;
+                  const bool ble_enabled_now = g_ble_enabled.load(std::memory_order_acquire);
+                  g_ble_enabled.store(!ble_enabled_now, std::memory_order_release);
                   apply_ble_enabled_policy(true);
                   save_station_data();
                   draw_menu_view();
@@ -5331,7 +5785,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 draw_menu_view();
               } else if (c == '2') {
                 g_skip_tx1 = !g_skip_tx1;
-                autoseq_set_skip_tx1(g_skip_tx1);
+                autoseq_safe_set_skip_tx1(g_skip_tx1);
                 save_station_data();
                 draw_menu_view();
               } else if (c == '3') {
@@ -5378,7 +5832,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     }
 
 #if ENABLE_BLE
-    if (g_ble_text_mode && !ble_text_target_active()) {
+    if (ble_state_is_text_mode() && !ble_text_target_active()) {
       ble_exit_text_mode();
     }
 #endif

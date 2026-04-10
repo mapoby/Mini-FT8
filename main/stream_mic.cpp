@@ -8,6 +8,7 @@
 #include <vector>
 #include <cmath>
 #include <cstring>
+#include <atomic>
 
 extern "C" {
   #include "ft8/decode.h"
@@ -16,7 +17,7 @@ extern "C" {
 }
 
 static const char* TAG_MIC = "FT8_MIC";
-extern bool g_streaming;  // true when WAV playback is running
+extern std::atomic_bool g_streaming;  // true when WAV playback is running
 extern int g_time_osr;
 extern int g_freq_osr;
 void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui);
@@ -91,7 +92,7 @@ void stream_mic_task(void* /*arg*/) {
   const int target_blocks = 80; // 79 symbols ~=12.64s; one-frame margin
 
   while (true) {
-    if (g_streaming) {
+    if (g_streaming.load(std::memory_order_acquire)) {
       mic_input_stop();
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
@@ -110,7 +111,7 @@ void stream_mic_task(void* /*arg*/) {
     monitor_reset(&mon);
     TickType_t next_wake = xTaskGetTickCount();
 
-        for (int blk = 0; blk < target_blocks && !g_streaming; ++blk) {
+        for (int blk = 0; blk < target_blocks && !g_streaming.load(std::memory_order_acquire); ++blk) {
       if (!mic_input_get_block(chunk, mon.block_size)) {
         ESP_LOGW(TAG_MIC, "mic read failed");
         break;
@@ -153,7 +154,7 @@ void stream_mic_task(void* /*arg*/) {
     }
 
     // If WAV streaming started, skip decode and continue
-    if (g_streaming) {
+    if (g_streaming.load(std::memory_order_acquire)) {
       mic_input_stop();
       continue;
     }
