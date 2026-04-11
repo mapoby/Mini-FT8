@@ -945,11 +945,11 @@ static std::vector<std::string> g_ctrl_lines = {
 
 static std::vector<std::string> g_startup_lines = {
     "Mini-FT8 V1.4.3",
-    "S: Status(Operate)",
-    "R: Rx page",
-    "T: Tx page",
-    "M: Menu(Setting)",
-    "Other: Q/C/B/N/O/D"
+    "Command: Status Rx",
+    "Tx Qso Menu(N,O)",
+    "Band Delete",
+    "BLE: Fetch U-up V-",
+    "down Z-left X-right"
 };
 
 // Runtime latch: when true, we keep showing the startup screen until any key is pressed.
@@ -1379,12 +1379,13 @@ static void delete_load_file_list() {
   g_d_files.clear();
   g_d_lines.clear();
   load_spiffs_regular_files(g_d_files);
+  g_d_files.erase(std::remove(g_d_files.begin(), g_d_files.end(), "Station.txt"), g_d_files.end());
   if (g_d_files.empty()) {
     g_d_lines.push_back("No SPIFFS files");
     return;
   }
   for (size_t i = 0; i < g_d_files.size(); ++i) {
-    g_d_lines.push_back(std::string("DELETE ") + g_d_files[i]);
+    g_d_lines.push_back(std::string("DEL ") + g_d_files[i]);
   }
 }
 
@@ -2777,7 +2778,7 @@ static void draw_menu_long_edit() {
     if (lines[line - 1].size() < 20) lines[line - 1].push_back('_');
     else if (line < 6) lines[line] = "_";
   }
-  ui_draw_list(lines, 0, -1);
+  ui_draw_debug(lines, 0);
 }
 
 static void log_tones(const uint8_t* tones, size_t n) {
@@ -3062,7 +3063,7 @@ static void draw_menu_view() {
     lines.push_back(std::string("Max Retry:") + std::to_string(g_autoseq_max_retry));
   }
   lines.push_back("Copy Logs to SD");
-  lines.push_back(menu_delete_confirm ? "Are you sure Y/N?" : "Delete Logs");
+  lines.push_back(menu_delete_confirm ? "Are you sure Y/N?" : "Delete All Files");
 
   int highlight_abs = -1;
   int64_t now = rtc_now_ms();
@@ -3430,7 +3431,7 @@ static std::string ble_text_mode_line7() {
   std::string item = "Edit";
 
   if (menu_delete_confirm) {
-    item = "Delete Logs";
+    item = "Delete All Files";
   } else if (menu_long_edit) {
     item = ble_menu_long_edit_label();
   } else if (menu_edit_idx >= 0) {
@@ -4213,7 +4214,7 @@ static void enter_mode(UIMode new_mode) {
       ui_draw_list(g_d_lines, d_page, -1);
       break;
     case UIMode::CONTROL:
-      ui_draw_list(g_ctrl_lines, 0, -1);
+      ui_draw_debug(g_ctrl_lines, 0);
       host_input.clear();
       ensure_usb();
       if (usb_ready) {
@@ -4421,7 +4422,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   ui_set_rx_list(empty);
 
   if (g_startup_active) {
-    ui_draw_list(g_startup_lines, 0, -1);
+    ui_draw_debug(g_startup_lines, 0);
   } else {
     ui_force_redraw_rx();
     ui_draw_rx();
