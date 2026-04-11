@@ -738,6 +738,21 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
     // passes in a ctx with a stale TX_UNDEF.
     switch (ctx->state) {
         case AutoseqState::CALLING:  // We sent CQ
+            // CQ is short-lived by design: autoseq_start_cq sets next_tx=TX6,
+            // we TX once, and tick() transitions CALLING→IDLE→pop. The beacon
+            // re-enqueues a fresh CQ on the next cycle if still on.
+            //
+            // The default case here is unreachable in normal operation:
+            //  - CALLING ctx always has dxcall="CQ" which never matches a DX
+            //    sender, so on_decode never calls generate_response(false) on
+            //    an existing CALLING ctx.
+            //  - The override path sets CALLING only when rcvd=TX1, which
+            //    immediately transitions via the TX1 case below.
+            //  - CALLING ctxs never enter the inactive zone (tick pops them
+            //    directly), so reactivation never produces CALLING.
+            // Therefore no next_tx refresh is needed — the invariant is
+            // maintained by construction. Refreshing to TX6 would wrongly
+            // re-send CQ and violate the short-lived design.
             switch (rcvd) {
                 case TxMsgType::TX1:
                     set_state(ctx, AutoseqState::REPORT, TxMsgType::TX2, s_max_retry);
@@ -750,8 +765,6 @@ static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool overrid
                     log_qso_if_needed(ctx);
                     return true;
                 default:
-                    // No-op: keep sending CQ
-                    ctx->next_tx = TxMsgType::TX6;
                     return false;
             }
 
