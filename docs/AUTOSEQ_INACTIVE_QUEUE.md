@@ -220,3 +220,69 @@ don't advance the QSO.
 The invariant is restored even across the inactive queue boundary: if
 `reactivate()` brings back an entry with stale `next_tx`, the very next call
 to `generate_response()` repairs it unconditionally.
+
+**Note on CALLING (CQ):** The CALLING state handler does NOT refresh `next_tx`
+in its default case, because CALLING is unreachable via reactivation by
+construction (CQ ctxs have dxcall="CQ", never enter the inactive zone, and
+the override path always transitions immediately). See inline comment in
+`generate_response()` for the full proof.
+
+## Formal design notes
+
+### Orthogonality of logical position and scheduling state
+
+A QsoContext has two independent coordinates:
+
+- **Logical position** (`state`): where we are in the FT8 protocol exchange.
+  Maps to the conversational order TX6 → TX1 → TX2 → TX3 → TX4 → TX5.
+  Active ctxs always have a well-defined position in {CALLING..SIGNOFF}.
+
+- **Scheduling state**: whether the ctx is actively participating in TX
+  scheduling. Three modes: active (in active zone, `tick()` processes it,
+  `fetch_pending_tx` can select it), inactive (in inactive zone, dormant,
+  preserving metadata for reactivation), or eliminated (popped from queue).
+
+These two dimensions are **orthogonal**. A ctx at logical position REPORT can
+be active (retrying TX2) or inactive (parked after retry exhaustion). Its
+logical position doesn't change when it moves between active and inactive —
+only its scheduling state does. When reactivated, it resumes at the same
+logical position with the same metadata.
+
+### Semantics of TX_UNDEF
+
+`TX_UNDEF` in the `next_tx` field means **"this context has no TX to schedule
+and should be eliminated from the active zone on the next cleanup."** It is a
+scheduling-layer tombstone, not a logical position.
+
+Specifically: `(next_tx == TX_UNDEF) ⇔ (state == IDLE, about to be popped)`.
+
+TX_UNDEF is NOT a protocol position. It should never appear on an active ctx
+with state != IDLE. The idempotent `generate_response()` state machine
+enforces this by refreshing `next_tx` to the canonical value for the current
+state whenever the state machine runs.
+
+**Pragmatic exception:** `autoseq_start_cq()` sets `next_tx = TX6` on CALLING
+ctxs so that CQ text can be generated through the same `format_tx_text()`
+path as QSO messages. This reuses the TX-generation pipeline uniformly for
+all message types, including the broadcast initiator (CQ). CALLING ctxs are
+one-shot (tick immediately transitions to IDLE → pop) and never retried or
+moved to inactive, so this does not violate the scheduling semantics of
+TX_UNDEF.
+
+### Future direction: TLA+ formalization
+
+The current switch/case state machine encodes both protocol progression rules
+and operational compliance heuristics (e.g., not logging QSOs without report
+exchange, handling DX intent for liveness). A future TLA+ specification would
+formalize these as:
+
+- **Safety**: the next_tx invariant, the ADIF logging correctness invariant
+- **Liveness**: every QSO with a responsive DX eventually completes
+- **Fairness**: round-robin retry ensures all active QSOs make progress
+
+The signed-distance metric (Δ = dx_pos − our_pos in conversational order)
+provides a candidate simplification: advance when 0 ≤ Δ ≤ 2, stay when
+Δ < 0, reject when Δ > 2. However, the current explicit rules also encode
+operational nuances (e.g., ethical compliance, DX intent inference) that
+would need to be captured as additional TLA+ constraints before the
+distance-based formulation can fully replace the case-by-case rules.
