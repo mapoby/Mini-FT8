@@ -267,19 +267,18 @@ void ui_force_redraw_rx() {
     last_page = -1;
 }
 
-static void draw_rx_line(int y, const RxDecodeEntry& l, int line_no, bool selected, bool more_indicator) {
+static void draw_rx_line(int y, const RxDecodeEntry& l, int line_no, bool selected, bool cyan_index_marker) {
     uint16_t color = TFT_WHITE;
-    if (more_indicator) {
-        color = rgb565(0, 255, 255); // cyan to indicate more pages
-    } else if (l.is_to_me) {
+    if (l.is_to_me) {
         color = rgb565(255, 0, 0);
     } else if (l.is_cq) {
         color = rgb565(0, 220, 0);
     }
     // Sticky line number in first column
     uint16_t bg = selected ? rgb565(30, 30, 60) : TFT_BLACK;
+    const uint16_t index_color = cyan_index_marker ? rgb565(0, 255, 255) : TFT_WHITE;
     M5.Display.fillRect(0, y, SCREEN_W, 16, bg);  // clear text band; gap handled by line_h
-    M5.Display.setTextColor(TFT_WHITE, bg);
+    M5.Display.setTextColor(index_color, bg);
     M5.Display.setCursor(0, y);
     M5.Display.printf("%d ", line_no);
     M5.Display.setTextColor(color, bg);
@@ -315,6 +314,8 @@ void ui_draw_rx(int flash_index) {
     DispGuard guard;
     M5.Display.startWrite();
     M5.Display.setTextSize(2);
+    const bool can_page_up = (rx_page > 0);
+    const bool can_page_down = ((rx_page + 1) * RX_LINES < rx_lines_count);
     int start = rx_page * RX_LINES;
     for (int i = 0; i < RX_LINES; ++i) {
         int idx = start + i;
@@ -322,8 +323,8 @@ void ui_draw_rx(int flash_index) {
         M5.Display.fillRect(0, y, SCREEN_W, line_h, TFT_BLACK);
         if (idx < rx_lines_count) {
             bool selected = (idx == flash_index);
-            bool more = (rx_page == 0 && rx_lines_count > RX_LINES && i == RX_LINES - 1);
-            draw_rx_line(y, rx_lines[idx], i + 1, selected, more);
+            bool cyan_marker = ((i == 0) && can_page_up) || ((i == RX_LINES - 1) && can_page_down);
+            draw_rx_line(y, rx_lines[idx], i + 1, selected, cyan_marker);
         } else {
             g_visible_rows[i].clear();
         }
