@@ -2052,6 +2052,38 @@ static std::string normalize_time_hms(const std::string& src) {
   return src;
 }
 
+static std::string normalize_date_ymd(const std::string& src) {
+  auto date_in_range = [](int y, int M, int d) -> bool {
+    return (y >= 2024 && y <= 2099 && M >= 1 && M <= 12 && d >= 1 && d <= 31);
+  };
+
+  int y = 0, M = 0, d = 0;
+  if (sscanf(src.c_str(), "%d-%d-%d", &y, &M, &d) == 3 && date_in_range(y, M, d)) {
+    char out[16];
+    snprintf(out, sizeof(out), "%04d-%02d-%02d", y, M, d);
+    return out;
+  }
+
+  std::string digits;
+  digits.reserve(src.size());
+  for (unsigned char ch : src) {
+    if (std::isdigit(ch)) digits.push_back((char)ch);
+  }
+  if (digits.size() >= 8) {
+    y = (digits[0] - '0') * 1000 + (digits[1] - '0') * 100 +
+        (digits[2] - '0') * 10 + (digits[3] - '0');
+    M = (digits[4] - '0') * 10 + (digits[5] - '0');
+    d = (digits[6] - '0') * 10 + (digits[7] - '0');
+    if (date_in_range(y, M, d)) {
+      char out[16];
+      snprintf(out, sizeof(out), "%04d-%02d-%02d", y, M, d);
+      return out;
+    }
+  }
+
+  return "";
+}
+
 static std::string menu_sleep_batt_line() {
   int level = (int)M5.Power.getBatteryLevel();
   if (level < 0 || level > 100) level = 0;
@@ -3553,9 +3585,13 @@ static std::string ble_meta_line() {
   ble_page_meta(cur, total);
 
   char meta[96];
+  const char* label = ble_page_label(ui_mode);
+  if (ui_mode == UIMode::QSO && g_ble_qso_pick_mode) {
+    label = "Fetch";
+  }
   const char up = (cur > 1) ? 'u' : '-';
   const char down = (cur < total) ? 'v' : '-';
-  std::snprintf(meta, sizeof(meta), "[%s %c%c]", ble_page_label(ui_mode), up, down);
+  std::snprintf(meta, sizeof(meta), "[%s %c%c]", label, up, down);
   return std::string(meta);
 }
 
@@ -4521,11 +4557,28 @@ static void ble_commit_text_input(const BleUiInput& input) {
     const size_t max_len = status_edit_buffer.size();
     if (value.size() > max_len) value.resize(max_len);
     status_edit_buffer = value;
-    if (status_edit_idx == 4) g_date = status_edit_buffer;
-    else g_time = normalize_time_hms(status_edit_buffer);
-    save_station_data();
-    rtc_set_from_strings();
-    rtc_sync_to_hw();  // Persist to hardware RTC
+    if (status_edit_idx == 4) {
+      const std::string old_date = g_date;
+      const std::string normalized = normalize_date_ymd(status_edit_buffer);
+      if (!normalized.empty()) {
+        g_date = normalized;
+        if (rtc_set_from_strings()) {
+          rtc_sync_to_hw();  // Persist to hardware RTC
+          save_station_data();
+        } else {
+          g_date = old_date;
+          ble_notify_payload("ERROR: use DATE YYYY-MM-DD");
+        }
+      } else {
+        g_date = old_date;
+        ble_notify_payload("ERROR: use DATE YYYY-MM-DD");
+      }
+    } else {
+      g_time = normalize_time_hms(status_edit_buffer);
+      save_station_data();
+      rtc_set_from_strings();
+      rtc_sync_to_hw();  // Persist to hardware RTC
+    }
     status_edit_idx = -1;
     status_cursor_pos = -1;
     status_edit_buffer.clear();
