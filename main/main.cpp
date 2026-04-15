@@ -3745,6 +3745,7 @@ static void ble_try_dump_qso_file_by_key(char key) {
   if (key < '1' || key > '6') return;
   int idx = q_page * 6 + (key - '1');
   if (idx < 0 || idx >= (int)g_q_files.size()) return;
+  if (!g_ble_enabled || g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
   ble_dump_qso_file(g_q_files[idx]);
 }
 
@@ -5057,9 +5058,14 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         }
         switched = true;
       }
-      else if ((c == 'f' || c == 'F') && c_from_ble) {
+      else if (c == 'f' || c == 'F') {
         cancel_status_edit();
-        ble_start_qso_pick_mode();
+        if (ui_mode == UIMode::QSO && g_ble_qso_pick_mode) {
+          g_ble_qso_return_mode = UIMode::RX;
+          ble_cancel_qso_pick_mode();
+        } else {
+          ble_start_qso_pick_mode();
+        }
         switched = true;
       }
       else if (c == 'q' || c == 'Q') { cancel_status_edit(); enter_mode(ui_mode == UIMode::QSO ? UIMode::RX : UIMode::QSO); switched = true; }
@@ -5334,7 +5340,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         }
         case UIMode::QSO: {
 #if ENABLE_BLE
-          if (g_ble_qso_pick_mode && c_from_ble) {
+          if (g_ble_qso_pick_mode) {
             if (c == ';') {
               if (q_page > 0) { q_page--; qso_draw_page(); }
             } else if (c == '.') {
