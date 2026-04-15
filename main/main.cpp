@@ -51,6 +51,7 @@ extern "C" {
 #include "audio_source.h"
 #include "stream_uac.h"
 #include "radio_control.h"
+#include "gps.h"
 
 #include "driver/spi_master.h"
 #include "driver/sdspi_host.h"
@@ -1003,6 +1004,9 @@ static void ble_countdown_tick();
 static void enter_mode(UIMode new_mode);
 static void apply_ble_enabled_policy(bool runtime_apply);
 static std::string menu_sleep_batt_line();
+static int normalize_gps_baud_value(int value);
+static bool rtc_set_from_strings();
+static void rtc_sync_to_hw();
 static bool g_rx_dirty = false;
 #if ENABLE_BLE
 static void ble_enter_text_mode();
@@ -1131,11 +1135,15 @@ static int g_autoseq_max_retry = AUTOSEQ_MAX_RETRY;
 static std::string g_free_text = "TNX 73";
 static std::string g_call = "YOURCALL";
 static std::string g_grid = "CM97";
+static std::string g_grid_saved_manual = "CM97";
+static bool g_grid_from_gps = false;
+static bool g_time_synced_from_gps = false;
 bool g_decode_enabled = true;
 int g_time_osr = 2;
 int g_freq_osr = 1;
 static OffsetSrc g_offset_src = OffsetSrc::RANDOM;
 static RadioType g_radio = RadioType::QMX;
+static int g_gps_baud = 115200;
 static constexpr size_t kIgnorePrefixTextMaxLen = 64;
 static std::string g_comment1 = "MiniFT8 /Radio";
 static std::string g_ignore_prefix_text;
@@ -1144,6 +1152,7 @@ static bool g_rxtx_log = true;
 static RadioType canonical_radio_type(RadioType r);
 static RadioProfileBinding get_radio_profile_binding(RadioType r);
 static void apply_radio_profile_binding();
+static void gps_runtime_tick();
 // Single-threaded TX state machine (replaces separate tx_send_task)
 // TX runs in main loop via tx_tick(), one tone at a time
 static bool g_tx_active = false;           // TX state machine is running
@@ -1984,6 +1993,13 @@ static const char* radio_name(RadioType r) {
 static void apply_radio_profile_binding() {
   audio_source_backend_t prev_audio = audio_source_get_backend();
   g_radio = canonical_radio_type(g_radio);
+  g_gps_baud = normalize_gps_baud_value(g_gps_baud);
+  if (g_radio == RadioType::KH1) {
+    // KH1 uses UART1 with inverted CAT signaling; GPS must release it.
+    gps_stop();
+  } else {
+    gps_start(g_gps_baud);
+  }
   RadioProfileBinding binding = get_radio_profile_binding(g_radio);
   audio_source_set_backend(binding.audio_backend);
   radio_control_set_backend(binding.radio_backend);
@@ -1996,6 +2012,82 @@ static void apply_radio_profile_binding() {
            radio_name(g_radio),
            audio_source_backend_name(binding.audio_backend),
            radio_control_backend_name(binding.radio_backend));
+}
+
+static void gps_runtime_tick() {
+  static int64_t s_last_apply_ms = 0;
+  static bool s_time_synced_once = false;
+  static int s_last_time_sync_hour_key = -1;
+
+  if (canonical_radio_type(g_radio) == RadioType::KH1) return;
+
+  gps_tick();
+
+  int detected_baud = 0;
+  if (gps_take_baud_update(&detected_baud)) {
+    detected_baud = normalize_gps_baud_value(detected_baud);
+    if (detected_baud != g_gps_baud) {
+      g_gps_baud = detected_baud;
+      save_station_data();
+      ESP_LOGI(TAG, "GPS baud persisted: %d", g_gps_baud);
+    }
+  }
+
+  const int64_t now = rtc_now_ms();
+  if ((now - s_last_apply_ms) < 1000) return;
+  s_last_apply_ms = now;
+
+  gps_state_t st = gps_get_state();
+  if (!st.valid_fix) return;
+
+  bool changed = false;
+  if (!st.grid_square.empty() && st.grid_square != "    " && st.grid_square != g_grid) {
+    g_grid = st.grid_square;
+    g_grid_from_gps = true;
+    autoseq_set_station(g_call, g_grid);
+    changed = true;
+    ESP_LOGI(TAG, "GPS grid synced: %s", g_grid.c_str());
+  }
+
+  if (!st.date_utc.empty() && !st.time_utc.empty()) {
+    int y = 0, M = 0, d = 0;
+    int h = 0, m = 0, s = 0;
+    const bool parsed_date = (sscanf(st.date_utc.c_str(), "%d-%d-%d", &y, &M, &d) == 3);
+    const bool parsed_time = (sscanf(st.time_utc.c_str(), "%d:%d:%d", &h, &m, &s) == 3);
+    int hour_key = -1;
+    if (parsed_date && parsed_time) {
+      hour_key = (((y * 100) + M) * 100 + d) * 100 + h;
+    }
+
+    bool do_time_sync = !s_time_synced_once;
+    if (!do_time_sync && parsed_time && !g_tx_active && !g_decode_in_progress) {
+      if (m == 0 && s <= 5 && hour_key >= 0 && hour_key != s_last_time_sync_hour_key) {
+        do_time_sync = true;
+      }
+    }
+
+    if (do_time_sync) {
+      const std::string old_date = g_date;
+      const std::string old_time = g_time;
+      g_date = st.date_utc;
+      g_time = st.time_utc;
+      if (rtc_set_from_strings()) {
+        rtc_sync_to_hw();
+        s_time_synced_once = true;
+        g_time_synced_from_gps = true;
+        if (hour_key >= 0) s_last_time_sync_hour_key = hour_key;
+        changed = true;
+        ESP_LOGI(TAG, "GPS time synced: %s %s", g_date.c_str(), g_time.c_str());
+      } else {
+        g_date = old_date;
+        g_time = old_time;
+      }
+    }
+  }
+
+  if (changed) {
+    save_station_data();
+  }
 }
 
 static std::string expand_comment1() {
@@ -2068,6 +2160,10 @@ static std::string normalize_time_hms(const std::string& src) {
     }
   }
   return src;
+}
+
+static int normalize_gps_baud_value(int value) {
+  return (value == 9600 || value == 115200) ? value : 115200;
 }
 
 static std::string normalize_date_ymd(const std::string& src) {
@@ -3326,7 +3422,7 @@ static void draw_status_view() {
   if (status_edit_idx == 4 && !status_edit_buffer.empty()) {
     lines[4] = std::string("Date: ") + highlight_pos(status_edit_buffer, status_cursor_pos);
   } else {
-    lines[4] = std::string("Date: ") + g_date;
+    lines[4] = std::string("Date: ") + g_date + (g_time_synced_from_gps ? "G" : "");
   }
   if (status_edit_idx == 5 && !status_edit_buffer.empty()) {
     lines[5] = std::string("Time: ") + highlight_pos(status_edit_buffer, status_cursor_pos);
@@ -4182,7 +4278,7 @@ static void host_handle_line(const std::string& line_in) {
         char buf[16];
         snprintf(buf, sizeof(buf), "%04d-%02d-%02d", y, M, d);
         g_date = buf;
-        if (rtc_set_from_strings()) { rtc_sync_to_hw(); save_station_data(); send("OK"); }
+        if (rtc_set_from_strings()) { g_time_synced_from_gps = false; rtc_sync_to_hw(); save_station_data(); send("OK"); }
         else send("ERROR: invalid date");
       }
     }
@@ -4198,7 +4294,7 @@ static void host_handle_line(const std::string& line_in) {
         char buf[16];
         snprintf(buf, sizeof(buf), "%02d:%02d:%02d", h, m, s);
         g_time = buf;
-        if (rtc_set_from_strings()) { rtc_sync_to_hw(); save_station_data(); send("OK"); }
+        if (rtc_set_from_strings()) { g_time_synced_from_gps = false; rtc_sync_to_hw(); save_station_data(); send("OK"); }
         else send("ERROR: invalid time");
       }
     }
@@ -4387,6 +4483,9 @@ static void load_station_data() {
   g_rtc_comp = kRtcCompFixed;
   g_autoseq_max_retry = AUTOSEQ_MAX_RETRY;
   g_ble_enabled = true;
+  g_gps_baud = 115200;
+  g_grid_saved_manual = g_grid;
+  g_grid_from_gps = false;
 
   FILE* f = fopen(STATION_FILE, "r");
   if (!f) {
@@ -4419,6 +4518,8 @@ static void load_station_data() {
     } else if (sscanf(line, "radio=%d", &val) == 1) {
       if (val == (int)RadioType::KH1) g_radio = RadioType::KH1;
       else g_radio = RadioType::QMX;
+    } else if (sscanf(line, "gps_baud=%d", &val) == 1) {
+      g_gps_baud = normalize_gps_baud_value(val);
     } else if (strncmp(line, "cq_ft=", 6) == 0) {
       g_cq_freetext = trim_upper_copy(line + 6);
     } else if (strncmp(line, "free_text=", 10) == 0) {
@@ -4427,6 +4528,8 @@ static void load_station_data() {
       g_call = trim_upper_copy(line + 5);
     } else if (strncmp(line, "grid=", 5) == 0) {
       g_grid = trim_upper_copy(line + 5);
+      g_grid_saved_manual = g_grid;
+      g_grid_from_gps = false;
     } else if (strncmp(line, "comment1=", 9) == 0) {
       g_comment1 = trim_copy(line + 9);
     } else if (strncmp(line, "ignore_prefixes=", 16) == 0) {
@@ -4484,9 +4587,10 @@ static void save_station_data() {
   fprintf(f, "skiptx1=%d\n", g_skip_tx1 ? 1 : 0);
   fprintf(f, "free_text=%s\n", g_free_text.c_str());
   fprintf(f, "call=%s\n", g_call.c_str());
-  fprintf(f, "grid=%s\n", g_grid.c_str());
+  fprintf(f, "grid=%s\n", g_grid_saved_manual.c_str());
   fprintf(f, "offset_src=%d\n", (int)g_offset_src);
   fprintf(f, "radio=%d\n", (int)canonical_radio_type(g_radio));
+  fprintf(f, "gps_baud=%d\n", normalize_gps_baud_value(g_gps_baud));
   fprintf(f, "comment1=%s\n", g_comment1.c_str());
   fprintf(f, "ignore_prefixes=%s\n", g_ignore_prefix_text.c_str());
   fprintf(f, "rxtx_log=%d\n", g_rxtx_log ? 1 : 0);
@@ -4654,7 +4758,12 @@ static void ble_commit_text_input(const BleUiInput& input) {
 
     // Absolute indices across pages
     if (menu_edit_idx == 3) { g_call = menu_edit_buf; autoseq_set_station(g_call, g_grid); }
-    else if (menu_edit_idx == 4) { g_grid = menu_edit_buf; autoseq_set_station(g_call, g_grid); }
+    else if (menu_edit_idx == 4) {
+      g_grid = menu_edit_buf;
+      g_grid_saved_manual = g_grid;
+      g_grid_from_gps = false;
+      autoseq_set_station(g_call, g_grid);
+    }
     else if (menu_edit_idx == 7) { g_offset_hz = atoi(menu_edit_buf.c_str()); redraw_countdown_now(); }
     else if (menu_edit_idx == 10) { g_comment1 = menu_edit_buf; }
     else if (menu_edit_idx == 15) {
@@ -4711,6 +4820,7 @@ static void ble_commit_text_input(const BleUiInput& input) {
       if (!normalized.empty()) {
         g_date = normalized;
         if (rtc_set_from_strings()) {
+          g_time_synced_from_gps = false;
           rtc_sync_to_hw();  // Persist to hardware RTC
           save_station_data();
         } else {
@@ -4723,6 +4833,7 @@ static void ble_commit_text_input(const BleUiInput& input) {
       }
     } else {
       g_time = normalize_time_hms(status_edit_buffer);
+      g_time_synced_from_gps = false;
       save_station_data();
       rtc_set_from_strings();
       rtc_sync_to_hw();  // Persist to hardware RTC
@@ -4875,6 +4986,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     // BLE remote UI push model: always compare and send latest 7-line snapshot when changed.
     ble_mirror_tick();
     ble_countdown_tick();
+    gps_runtime_tick();
     TickType_t now_ticks = xTaskGetTickCount();
     if ((now_ticks - g_app_core0_stack_last_sample_tick) >= pdMS_TO_TICKS(1000)) {
       g_app_core0_stack_last_sample_tick = now_ticks;
@@ -5380,6 +5492,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 } else if (c == '\n') {
                   if (status_edit_idx == 4) g_date = status_edit_buffer;
                   else g_time = normalize_time_hms(status_edit_buffer);
+                  g_time_synced_from_gps = false;
                   save_station_data();
                   rtc_set_from_strings();
                   rtc_sync_to_hw();  // Persist to hardware RTC
@@ -5532,7 +5645,12 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
               if (c == '\n' || c == '\r') {
                 // Absolute indices across pages
                 if (menu_edit_idx == 3) { g_call = menu_edit_buf; autoseq_set_station(g_call, g_grid); }
-                else if (menu_edit_idx == 4) { g_grid = menu_edit_buf; autoseq_set_station(g_call, g_grid); }
+                else if (menu_edit_idx == 4) {
+                  g_grid = menu_edit_buf;
+                  g_grid_saved_manual = g_grid;
+                  g_grid_from_gps = false;
+                  autoseq_set_station(g_call, g_grid);
+                }
                 else if (menu_edit_idx == 7) { g_offset_hz = atoi(menu_edit_buf.c_str()); redraw_countdown_now(); }
                 else if (menu_edit_idx == 10) { g_comment1 = menu_edit_buf; }
                 else if (menu_edit_idx == 15) {

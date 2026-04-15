@@ -2,6 +2,7 @@ idf_component_register(
     SRCS "main.cpp"
          "autoseq.cpp"
          "audio_source.cpp"
+         "gps.cpp"
          "radio_control.cpp"
          "radio_control_qmx.cpp"
          "radio_control_kh1_cat.cpp"
