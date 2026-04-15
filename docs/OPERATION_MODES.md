@@ -107,36 +107,34 @@ Both 9600 and 115200 GPS will work
 │ GPS              │                 │ Cardputer ADV               │
 │                  │                 │ PORTA                       │
 │ GND ─────────────┼─────────────────┤ GND                         │
-│ VDD ─────────────┼─────────────────┤ VDD                         │
-│ RX  ·············│                 │ TX (G2)                     │
+│ VDD ─────────────┼─────────────────┤ 5V                          │
+│ RX  ─────────────┼<──(Not Used)────┤ TX (G2)                     │
 │ TX  ─────────────┼────────────────>┤ RX (G1)                     │
 └──────────────────┘                 │                             │
                                      │ SW: 5VOUT (Left)            │
                                      └─────────────────────────────┘
 ```
 ## KH1 Connections
-Notice UART Port is configured differently.
+
  - TX Only (sotamat)
 ```text
 ┌──────────────────┐                 ┌────────────────────────────┐
 │ KH1 RS232        │                 │ Cardputer ADV              │
 │                  │                 │ PORTA                      │
 │ GND ─────────────┼─────────────────┤ GND                        │
-│ VDD ·············│                 │ VDD                        │
-│ Ring(Tx) ········│                 | RX (G2)                    │
-│ Tip(RX)──────────┼<────────────────┤ TX (G1)                    │
+│                  │                 │ 5V (NC)                    │
+│ Tip(Rx) ─────────┼<────────────────┤ TX (G2)                    │
+│ Ring(TX) ────────┼───(Not Used)───>┤ RX (G1)                    │
 └──────────────────┘                 │                            │
                                      │ SW: NA                     │
                                      └────────────────────────────┘
-
 ```
 - TX + RX (FT8 QSO)
   - Use a USB-C to audio/mic adapter for RX
   - Add 5V to PORTA, otherwise USB-C OTG port has no power
 ```text
 ┌──────────────────┐
-│ USB Port         │
-│                  │
+│ Power Cable      │
 │ GND ─────────────┼─────────┐
 │ 5V  ─────────────┼─────┐   │
 └──────────────────┘     |   |
@@ -144,9 +142,9 @@ Notice UART Port is configured differently.
 │ KH1 RS232        │     |   |       │ Cardputer ADV              │
 │                  │     |   |       │ PORTA                      │
 │ GND ─────────────┼─────)───┴───────┤ GND                        │
-│ VDD ·············│     └───────────┤ VDD                        │
-│ Ring(Tx) ········│                 | RX (G2)                    │
-│ Tip(RX)──────────┼<────────────────┤ TX (G1)                    │
+│                  │     └───────────┤ 5V                         │
+│ Tip(Rx) ─────────┼<────────────────┤ TX (G2)                    │
+│ Ring(TX) ────────┼── (Not Used)───>┤ RX (G1)                    │
 └──────────────────┘                 │                            │
                                      │ SW: 5VIN (Right)           │
                                      └────────────────────────────┘
