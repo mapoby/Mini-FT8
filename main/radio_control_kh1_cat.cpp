@@ -12,9 +12,12 @@
 static const char* TAG = "RADIO_KH1";
 
 static constexpr uart_port_t k_kh1_uart_num = UART_NUM_1;
-static constexpr gpio_num_t k_kh1_uart_tx_pin = GPIO_NUM_1;
+static constexpr gpio_num_t k_kh1_uart_tx_pin = GPIO_NUM_2;
+static constexpr gpio_num_t k_kh1_uart_rx_pin = GPIO_NUM_1;
 static constexpr int k_kh1_uart_baud = 9600;
 static bool s_uart_inited = false;
+static bool s_kh1_enabled = false;
+static bool s_power_seq_done = false;
 
 static int s_rx_freq10 = 0;
 static int s_tx_freq10 = 0;
@@ -28,6 +31,7 @@ static int hz_to_10hz(int hz) {
 }
 
 static esp_err_t kh1_uart_init(void) {
+    if (!s_kh1_enabled) return ESP_ERR_INVALID_STATE;
     if (s_uart_inited) return ESP_OK;
 
     uart_config_t cfg = {};
@@ -48,7 +52,7 @@ static esp_err_t kh1_uart_init(void) {
     err = uart_param_config(k_kh1_uart_num, &cfg);
     if (err != ESP_OK) return err;
 
-    err = uart_set_pin(k_kh1_uart_num, k_kh1_uart_tx_pin, UART_PIN_NO_CHANGE,
+    err = uart_set_pin(k_kh1_uart_num, k_kh1_uart_tx_pin, k_kh1_uart_rx_pin,
                        UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     if (err != ESP_OK) return err;
 
@@ -58,16 +62,18 @@ static esp_err_t kh1_uart_init(void) {
 
     gpio_set_drive_capability(k_kh1_uart_tx_pin, GPIO_DRIVE_CAP_3);
     s_uart_inited = true;
-    ESP_LOGI(TAG, "KH1 UART ready: UART%d TX=G%d %d 8N1 inverted",
-             (int)k_kh1_uart_num, (int)k_kh1_uart_tx_pin, k_kh1_uart_baud);
+    ESP_LOGI(TAG, "KH1 UART ready: UART%d TX=G%d RX=G%d %d 8N1 inverted",
+             (int)k_kh1_uart_num, (int)k_kh1_uart_tx_pin, (int)k_kh1_uart_rx_pin, k_kh1_uart_baud);
     return ESP_OK;
 }
 
 static bool kh1_ready(void) {
+    if (!s_kh1_enabled) return false;
     return kh1_uart_init() == ESP_OK;
 }
 
 static esp_err_t kh1_send_cmd(const char* cmd, uint32_t timeout_ms) {
+    if (!s_kh1_enabled) return ESP_ERR_INVALID_STATE;
     if (kh1_uart_init() != ESP_OK) return ESP_ERR_INVALID_STATE;
     ESP_LOGD(TAG, "CAT>%s", cmd);
     int written = uart_write_bytes(k_kh1_uart_num, cmd, strlen(cmd));
@@ -80,6 +86,9 @@ static esp_err_t kh1_sync_frequency_mode(int freq_hz) {
 
     esp_err_t err = kh1_send_cmd("MD2;", 200);
     if (err != ESP_OK) return err;
+    kh1_send_cmd("MNPWR;", 200);
+    kh1_send_cmd("MP020;", 200);
+    kh1_send_cmd("SW4T;", 200);
 
     char fa[24];
     snprintf(fa, sizeof(fa), "FA%07d;", s_rx_freq10);
@@ -170,6 +179,19 @@ static esp_err_t kh1_on_audio_start(void) {
 
     esp_err_t err = kh1_send_cmd("MD2;", 200);
     if (err != ESP_OK) return err;
+    
+    if (!s_power_seq_done) {
+        for (int i = 0; i < 25; ++i) {
+            err = kh1_send_cmd("ENAD;", 200);
+            if (err != ESP_OK) return err;
+        }
+        for (int i = 0; i < 5; ++i) {
+            err = kh1_send_cmd("ENAU;", 200);
+            if (err != ESP_OK) return err;
+        }
+        s_power_seq_done = true;
+    }
+    
     kh1_send_cmd("MNPWR;", 200);
     kh1_send_cmd("MP020;", 200);
     kh1_send_cmd("SW4T;", 200);
@@ -190,4 +212,23 @@ static const radio_control_ops_t k_ops = {
 
 const radio_control_ops_t* radio_control_kh1_get_ops(void) {
     return &k_ops;
+}
+
+void radio_control_kh1_set_enabled(bool enabled) {
+    if (s_kh1_enabled == enabled) return;
+    s_kh1_enabled = enabled;
+    if (!enabled) {
+        s_tx_active = false;
+        if (s_uart_inited) {
+            uart_wait_tx_done(k_kh1_uart_num, pdMS_TO_TICKS(50));
+            uart_flush_input(k_kh1_uart_num);
+            uart_driver_delete(k_kh1_uart_num);
+            s_uart_inited = false;
+        }
+    }
+    ESP_LOGI(TAG, "KH1 CAT %s", enabled ? "enabled" : "disabled");
+}
+
+bool radio_control_kh1_is_enabled(void) {
+    return s_kh1_enabled;
 }

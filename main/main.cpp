@@ -51,6 +51,7 @@ extern "C" {
 #include "audio_source.h"
 #include "stream_uac.h"
 #include "radio_control.h"
+#include "radio_control_backend.h"
 #include "gps.h"
 
 #include "driver/spi_master.h"
@@ -114,7 +115,7 @@ static bool g_ble_last_screen_valid = false;
 static int64_t g_ble_status_clock_slot_sent = -1;
 static int64_t g_ble_last_tick_slot = -1;
 static int g_ble_last_tick_sec = -1;
-static std::string g_ble_waterfall_header = "[                           ]";
+static std::string g_ble_waterfall_header = "|                           |";
 static int64_t g_ble_waterfall_slot_idx = -1;
 static bool g_ble_text_mode = false;
 static volatile uint32_t g_ble_decode_event_seq = 0;
@@ -1144,6 +1145,7 @@ int g_time_osr = 2;
 int g_freq_osr = 1;
 static OffsetSrc g_offset_src = OffsetSrc::RANDOM;
 static RadioType g_radio = RadioType::QMX;
+static bool g_kh1_connected = false;
 static int g_gps_baud = 115200;
 static constexpr size_t kIgnorePrefixTextMaxLen = 64;
 static std::string g_comment1 = "MiniFT8 /Radio";
@@ -1988,9 +1990,18 @@ static void apply_radio_profile_binding() {
   g_radio = canonical_radio_type(g_radio);
   g_gps_baud = normalize_gps_baud_value(g_gps_baud);
   if (g_radio == RadioType::KH1) {
-    // KH1 uses UART1 with inverted CAT signaling; GPS must release it.
-    gps_stop();
+    // KH1 mode is explicit-connect: GPS keeps UART1 until user presses Connect to KH1.
+    if (g_kh1_connected) {
+      gps_stop();
+      radio_control_kh1_set_enabled(true);
+    } else {
+      radio_control_kh1_set_enabled(false);
+      gps_start(g_gps_baud);
+    }
   } else {
+    // Leaving KH1 releases UART1 back to GPS.
+    g_kh1_connected = false;
+    radio_control_kh1_set_enabled(false);
     gps_start(g_gps_baud);
   }
   RadioProfileBinding binding = get_radio_profile_binding(g_radio);
@@ -2064,7 +2075,7 @@ static void gps_runtime_tick() {
   static bool s_time_synced_once = false;
   static int s_last_time_sync_hour_key = -1;
 
-  if (canonical_radio_type(g_radio) == RadioType::KH1) return;
+  if (canonical_radio_type(g_radio) == RadioType::KH1 && g_kh1_connected) return;
 
   gps_tick();
 
@@ -3513,6 +3524,7 @@ static std::string status_sync_line() {
   const bool streaming = audio_source_is_streaming();
   const RadioType radio = canonical_radio_type(g_radio);
   if (radio == RadioType::KH1) {
+    if (!g_kh1_connected) return "Connect to KH1";
     const bool cat_ready = radio_control_ready();
     if (cat_ready && streaming) return "Sync to KH1(RX+TX)";
     if (cat_ready && !streaming) return "Sync to KH1(TX)";
@@ -3903,7 +3915,7 @@ static std::string ble_timing_token(int sec, bool even_slot, bool txing) {
 }
 
 static std::string ble_blank_waterfall_header() {
-  return "[                           ]";
+  return "|                           |";
 }
 
 static void ble_update_waterfall_header_if_due(int64_t slot_idx, int sec) {
@@ -3937,7 +3949,7 @@ static void ble_update_waterfall_header_if_due(int64_t slot_idx, int sec) {
     if (bins[i] > max_v) max_v = bins[i];
   }
 
-  static const char kChars[4] = {' ', '.', ':', '|'};
+  static const char kChars[4] = {' ', '.', ':', '!'};
   char chars[kBleWfBins + 1];
   chars[kBleWfBins] = '\0';
   if (max_v <= min_v) {
@@ -3955,9 +3967,9 @@ static void ble_update_waterfall_header_if_due(int64_t slot_idx, int sec) {
 
   g_ble_waterfall_header.clear();
   g_ble_waterfall_header.reserve(kBleWfBins + 2);
-  g_ble_waterfall_header.push_back('[');
+  g_ble_waterfall_header.push_back('|');
   g_ble_waterfall_header.append(chars, kBleWfBins);
-  g_ble_waterfall_header.push_back(']');
+  g_ble_waterfall_header.push_back('|');
 }
 
 static void ble_start_qso_pick_mode() {
@@ -4122,7 +4134,7 @@ static void ble_mirror_tick() {
   out += "\n";
   out += g_ble_waterfall_header.empty() ? ble_blank_waterfall_header() : g_ble_waterfall_header;
   out += "\n";
-  out += std::string(29, '-');
+  out += "---+----+----+----+----+----+";
   out += "\n";
   out += screen_key;
   ble_notify_payload(out);
@@ -5293,7 +5305,8 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   int cur_status_sync_sig = audio_source_is_streaming() ? 1 : 0;
   if (canonical_radio_type(g_radio) == RadioType::KH1) {
     cur_status_sync_sig |= 2;
-    if (radio_control_ready()) cur_status_sync_sig |= 4;
+    if (g_kh1_connected) cur_status_sync_sig |= 8;
+    if (g_kh1_connected && radio_control_ready()) cur_status_sync_sig |= 4;
   }
   if (ui_mode == UIMode::STATUS && cur_status_sync_sig != last_status_sync_sig) {
     draw_status_view();
@@ -5528,6 +5541,10 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
           else if (c == '2') {
             status_edit_idx = 1;
             draw_status_view();
+            if (canonical_radio_type(g_radio) == RadioType::KH1 && !g_kh1_connected) {
+              g_kh1_connected = true;
+              apply_radio_profile_binding();
+            }
             if (!audio_source_is_streaming()) {
               debug_log_line("UAC2 start");
               apply_radio_profile_binding();
