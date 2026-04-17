@@ -173,7 +173,10 @@ static QsoContext* enqueue_one_shot(const std::string& dxcall,
     ctx->slot_id = slot_parity;
     ctx->is_freetext = is_freetext;
     ctx->pending_text = pending_text;
-    set_state(ctx, AutoseqState::CALLING, TxMsgType::TX6, 0);
+    // One-shots use TX_NONE as next_tx — text comes from format_one_shot_text
+    // (FT pending_text or CQ template), not from the FT8 state machine.
+    // Enforces the typing invariant: next_tx ∈ {TX_NONE, TX1..TX5}.
+    set_state(ctx, AutoseqState::CALLING, TxMsgType::TX_NONE, 0);
     return ctx;
 }
 
@@ -364,17 +367,16 @@ void autoseq_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
 }
 
 // Get the next TX message text based on current state (does NOT modify state)
-// Returns true if there's a TX ready, false otherwise
+// Returns true if there's a TX ready, false otherwise.
+//
+// Note: TX_NONE is no longer a "no TX" sentinel — it's a valid marker for
+// one-shot CALLING ctxs (CQ/FT) whose text comes from format_one_shot_text.
+// The "no TX" signal is now: state == IDLE OR format_tx_text returns empty.
 bool autoseq_get_next_tx(std::string& out_text) {
     out_text.clear();
-
     if (s_active_count == 0) return false;
-
     QsoContext* ctx = &s_queue[0];
-    if (ctx->state == AutoseqState::IDLE || ctx->next_tx == TxMsgType::TX_NONE) {
-        return false;
-    }
-
+    if (ctx->state == AutoseqState::IDLE) return false;
     format_tx_text(ctx, ctx->next_tx, out_text);
     return !out_text.empty();
 }
@@ -385,13 +387,11 @@ bool autoseq_fetch_pending_tx(AutoseqTxEntry& out) {
     if (s_active_count == 0) return false;
 
     QsoContext* ctx = &s_queue[0];
-    if (ctx->state == AutoseqState::IDLE || ctx->next_tx == TxMsgType::TX_NONE) {
-        return false;
-    }
+    if (ctx->state == AutoseqState::IDLE) return false;
 
     std::string tx_text;
     format_tx_text(ctx, ctx->next_tx, tx_text);
-    if (tx_text.empty()) return false;
+    if (tx_text.empty()) return false;  // covers degenerate one-shots, etc.
 
     out.text = tx_text;
     out.dxcall = ctx->dxcall;
@@ -513,9 +513,42 @@ static void set_state(QsoContext* ctx, AutoseqState s, TxMsgType first_tx, int l
     ctx->retry_limit = limit;
 }
 
+// Generate text for a one-shot entry (CQ or Free Text). Used when next_tx
+// is TX_NONE — the marker that this ctx's text comes from a preloaded
+// source (FT user text) or template path (CQ), not from the FT8 protocol
+// state machine. Enforces the typing invariant: next_tx ∈ {TX_NONE, TX1..TX5}.
+static void format_one_shot_text(const QsoContext* ctx, std::string& out) {
+    if (ctx->is_freetext) {
+        out = ctx->pending_text;
+        return;
+    }
+    char buf[64];
+    const char* cq_prefix = "CQ";
+    switch (s_cq_type) {
+        case AutoseqCqType::SOTA: cq_prefix = "CQ SOTA"; break;
+        case AutoseqCqType::POTA: cq_prefix = "CQ POTA"; break;
+        case AutoseqCqType::QRP:  cq_prefix = "CQ QRP";  break;
+        case AutoseqCqType::FD:   cq_prefix = "CQ FD";   break;
+        case AutoseqCqType::FREETEXT:
+            out = s_cq_freetext;
+            return;
+        default: break;
+    }
+    snprintf(buf, sizeof(buf), "%s %s %s",
+             cq_prefix, s_my_call.c_str(), s_my_grid.c_str());
+    out = buf;
+}
+
 static void format_tx_text(QsoContext* ctx, TxMsgType id, std::string& out) {
     out.clear();
     if (!ctx || ctx->state == AutoseqState::IDLE) return;
+
+    // TX_NONE on an active CALLING ctx = one-shot (CQ or FT). Otherwise on
+    // an IDLE ctx it means "evict me" — handled by the IDLE check above.
+    if (id == TxMsgType::TX_NONE) {
+        format_one_shot_text(ctx, out);
+        return;
+    }
 
     char buf[64];
 
@@ -575,29 +608,9 @@ static void format_tx_text(QsoContext* ctx, TxMsgType id, std::string& out) {
             out = buf;
             break;
 
-        case TxMsgType::TX6: {
-            // One-shot entry. Either Free Text (user-supplied, stored on ctx)
-            // or CQ (template-generated from station config).
-            if (ctx->is_freetext) {
-                out = ctx->pending_text;
-                break;
-            }
-            const char* cq_prefix = "CQ";
-            switch (s_cq_type) {
-                case AutoseqCqType::SOTA: cq_prefix = "CQ SOTA"; break;
-                case AutoseqCqType::POTA: cq_prefix = "CQ POTA"; break;
-                case AutoseqCqType::QRP:  cq_prefix = "CQ QRP";  break;
-                case AutoseqCqType::FD:   cq_prefix = "CQ FD";   break;
-                case AutoseqCqType::FREETEXT:
-                    out = s_cq_freetext;
-                    return;
-                default: break;
-            }
-            snprintf(buf, sizeof(buf), "%s %s %s",
-                     cq_prefix, s_my_call.c_str(), s_my_grid.c_str());
-            out = buf;
-            break;
-        }
+        // TX6 is no longer assigned to next_tx — one-shot CQ uses TX_NONE
+        // and goes through format_one_shot_text() above. The TX6 enum value
+        // remains for FT8 protocol completeness but is not a valid next_tx.
 
         default:
             break;

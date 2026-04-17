@@ -23,7 +23,21 @@ enum class AutoseqState {
     IDLE           // QSO complete (auto-removed)
 };
 
-// FT8 message types
+// FT8 message types.
+//
+// Typing invariant for QsoContext::next_tx:
+//
+//     next_tx ∈ {TX_NONE, TX1, TX2, TX3, TX4, TX5}
+//
+// TX6 is the FT8 CQ message but is NEVER assigned to next_tx. CQ ctxs
+// (and the Free Text variant that piggy-backs on the CQ infrastructure)
+// use next_tx = TX_NONE — text comes from format_one_shot_text(), which
+// reads ctx->pending_text for FT or generates the CQ template for CQ.
+//
+// Semantics of TX_NONE on next_tx:
+//   - On a CALLING ctx: "one-shot — text from preloaded source, evict
+//     after one TX (tick CALLING → IDLE → pop)."
+//   - On an IDLE ctx: "no TX, evict immediately by sort_and_clean."
 enum class TxMsgType {
     TX_NONE = 0,
     TX1,  // <DXCALL> <MYCALL> <GRID>
@@ -31,7 +45,7 @@ enum class TxMsgType {
     TX3,  // <DXCALL> <MYCALL> R##
     TX4,  // <DXCALL> <MYCALL> RR73
     TX5,  // <DXCALL> <MYCALL> 73
-    TX6   // CQ <MYCALL> <GRID>
+    TX6   // CQ <MYCALL> <GRID> — never used for next_tx (one-shots use TX_NONE)
 };
 
 // QSO context - one per active contact
