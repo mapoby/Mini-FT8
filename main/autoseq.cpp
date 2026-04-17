@@ -154,28 +154,63 @@ bool autoseq_rotate_same_parity() {
     return true;
 }
 
-void autoseq_start_cq(int slot_parity) {
-    // Don't add duplicate CQ in active zone
-    for (int i = 0; i < s_active_count; ++i) {
-        if (s_queue[i].state == AutoseqState::CALLING) {
-            return;
-        }
-    }
+// Shared helper for injecting one-shot CALLING entries (CQ and Free Text).
+// Both types are single-transmission: emit once, tick moves CALLING → IDLE → pop.
+// Returns the appended ctx, or nullptr if no room.
+static QsoContext* enqueue_one_shot(const std::string& dxcall,
+                                    bool is_freetext,
+                                    const std::string& pending_text,
+                                    int slot_parity) {
     if (s_inactive_start <= s_active_count) {
-        // No free space — try to evict an inactive entry
         evict_oldest_inactive();
-        if (s_inactive_start <= s_active_count) return;  // Still no room
+        if (s_inactive_start <= s_active_count) return nullptr;
     }
-
     QsoContext* ctx = append_ctx();
-    ctx->dxcall = "CQ";
+    ctx->dxcall = dxcall;
     ctx->dxgrid.clear();
     ctx->snr_tx = -99;
     ctx->snr_rx = -99;
-    ctx->slot_id = slot_parity;  // Use the specified slot parity
+    ctx->slot_id = slot_parity;
+    ctx->is_freetext = is_freetext;
+    ctx->pending_text = pending_text;
     set_state(ctx, AutoseqState::CALLING, TxMsgType::TX6, 0);
-    // No sort needed - CQ always at bottom
-    ESP_LOGI(TAG, "Started CQ on slot %d", slot_parity);
+    return ctx;
+}
+
+void autoseq_start_cq(int slot_parity) {
+    // Don't add duplicate CQ in active zone
+    for (int i = 0; i < s_active_count; ++i) {
+        if (s_queue[i].state == AutoseqState::CALLING && !s_queue[i].is_freetext) {
+            return;
+        }
+    }
+    // CQ text is generated from template at TX time — pending_text stays empty.
+    if (enqueue_one_shot("CQ", false, "", slot_parity)) {
+        ESP_LOGI(TAG, "Started CQ on slot %d", slot_parity);
+    }
+}
+
+bool autoseq_schedule_freetext(const std::string& text, int fallback_slot_parity) {
+    if (text.empty()) return false;
+    // Don't duplicate an already-pending Free Text.
+    for (int i = 0; i < s_active_count; ++i) {
+        if (s_queue[i].is_freetext) return false;
+    }
+    // Inherit parity from queue head if non-empty (preserves queue parity
+    // invariant — FT joins the current activation period). Otherwise use
+    // caller-provided fallback.
+    int slot_parity = (s_active_count > 0)
+                        ? (s_queue[0].slot_id & 1)
+                        : (fallback_slot_parity & 1);
+    QsoContext* ctx = enqueue_one_shot("(FT)", true, text, slot_parity);
+    if (ctx) {
+        ESP_LOGI(TAG, "Scheduled Free Text on slot %d: %s", slot_parity, text.c_str());
+        // Sort so the one-shot lands at the correct position (CALLING has
+        // lowest priority so it sits behind active QSOs).
+        sort_and_clean();
+        return true;
+    }
+    return false;
 }
 
 void autoseq_on_touch(const UiRxLine& msg) {
@@ -541,6 +576,12 @@ static void format_tx_text(QsoContext* ctx, TxMsgType id, std::string& out) {
             break;
 
         case TxMsgType::TX6: {
+            // One-shot entry. Either Free Text (user-supplied, stored on ctx)
+            // or CQ (template-generated from station config).
+            if (ctx->is_freetext) {
+                out = ctx->pending_text;
+                break;
+            }
             const char* cq_prefix = "CQ";
             switch (s_cq_type) {
                 case AutoseqCqType::SOTA: cq_prefix = "CQ SOTA"; break;
@@ -916,6 +957,10 @@ static void on_decode(const UiRxLine& msg) {
         std::string ctx_dxcall = ctx->dxcall;
         for (auto& ch : ctx_dxcall) ch = toupper((unsigned char)ch);
         if (ctx_dxcall == dxcall) {
+            // Re-anchor slot_id to the current RX slot's opposite parity.
+            // This preserves the queue-parity invariant across any edge cases
+            // where parity might drift (band switch, external intervention).
+            ctx->slot_id = msg.slot_id ^ 1;
             ESP_LOGI(TAG, "on_decode: found active ctx for %s, state=%d, next_tx=%d",
                      dxcall.c_str(), (int)ctx->state, (int)ctx->next_tx);
             generate_response(ctx, msg, false);
@@ -930,8 +975,11 @@ static void on_decode(const UiRxLine& msg) {
     if (inact_idx >= 0) {
         ESP_LOGI(TAG, "on_decode: reactivating inactive ctx for %s", dxcall.c_str());
         reactivate(inact_idx);
-        // After reactivation, the entry is at s_queue[s_active_count - 1]
+        // After reactivation, the entry is at s_queue[s_active_count - 1].
+        // Re-anchor slot_id to match the current RX — the parked ctx's
+        // slot_id may be stale if parity shifted while dormant.
         QsoContext* ctx = &s_queue[s_active_count - 1];
+        ctx->slot_id = msg.slot_id ^ 1;
         generate_response(ctx, msg, false);
         sort_and_clean();
         return;

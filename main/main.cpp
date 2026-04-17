@@ -5855,23 +5855,17 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 update_autoseq_cq_type();
                 draw_menu_view();
               } else if (c == '2') {
-                // Send freetext - one-off transmission, bypass autoseq
-                // If autoseq already has pending TX, ignore to avoid races
-                if (!autoseq_has_pending_tx()) {
-                  int64_t now_slot = rtc_now_ms() / 15000;
-                  AutoseqTxEntry ft{};
-                  ft.text = g_free_text;
-                  ft.dxcall = "FreeText";
-                  ft.offset_hz = g_offset_hz;
-                  ft.slot_id = (int)((now_slot + 1) & 1); // next slot
-                  ft.repeat_counter = 1;
-                  ft.is_signoff = false;
-                  if (schedule_manual_pending_tx(ft)) {
-                    menu_flash_idx = 1; // absolute index of "Send FreeText"
-                    menu_flash_deadline = rtc_now_ms() + 500;
-                    draw_menu_view();
-                    debug_log_line(std::string("Queued: ") + g_free_text);
-                  }
+                // Send Free Text via autoseq queue. FT is a one-shot CALLING
+                // entry that honors queue parity (inherits from queue[0] if
+                // non-empty, uses "next slot" if empty). This respects active
+                // QSOs — FT waits its turn rather than colliding.
+                int64_t now_slot = rtc_now_ms() / 15000;
+                int fallback_parity = (int)((now_slot + 1) & 1);
+                if (autoseq_schedule_freetext(g_free_text, fallback_parity)) {
+                  menu_flash_idx = 1; // absolute index of "Send FreeText"
+                  menu_flash_deadline = rtc_now_ms() + 500;
+                  draw_menu_view();
+                  debug_log_line(std::string("Queued: ") + g_free_text);
                 }
               } else if (c == '3') {
                 menu_long_edit = true;

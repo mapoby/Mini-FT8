@@ -61,6 +61,12 @@ struct QsoContext {
 
     int offset_hz = 1500;   // TX audio offset
     int slot_id = 0;        // TX slot (0=even, 1=odd)
+
+    // One-shot entries (CQ and Free Text) share the CALLING state but differ
+    // in text source: CQ text is generated from template, FT text is user-
+    // provided and stored here. is_freetext distinguishes the two.
+    bool is_freetext = false;
+    std::string pending_text;  // populated for FT one-shots; empty otherwise
 };
 
 // TX entry for scheduling
@@ -94,9 +100,17 @@ bool autoseq_drop_index(int idx);
 // Returns true if a rotation occurred.
 bool autoseq_rotate_same_parity();
 
-// Start a CQ call (adds CQ to queue)
+// Start a CQ call (adds CQ to queue). One-shot: transmits once then evicts.
 // slot_parity: 0 for even slots, 1 for odd slots
 void autoseq_start_cq(int slot_parity);
+
+// Schedule a Free Text one-shot transmission.
+// - Inherits slot parity from queue[0] if queue is non-empty, so FT joins the
+//   current activation period instead of colliding with other QSOs' slots.
+// - If queue is empty, uses fallback_slot_parity (caller should pass the next
+//   TX slot's parity based on wall-clock).
+// Returns false if no room or text is empty.
+bool autoseq_schedule_freetext(const std::string& text, int fallback_slot_parity);
 
 // Manual response: user taps on a decoded message
 void autoseq_on_touch(const UiRxLine& msg);
