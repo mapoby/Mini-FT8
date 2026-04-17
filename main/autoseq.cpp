@@ -26,6 +26,13 @@ static QsoContext s_queue[AUTOSEQ_MAX_QUEUE];
 static int s_active_count = 0;
 static int s_inactive_start = AUTOSEQ_MAX_QUEUE;  // no inactive entries
 
+// Singleton TX message buffer — holds the TX text for queue[0].
+// Invariant: (s_active_count == 0) ⇔ s_tx_msg_buffer.empty()
+// Refreshed by refresh_tx_msg_buffer() whenever queue[0] or its text
+// source may have changed. fetch_pending_tx() and autoseq_get_next_tx()
+// are pure reads of this buffer — they do not consult next_tx.
+static std::string s_tx_msg_buffer;
+
 // Station configuration
 static std::string s_my_call;
 static std::string s_my_grid;
@@ -57,6 +64,8 @@ static int s_last_tx_parity = -1;
 // ============== Forward declarations ==============
 
 static void set_state(QsoContext* ctx, AutoseqState s, TxMsgType first_tx, int limit);
+static void generate_cq_text_into(std::string& out);
+static void refresh_tx_msg_buffer();
 static void format_tx_text(QsoContext* ctx, TxMsgType id, std::string& out);
 static TxMsgType parse_rcvd_msg(QsoContext* ctx, const UiRxLine& msg);
 static bool generate_response(QsoContext* ctx, const UiRxLine& msg, bool override);
@@ -102,6 +111,7 @@ void autoseq_init() {
     s_pending_ctx_idx = -1;
     s_last_tx_slot_idx = -1000;
     s_last_tx_parity = -1;
+    s_tx_msg_buffer.clear();
 }
 
 void autoseq_clear() {
@@ -128,9 +138,11 @@ bool autoseq_drop_index(int idx) {
             s_queue[i] = s_queue[i + 1];
         }
         --s_active_count;
+        refresh_tx_msg_buffer();
         return true;
     }
     move_to_inactive(idx);
+    refresh_tx_msg_buffer();
     return true;
 }
 
@@ -151,11 +163,19 @@ bool autoseq_rotate_same_parity() {
         s_queue[i] = s_queue[i + 1];
     }
     s_queue[last] = head;
+    refresh_tx_msg_buffer();
     return true;
 }
 
 // Shared helper for injecting one-shot CALLING entries (CQ and Free Text).
 // Both types are single-transmission: emit once, tick moves CALLING → IDLE → pop.
+// Returns the appended ctx, or nullptr if no room.
+// Inject a one-shot CALLING entry. The caller is responsible for:
+//   - Choosing the dxcall marker ("CQ" for beacon CQ, "(FT)" for Free Text)
+//   - Providing the fully-formed TX text (preloaded into ctx->pending_text)
+//   - Setting is_freetext correctly (used for sort priority, not text source)
+//   - Picking the slot parity
+// The helper is type-agnostic — it doesn't inspect the text to infer type.
 // Returns the appended ctx, or nullptr if no room.
 static QsoContext* enqueue_one_shot(const std::string& dxcall,
                                     bool is_freetext,
@@ -171,11 +191,10 @@ static QsoContext* enqueue_one_shot(const std::string& dxcall,
     ctx->snr_tx = -99;
     ctx->snr_rx = -99;
     ctx->slot_id = slot_parity;
-    ctx->is_freetext = is_freetext;
+    ctx->is_freetext = is_freetext;  // for compare_ctx priority (FT above CQ)
     ctx->pending_text = pending_text;
-    // One-shots use TX_NONE as next_tx — text comes from format_one_shot_text
-    // (FT pending_text or CQ template), not from the FT8 state machine.
-    // Enforces the typing invariant: next_tx ∈ {TX_NONE, TX1..TX5}.
+    // next_tx = TX_NONE marks this ctx as "evict after tick." The text
+    // source is ctx->pending_text (via refresh_tx_msg_buffer), not next_tx.
     set_state(ctx, AutoseqState::CALLING, TxMsgType::TX_NONE, 0);
     return ctx;
 }
@@ -187,9 +206,12 @@ void autoseq_start_cq(int slot_parity) {
             return;
         }
     }
-    // CQ text is generated from template at TX time — pending_text stays empty.
-    if (enqueue_one_shot("CQ", false, "", slot_parity)) {
+    // Generate CQ text NOW (caller knows the type — no inference later).
+    std::string cq_text;
+    generate_cq_text_into(cq_text);
+    if (enqueue_one_shot("CQ", false, cq_text, slot_parity)) {
         ESP_LOGI(TAG, "Started CQ on slot %d", slot_parity);
+        refresh_tx_msg_buffer();
     }
 }
 
@@ -205,12 +227,13 @@ bool autoseq_schedule_freetext(const std::string& text, int fallback_slot_parity
     int slot_parity = (s_active_count > 0)
                         ? (s_queue[0].slot_id & 1)
                         : (fallback_slot_parity & 1);
+    // FT text is the user-provided string directly — no template involvement.
     QsoContext* ctx = enqueue_one_shot("(FT)", true, text, slot_parity);
     if (ctx) {
         ESP_LOGI(TAG, "Scheduled Free Text on slot %d: %s", slot_parity, text.c_str());
-        // Sort so the one-shot lands at the correct position (CALLING has
-        // lowest priority so it sits behind active QSOs).
+        // Sort so FT lands at the correct position (top, above QSOs).
         sort_and_clean();
+        refresh_tx_msg_buffer();
         return true;
     }
     return false;
@@ -240,6 +263,7 @@ void autoseq_on_touch(const UiRxLine& msg) {
     if (!my_norm.empty() && f1_norm == my_norm) {
         generate_response(ctx, msg, true);
         sort_and_clean();
+        refresh_tx_msg_buffer();
         return;
     }
 
@@ -274,6 +298,7 @@ void autoseq_on_touch(const UiRxLine& msg) {
     set_state(ctx, s_skip_tx1 ? AutoseqState::REPORT : AutoseqState::REPLYING,
               s_skip_tx1 ? TxMsgType::TX2 : TxMsgType::TX1, s_max_retry);
     sort_and_clean();
+    refresh_tx_msg_buffer();
 
     //dlogf("TH: af snr_tx=%d state=%d",
     //  ctx->snr_tx, (int)ctx->state);
@@ -292,6 +317,7 @@ void autoseq_on_decodes(const std::vector<UiRxLine>& to_me_messages) {
         on_decode(msg);
     }
     sort_and_clean();
+    refresh_tx_msg_buffer();
     if (s_active_count > 0) {
         ESP_LOGI(TAG, "on_decodes done: queue[0] state=%d, next_tx=%d, dxcall=%s",
                  (int)s_queue[0].state, (int)s_queue[0].next_tx, s_queue[0].dxcall.c_str());
@@ -358,6 +384,7 @@ void autoseq_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
     if (s_active_count > 0 && s_queue[0].state == AutoseqState::IDLE) {
         pop_front();
     }
+    refresh_tx_msg_buffer();
 
     ESP_LOGI(TAG, "Tick: active=%d, state=%d, next_tx=%d, retry=%d/%d",
              s_active_count, s_active_count > 0 ? (int)s_queue[0].state : -1,
@@ -366,34 +393,20 @@ void autoseq_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
              s_active_count > 0 ? s_queue[0].retry_limit : 0);
 }
 
-// Get the next TX message text based on current state (does NOT modify state)
-// Returns true if there's a TX ready, false otherwise.
-//
-// Note: TX_NONE is no longer a "no TX" sentinel — it's a valid marker for
-// one-shot CALLING ctxs (CQ/FT) whose text comes from format_one_shot_text.
-// The "no TX" signal is now: state == IDLE OR format_tx_text returns empty.
+// Pure reads of the singleton s_tx_msg_buffer. No inspection of next_tx.
+// The invariant "queue empty ⇔ buffer empty" is maintained by
+// refresh_tx_msg_buffer() being called at the end of every public API
+// that may change queue[0]'s identity or text source.
 bool autoseq_get_next_tx(std::string& out_text) {
-    out_text.clear();
-    if (s_active_count == 0) return false;
-    QsoContext* ctx = &s_queue[0];
-    if (ctx->state == AutoseqState::IDLE) return false;
-    format_tx_text(ctx, ctx->next_tx, out_text);
+    out_text = s_tx_msg_buffer;
     return !out_text.empty();
 }
 
-// Get the pending TX entry - populates from current context state
-// Does NOT modify state - just reads current next_tx
 bool autoseq_fetch_pending_tx(AutoseqTxEntry& out) {
-    if (s_active_count == 0) return false;
-
+    if (s_tx_msg_buffer.empty()) return false;
+    // Queue must be non-empty for the buffer to be non-empty (invariant).
     QsoContext* ctx = &s_queue[0];
-    if (ctx->state == AutoseqState::IDLE) return false;
-
-    std::string tx_text;
-    format_tx_text(ctx, ctx->next_tx, tx_text);
-    if (tx_text.empty()) return false;  // covers degenerate one-shots, etc.
-
-    out.text = tx_text;
+    out.text = s_tx_msg_buffer;
     out.dxcall = ctx->dxcall;
     out.offset_hz = ctx->offset_hz;
     out.slot_id = ctx->slot_id;
@@ -402,7 +415,7 @@ bool autoseq_fetch_pending_tx(AutoseqTxEntry& out) {
                       ctx->next_tx == TxMsgType::TX5);
 
     ESP_LOGI(TAG, "Fetch TX: %s (state=%d, next_tx=%d)",
-             tx_text.c_str(), (int)ctx->state, (int)ctx->next_tx);
+             out.text.c_str(), (int)ctx->state, (int)ctx->next_tx);
     return true;
 }
 
@@ -480,6 +493,13 @@ void autoseq_set_cabrillo_fd_callback(CabrilloFdLogCallback cb) {
 void autoseq_set_station(const std::string& call, const std::string& grid) {
     s_my_call = call;
     s_my_grid = grid;
+    // An enqueued CQ ctx would have cached the template with the old station
+    // — refresh so pending CQ reflects the new call/grid. (Rare but correct.)
+    if (s_active_count > 0 && s_queue[0].state == AutoseqState::CALLING
+        && !s_queue[0].is_freetext) {
+        generate_cq_text_into(s_queue[0].pending_text);
+        refresh_tx_msg_buffer();
+    }
 }
 
 void autoseq_set_skip_tx1(bool skip) {
@@ -502,6 +522,12 @@ void autoseq_set_max_retry(int retry) {
 void autoseq_set_cq_type(AutoseqCqType type, const std::string& freetext) {
     s_cq_type = type;
     s_cq_freetext = freetext;
+    // Refresh cached CQ text if there's a CQ ctx at the front.
+    if (s_active_count > 0 && s_queue[0].state == AutoseqState::CALLING
+        && !s_queue[0].is_freetext) {
+        generate_cq_text_into(s_queue[0].pending_text);
+        refresh_tx_msg_buffer();
+    }
 }
 
 // ============== Internal helpers ==============
@@ -513,15 +539,36 @@ static void set_state(QsoContext* ctx, AutoseqState s, TxMsgType first_tx, int l
     ctx->retry_limit = limit;
 }
 
-// Generate text for a one-shot entry (CQ or Free Text). Used when next_tx
-// is TX_NONE — the marker that this ctx's text comes from a preloaded
-// source (FT user text) or template path (CQ), not from the FT8 protocol
-// state machine. Enforces the typing invariant: next_tx ∈ {TX_NONE, TX1..TX5}.
-static void format_one_shot_text(const QsoContext* ctx, std::string& out) {
-    if (ctx->is_freetext) {
-        out = ctx->pending_text;
+// Recompute s_tx_msg_buffer from queue[0]. This is the sole writer of the
+// TX text buffer (aside from enqueue_one_shot which also populates ctx->
+// pending_text). Called at the end of every public API that may change
+// queue[0]'s identity or text source.
+//
+// Sources of text:
+//   queue empty            → buffer cleared
+//   queue[0] state IDLE    → buffer cleared (defensive; sort_and_clean should
+//                            have popped IDLE entries first)
+//   queue[0] state CALLING → copy from ctx->pending_text (populated at
+//                            enqueue for both CQ and FT one-shots)
+//   queue[0] other state   → derive via format_tx_text from ctx->next_tx
+//                            (this is the QSO state machine path)
+static void refresh_tx_msg_buffer() {
+    s_tx_msg_buffer.clear();
+    if (s_active_count == 0) return;
+    QsoContext* ctx = &s_queue[0];
+    if (ctx->state == AutoseqState::IDLE) return;
+    if (ctx->state == AutoseqState::CALLING) {
+        // One-shot entry (CQ or FT): text was populated at enqueue.
+        s_tx_msg_buffer = ctx->pending_text;
         return;
     }
+    // QSO ctx: derive from state machine.
+    format_tx_text(ctx, ctx->next_tx, s_tx_msg_buffer);
+}
+
+// Generate CQ template text into `out`. Called explicitly by the caller
+// when it knows it's handling CQ — no type inference from ctx flags.
+static void generate_cq_text_into(std::string& out) {
     char buf[64];
     const char* cq_prefix = "CQ";
     switch (s_cq_type) {
@@ -539,16 +586,13 @@ static void format_one_shot_text(const QsoContext* ctx, std::string& out) {
     out = buf;
 }
 
+// Derive TX text for a QSO ctx from its state-machine fields.
+// Called only for states REPLYING..SIGNOFF where next_tx ∈ {TX1..TX5}.
+// One-shot CALLING ctxs never reach this function — their text lives
+// in ctx->pending_text, populated at enqueue.
 static void format_tx_text(QsoContext* ctx, TxMsgType id, std::string& out) {
     out.clear();
     if (!ctx || ctx->state == AutoseqState::IDLE) return;
-
-    // TX_NONE on an active CALLING ctx = one-shot (CQ or FT). Otherwise on
-    // an IDLE ctx it means "evict me" — handled by the IDLE check above.
-    if (id == TxMsgType::TX_NONE) {
-        format_one_shot_text(ctx, out);
-        return;
-    }
 
     char buf[64];
 
