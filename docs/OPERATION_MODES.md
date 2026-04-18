@@ -1,106 +1,115 @@
-# Mini-FT8 Operation Menu (V2.0)
+# Mini-FT8 Operation Manual (V2.0)
 
 ## Quick Mode Map
 
 | Key | Mode | Purpose |
 |---|---|---|
-| `R` | RX | View decoded messages and tap one to start QSO. |
-| `T` | TX Queue | View and manage TX queue. |
-| `S` | STATUS | Beacon, connect/sync, band step, tune, date/time. |
-| `M` | MENU P1 | Core station/operator settings. |
-| `N` | MENU P2 | Radio/input/comment settings. |
-| `O` | MENU P3 | Logging/active bands/RTC/copy-to-SD/retry settings. |
-| `Q` | QSO | Browse QSO/log files and view entries. |
-| `F` | Fetch | Browse files and fetch/dump selected file to BLE client. |
-| `D` | Delete Files | Browse and delete files in SPIFFS. |
+| `R` | RX | View decoded messages and tap one to start a QSO. |
+| `T` | TX Queue | View and manage the transmit queue. |
+| `S` | STATUS | Access beacon, connect/sync, band step, tune, and date/time functions. |
+| `M` | MENU P1 | Configure core station and operator settings. |
+| `N` | MENU P2 | Configure radio, input, and comment settings. |
+| `O` | MENU P3 | Configure logging, active bands, RTC, copy-to-SD, and retry settings. |
+| `Q` | QSO | Browse QSO and log files, and view entries. |
+| `F` | Fetch | Browse files and fetch or dump the selected file to the BLE client. |
+| `D` | Delete Files | Browse and delete files stored in SPIFFS. |
 | `B` | BAND | Edit per-band frequencies. |
-| `C` | Connect | USB serial command mode. |
+| `C` | Connect | Enter USB serial command mode. |
 
 ## Global Keys and Navigation
 
-- `R/T/B/S/Q/F/D/C`: toggle target mode; pressing same mode key again returns to `RX`.
-- `M/N/O`: jump to MENU pages 1/2/3; pressing the same page key again on that page returns to `RX`.
-- `` ` `` (ESC/backtick): global TX cancel in `RX`, `TX`, and `STATUS` when not editing.
-- `▲` `▼` page up/down (RX/TX/BAND/MENU/QSO/Fetch/Delete).
-- `◀` `▶` left/right (QSO-SNR/Status-Date-Time/MENU-Fixed-LongEdit)
-- `1..6` always target the currently visible row/slot for the active mode.
--  BLE Terminal
-   - `u` `v` page up/down
-   - `z` `x` left/right (QSO-SNR)
+- `R` / `T` / `B` / `S` / `Q` / `F` / `D` / `C`: switch to the selected mode. Press the same mode key again to return to `RX`.
+- `M` / `N` / `O`: jump to MENU page 1 / 2 / 3. Press the current page key again to return to `RX`.
+- `` ` ``: cancel TX globally in `RX`, `TX`, and `STATUS` when not editing.
+- `▲` / `▼`: page up / page down in `RX`, `TX`, `BAND`, `MENU`, `QSO`, `Fetch`, and `Delete`.
+- `◀` / `▶`: move left / right in `QSO-SNR`, `STATUS` date/time, `MENU` fixed fields, and long edit mode.
+- `1`..`6`: always select the currently visible row in the active mode.
+
+### BLE Terminal
+
+- `E`: cancel current TX 
+- `u` / `v`: page up / page down
+- `z` / `x`: move left / right (`QSO-SNR`)
 
 ## BLE Screen Layout
 
 1. Text waterfall frame:
    ```text
-   =============================  (29 `=` Frame Boundary)
-   |                           |  (27 bins inside bars)
-   ---.----+----.----+----.----+  (29 `-` with 500Hz tick mark)
+   =============================  (29 `=` frame boundary)
+   |                           |  (27 bins inside the bars)
+   ----.----+----.----+----.----  (29-character scale with 500 Hz tick marks)
    ```
-4. Line 7 meta/edit line:
-   - normal: `[MODE uv]` (`u`/`v` show page-up/page-down availability; `-` means not available)
-   - text edit mode: `[Edit <item>]` (edit on BLE terminal first, enter to send, no escape)
+2. Line 7 meta/edit line:
+   - normal: [MODE uv] (`u` / `v` show page-up / page-down availability; `-` means not available)
+   - text edit mode: [Edit <item>] (edit in the BLE terminal, then press Enter to save; ESC is not available)
 
 Notes:
-- Waterfall bins use `space`, `.`, `:`, `!` to indicate signal strength for about 100Hz
-- counter: `|(slot boundary)`, `4`, `8`, `12`, `: (even)`, `. (odd)`, `o (Tx indicator)`
-- decoded message count: `[D:n]`
+- Waterfall bins use `space`, `.`, `:`, and `!` to indicate signal strength, about 100 Hz per bin.
+- Counter symbols: `|` (slot boundary), `4`, `8`, `12`, `:` (even slot), `.` (odd slot), `o` (TX indicator).
+- Decoded message count: [D:n]
 
 ## Per-Mode Controls
- - `` ` `` (ESC/backtick) applies wherever is needed.
- - Tex Edit: Backspace delete,  `` ` `` Cancel, Enter save
-   
+
+- ` acts as ESC where applicable.
+- Text Edit: Backspace deletes, ` cancels, Enter saves.
+  
 | Mode | Item | Notes |
 |---|---|---|
-| `R` (RX) | `1..6` | Select decoded line to reply. CQ messages are sorted from strong to weak. If the click happens within 4s, Tx starts immediately |
-|  | `▲` `▼` | Page up/down is appliable if 1 or 6 turns cyan |
-| `T` (TX Queue) | `1` | Rotate queue to next same-parity entry. |
-|  | `2..6` | Drop queue item on current page. |
-|  | `` ` `` (ESC) | Cancel a TX immediately. |
-| `S` (STATUS) | `1` | Cycle Beacon mode; applies after idle delay or on exit. |
-|  | `2` | Connect/sync action now; audio start + CAT sync path. |
-|  | `3` | Step to next active band; applies after idle delay or on exit. |
-|  | `4` | Tune toggle. |
-|  | `5` | Edit Date. (in place) `G` indicates Date/Time is synced to GPS|
-|  | `6` | Edit Time. (in place) |
-| `M` (MENU P1) | `1` | CQ Type cycle. For CQ FD, enter operating class and ARRL/RAC section in FreeText, e.g. `1B SCV` |
+| `R` (RX) | `1..6` | Select a decoded line to reply to. CQ messages are sorted from strongest to weakest. If selected within 4 s, TX starts immediately. |
+|  | `▲` `▼` | Page up/down is available when line 1 or line 6 is cyan. |
+| `T` (TX Queue) | `1` | Rotate the queue to the next same-parity entry. |
+|  | `2..6` | Drop the queue item on the current page. |
+|  | `` ` `` | Cancel TX immediately. |
+| `S` (STATUS) | `1` | Cycle Beacon mode. Applies when leaving STATUS mode. |
+|  | `2` | Run connect/sync now; starts audio and follows the CAT sync path. |
+|  | `3` | Step to the next active band. Applies after key 2 is pressed or when leaving STATUS. |
+|  | `4` | Toggle Tune. |
+|  | `5` | Edit Date (in place). `G` indicates date/time is synced from GPS. |
+|  | `6` | Edit Time (in place). |
+| `M` (MENU P1) | `1` | Cycle CQ Type. For CQ FD, enter operating class and ARRL/RAC section in FreeText, for example `1B SCV`. |
 |  | `2` | Send FreeText once. |
-|  | `3` | Edit FreeText. (Long Edit) Multi-purpose for sotamat, park/summit reference, ARRL field day, CQ modifier (CQ EU, CQ ASIA, etc.) |
-|  | `4` | Edit Call. (in place) |
-|  | `5` | Edit Grid. (in place) 4/6/8-char grid. If GPS is available, grid from GPS will be shown/used but not saved |
-|  | `6` | Enter Sleep. Battery Info |
-| `N` (MENU P2) | `1` | Offset source Random/Rx/Fixed. Random values are within 500-2500Hz|
-|  | `2` | Edit fixed cursor offset. (in place) Direct Enter or use `▲` `▼` `◀` `▶` |
-|  | `3` | Radio select (`QMX` / `KH1`). |
-|  | `4` | Edit ignore list (Long Edit). Prefixes separated by space, maximum 64-characters|
-|  | `5` | Edit comment. (Long Edit) For ADIF logging, Supports Macro `/Radio`, `/Grid` Expansion |
-|  | `6` | BLE on/off. Device name is `Mini-FT8-<callsign>` |
-| `O` (MENU P3) | `1` | RxTx log on/off. Note: RxTxLog has been renamed to RT\[YYMMDD\].txt |
-|  | `2` | SkipTX1 on/off. Skip `dxcall mycall mygrid` and reply with SNR report |
-|  | `3` | Edit active bands. (Long Edit) For Status Key 3|
-|  | `4` | Edit RTC compensation. (in place) |
-|  | `5` | Copy files to SD. Feedback with `Copied OK` or `Missed [n]` |
-|  | `6` | Edit max retry. (in place) any natural number or 0|
-| `Q` (QSO) | `1..6` | Open selected ADIF file. |
-|  | `◀` `▶` |  switch columns (choose Default view or SNR view). |
-| `F` (Fetch) | `1..6` | Select/Send file over BLE. |
-| `D` (Delete Files) | `1..6` | Delete selected file IMMEDIATELY without prompt |
+|  | `3` | Edit FreeText (Long Edit). Used for SOTAMAT, park/summit reference, ARRL Field Day exchange, CQ modifiers (`CQ EU`, `CQ ASIA`), and similar text. |
+|  | `4` | Edit Call (in place). |
+|  | `5` | Edit Grid (in place). Supports 4/6/8-character grid. If GPS is available, the GPS grid is shown and used, but not saved. |
+|  | `6` | Enter Sleep. Shows battery info. |
+| `N` (MENU P2) | `1` | Select offset source: Random / RX / Fixed. Random values are within 500-2500 Hz. |
+|  | `2` | Edit fixed cursor offset (in place). Enter directly or use `▲` `▼` `◀` `▶`. |
+|  | `3` | Select radio (`QMX` / `KH1`). |
+|  | `4` | Edit ignore list (Long Edit). Prefixes are separated by spaces; maximum 64 characters. |
+|  | `5` | Edit comment (Long Edit). Used for ADIF logging. Supports `/Radio` and `/Grid` macro expansion. |
+|  | `6` | Turn BLE on/off. Device name is `Mini-FT8-<callsign>`. |
+| `O` (MENU P3) | `1` | Turn RxTx log on/off. Note: RxTxLog has been renamed to `RT[YYMMDD].txt`. |
+|  | `2` | Turn SkipTX1 on/off. Skips `dxcall mycall mygrid` and replies with the SNR report. |
+|  | `3` | Edit active bands (Long Edit). Used by STATUS -> Band. |
+|  | `4` | Edit RTC compensation (in place). |
+|  | `5` | Copy files to SD. Feedback is `Copied OK` or `Missed [n]`. |
+|  | `6` | Edit max retry (in place). Accepts any natural number or `0`. |
+| `Q` (QSO) | `1..6` | Open the selected ADIF file. |
+|  | `◀` `▶` | Switch columns (Default view or SNR view). |
+| `F` (Fetch) | `1..6` | Select and send a file over BLE. |
+| `D` (Delete Files) | `1..6` | Delete the selected file immediately, without confirmation. |
 | `B` (BAND) | `1..6` | Choose a band slot to edit. |
-| `C` (Connect) |  | USB serial command mode for host commands. Only available before connected to a radio. Type `help`on PC to get host side commands |
+| `C` (Connect) |  | USB serial command mode for host commands. Available only before connecting to a radio. Type `help` on the PC to list host-side commands. |
 
 ## Download Logs
- - Use SD
-   - Insert a FAT/FAT32 formatted SD card
-   - Menu P3 (O), press 5 (Copy files to SD) — all files will be copied to the SD card (if "Missed", reboot will like fix it)
- - Use BLE
-   - Use BLE Terminal, send F and choose the file
-   - Use "Send Log file" on the BLE Terminal to save/email
- - Use pc_terminal.py
-   - On M5 Carputer, click C to enter communication 
-   - On PC: python .\pc_terminal.py COM11 for multiple commands 
-   - On PC: python .\pc_terminal.py COM11 read 20260113.adi for single command 
+
+- Use SD
+  - Insert a FAT/FAT32-formatted SD card.
+  - In MENU P3 (`O`), press `5` (Copy files to SD). All files will be copied to the SD card.
+  - If the result shows `Missed`, a reboot will usually fix it.
+
+- Use BLE
+  - In the BLE Terminal, send `F` and choose the file.
+  - Use "Send Log File" in the BLE Terminal to save or email it.
+
+- Use `pc_terminal.py`
+  - On the M5 Cardputer, press `C` to enter communication mode.
+  - On the PC, run `python .\pc_terminal.py COM11` for interactive use with multiple commands.
+  - On the PC, run `python .\pc_terminal.py COM11 read 20260113.adi` for a single command.
 
 ## GPS Connections
-Both 9600 and 115200 GPS modules work (auto detect)
+
+Both 9600 and 115200 baud GPS modules are supported (auto-detected).
 ```text
 ┌──────────────────┐                 ┌─────────────────────────────┐
 │ GPS              │                 │ Cardputer ADV               │
@@ -130,8 +139,8 @@ Both 9600 and 115200 GPS modules work (auto detect)
                                      └────────────────────────────┘
 ```
 - TX + RX (FT8 QSO)
-  - Use a USB-C to audio/mic adapter for RX (Amazon search: B0FWC9ZFC4, other calbes may work too, but this one was tested)
-  - Add 5V to PORTA, otherwise USB-C OTG port has no power
+  - Use a USB-C audio/mic adapter for RX. Tested adapter: Amazon `B0FWC9ZFC4`. Other adapters may also work, but this one is confirmed.
+  - Supply 5 V to PORTA; otherwise, the USB-C OTG port will not be powered.
 ```text
 ┌──────────────────┐
 │ Power Cable      │
@@ -150,5 +159,5 @@ Both 9600 and 115200 GPS modules work (auto detect)
                                      └────────────────────────────┘
 ```
 
-- Mini-FT8 will set KH1 Tx power to 2W automatically
-- Reduce AF volume to 05 or 06 for the best Rx performance
+- Mini-FT8 automatically sets KH1 TX power to 2 W.
+- For best RX performance, reduce AF volume to `05` or `06`.
