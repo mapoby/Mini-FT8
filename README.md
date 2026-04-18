@@ -65,7 +65,7 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
    ```text
    =============================  (29 `=` frame boundary)
    |                           |  (27 bins inside the bars)
-   ----.----+----.----+----.----  (29-character scale with 500 Hz tick marks)
+   ----.----+----.----+----.---+  (29-character scale with 500 Hz tick marks)
    ```
 2. Line 7 meta/edit line:
    - normal: [MODE uv] (`u` / `v` show page-up / page-down availability; `-` means not available)
