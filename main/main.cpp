@@ -1788,6 +1788,55 @@ static void host_write_str(const std::string& s) {
   }
 }
 
+// ================================================================
+// UART screen mirror
+//
+// Debug aid for headless boards (e.g. StampS3Bat): every time a
+// keystroke arrives over the console UART, dump the text that would
+// have been displayed on the Cardputer LCD to the same UART TX, so
+// a terminal shows the current page contents.
+//
+// To disable: comment out the `#define UART_SCREEN_MIRROR 1` below.
+// ================================================================
+#define UART_SCREEN_MIRROR 1
+
+#if UART_SCREEN_MIRROR
+static volatile bool g_uart_mirror_pending = false;
+
+static const char* uart_mirror_mode_label(UIMode mode) {
+  switch (mode) {
+    case UIMode::RX:      return "RX";
+    case UIMode::TX:      return "TX";
+    case UIMode::BAND:    return "BAND";
+    case UIMode::MENU:    return "MENU";
+    case UIMode::CONTROL: return "CONTROL";
+    case UIMode::DEBUG:   return "DEBUG";
+    case UIMode::STATUS:  return "STATUS";
+    case UIMode::QSO:     return "QSO";
+  }
+  return "?";
+}
+
+static void uart_mirror_dump_screen() {
+  std::vector<std::string> lines;
+  ui_get_visible_text_lines(lines);
+
+  // RX mode has proper paging info; other modes fall back to "page 1/1".
+  int cur = 1, total = 1;
+  if (ui_mode == UIMode::RX) {
+    ui_get_rx_page_info(cur, total);
+  }
+
+  const char* label = uart_mirror_mode_label(ui_mode);
+  printf("\n---- [%s %d/%d] ----\n", label, cur, total);
+  for (size_t i = 0; i < lines.size(); ++i) {
+    printf("%s\n", lines[i].c_str());
+  }
+  printf("--------------------\n");
+  fflush(stdout);
+}
+#endif  // UART_SCREEN_MIRROR
+
 struct WAVHeader {
   char riff[4];
   uint32_t file_size;
@@ -5116,15 +5165,32 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     } else if (state.enter) {
       c = '\n';  // enter/return
     }
-    // Merge injected keys from UART1 RX (console UART on G13/G15)
+    // Merge injected keys from console UART RX (G4/G5 per sdkconfig)
     poll_uart_inject_keys();
     if (c == 0 && s_key_inject_queue) {
       char injected = 0;
       if (xQueueReceive(s_key_inject_queue, &injected, 0) == pdTRUE) {
         c = injected;
         last_key = 0;  // Reset debounce so same-key injection works
+#if UART_SCREEN_MIRROR
+        g_uart_mirror_pending = true;  // dump screen at top of next iteration
+#endif
       }
     }
+
+#if UART_SCREEN_MIRROR
+    // Dump screen on the iteration AFTER a UART keypress was consumed,
+    // once the UI has had a chance to process the key and redraw.
+    static bool s_uart_mirror_fire = false;
+    if (s_uart_mirror_fire) {
+      uart_mirror_dump_screen();
+      s_uart_mirror_fire = false;
+    }
+    if (g_uart_mirror_pending) {
+      g_uart_mirror_pending = false;
+      s_uart_mirror_fire = true;  // fire on the next iteration
+    }
+#endif
     if (c == 0) {
       BleUiInput ble_input{};
       if (ble_pop_input(ble_input)) {
