@@ -24,7 +24,7 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 
 73, Wei AG6AQ
 
-# Mini-FT8 Operation Manual (V2.0)
+# Mini-FT8 Operation Manual (V2.0.1)
 
 ## Quick Mode Map
 
