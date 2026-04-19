@@ -1,0 +1,723 @@
+// ============================================================================
+// ble_native.cpp — GATT server for the Mini-FT8 native mobile client.
+//
+// Adds a second BLE service (alongside the existing text-terminal service)
+// that exposes structured reads, writes, and notifications per the contract
+// in ble_native.h and docs/NATIVE_CLIENT_ARCHITECTURE.md.
+//
+// The server is driven by a dedicated FreeRTOS task that:
+//   - pumps EVENTS / RADIO_STREAM notifications out of dirty flags
+//   - dispatches RPC_REQ writes to core_cmd_* and emits RPC_RESP
+//   - streams ADIF chunks on demand
+//
+// Consumer callbacks registered on core_api.h set dirty flags / push onto
+// queues — they MUST be trivial and fast; all heavy lifting happens on the
+// BLE TX task.
+// ============================================================================
+
+#include "ble_native.h"
+#include "core_api.h"
+#include "core_api_internal.h"
+
+#include <cstring>
+#include <cstdio>
+#include <string>
+#include <vector>
+
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+
+#include "host/ble_hs.h"
+#include "host/ble_gatt.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
+#include "cJSON.h"
+
+static const char* TAG = "BLE_NATIVE";
+
+// ---------------------------------------------------------------------------
+// UUIDs
+// ---------------------------------------------------------------------------
+
+static const ble_uuid128_t k_svc_uuid         = BLE_UUID128_INIT(BLE_NATIVE_SVC_UUID);
+static const ble_uuid128_t k_chr_events       = BLE_UUID128_INIT(BLE_NATIVE_CHR_EVENTS);
+static const ble_uuid128_t k_chr_rx_list      = BLE_UUID128_INIT(BLE_NATIVE_CHR_RX_LIST);
+static const ble_uuid128_t k_chr_qso_queue    = BLE_UUID128_INIT(BLE_NATIVE_CHR_QSO_QUEUE);
+static const ble_uuid128_t k_chr_config       = BLE_UUID128_INIT(BLE_NATIVE_CHR_CONFIG);
+static const ble_uuid128_t k_chr_radio_stream = BLE_UUID128_INIT(BLE_NATIVE_CHR_RADIO_STREAM);
+static const ble_uuid128_t k_chr_rpc_req      = BLE_UUID128_INIT(BLE_NATIVE_CHR_RPC_REQ);
+static const ble_uuid128_t k_chr_rpc_resp     = BLE_UUID128_INIT(BLE_NATIVE_CHR_RPC_RESP);
+static const ble_uuid128_t k_chr_adif_stream  = BLE_UUID128_INIT(BLE_NATIVE_CHR_ADIF_STREAM);
+
+// ---------------------------------------------------------------------------
+// Connection / subscription state
+// ---------------------------------------------------------------------------
+
+static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+static uint16_t s_mtu         = 23;   // negotiate up on connect
+
+static uint16_t s_h_events       = 0;
+static uint16_t s_h_radio_stream = 0;
+static uint16_t s_h_rpc_resp     = 0;
+static uint16_t s_h_adif_stream  = 0;
+
+static bool s_sub_events       = false;
+static bool s_sub_radio        = false;
+static bool s_sub_rpc_resp     = false;
+static bool s_sub_adif         = false;
+
+// ---------------------------------------------------------------------------
+// Event dirty flags (set by core_api callbacks, drained by TX task)
+// ---------------------------------------------------------------------------
+
+static volatile bool s_evt_dirty_rx     = false;
+static volatile bool s_evt_dirty_qso    = false;
+static volatile bool s_evt_dirty_config = false;
+
+// Latest waterfall row (callback overwrites; TX task sends whenever ready).
+// Only the single most recent row is kept — older rows are dropped (lossy).
+struct WaterfallSlot {
+  volatile bool valid = false;
+  int           sym   = 0;
+  int           num_bins = 0;
+  uint8_t       mag[512] = {};    // max bins at our config is ~433
+  float         swr   = 1.5f;
+  float         pwr   = 2.0f;
+  bool          ptt   = false;
+};
+static WaterfallSlot s_wf_slot;
+
+// ADIF streaming state
+struct AdifStreamState {
+  volatile bool active   = false;
+  int           handle   = -1;
+  int           total    = 0;
+  bool          eof_sent = false;
+};
+static AdifStreamState s_adif;
+
+// RPC response queue — small fixed-size buffer of pending JSON strings.
+struct RpcResponse {
+  std::string json;
+};
+static QueueHandle_t s_rpc_resp_queue = nullptr;
+
+// RPC request queue — populated in the BLE write callback, consumed by TX task.
+struct RpcRequest {
+  std::string json;
+};
+static QueueHandle_t s_rpc_req_queue = nullptr;
+
+// ---------------------------------------------------------------------------
+// TX task handle
+// ---------------------------------------------------------------------------
+
+static TaskHandle_t s_tx_task = nullptr;
+
+// ---------------------------------------------------------------------------
+// Core-API consumer callbacks (set dirty flags only; no BLE calls here)
+// ---------------------------------------------------------------------------
+
+static void on_rx_changed()     { s_evt_dirty_rx     = true; }
+static void on_qso_changed()    { s_evt_dirty_qso    = true; }
+static void on_config_changed() { s_evt_dirty_config = true; }
+
+static void on_waterfall_row(const WaterfallRow& row) {
+  // Keep only the most recent; drop older if TX task is behind.
+  s_wf_slot.valid    = false;          // invalidate while copying
+  s_wf_slot.sym      = row.sym;
+  s_wf_slot.swr      = row.swr;
+  s_wf_slot.pwr      = row.pwr;
+  s_wf_slot.ptt      = row.ptt;
+  s_wf_slot.num_bins = row.mag ? row.num_bins : 0;
+  if (row.mag && row.num_bins > 0 &&
+      (size_t)row.num_bins <= sizeof(s_wf_slot.mag)) {
+    memcpy(s_wf_slot.mag, row.mag, row.num_bins);
+  }
+  s_wf_slot.valid = true;
+}
+
+// ---------------------------------------------------------------------------
+// JSON serialization helpers
+// ---------------------------------------------------------------------------
+
+static std::string json_build_rx_list() {
+  std::vector<RxDecodeEntry> list;
+  core_get_rx_list(list);
+  cJSON* root  = cJSON_CreateObject();
+  cJSON* lines = cJSON_CreateArray();
+  for (const auto& e : list) {
+    cJSON* o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "t",  e.text);
+    cJSON_AddNumberToObject(o, "s",  e.snr);
+    cJSON_AddNumberToObject(o, "o",  e.offset_hz);
+    cJSON_AddNumberToObject(o, "p",  e.slot_id);
+    cJSON_AddBoolToObject  (o, "cq", e.is_cq);
+    cJSON_AddBoolToObject  (o, "me", e.is_to_me);
+    cJSON_AddItemToArray(lines, o);
+  }
+  cJSON_AddItemToObject(root, "lines", lines);
+  char* s = cJSON_PrintUnformatted(root);
+  std::string out = s ? s : "{}";
+  if (s) free(s);
+  cJSON_Delete(root);
+  return out;
+}
+
+static const char* qso_state_name(CoreQsoState s) {
+  switch (s) {
+    case CoreQsoState::CALLING:      return "CALLING";
+    case CoreQsoState::REPLYING:     return "REPLYING";
+    case CoreQsoState::REPORT:       return "REPORT";
+    case CoreQsoState::ROGER_REPORT: return "ROGER_REPORT";
+    case CoreQsoState::ROGERS:       return "ROGERS";
+    case CoreQsoState::SIGNOFF:      return "SIGNOFF";
+    case CoreQsoState::IDLE:         return "IDLE";
+  }
+  return "?";
+}
+static const char* tx_name(CoreTxMsg t) {
+  switch (t) {
+    case CoreTxMsg::NONE: return "NONE";
+    case CoreTxMsg::TX1:  return "TX1";
+    case CoreTxMsg::TX2:  return "TX2";
+    case CoreTxMsg::TX3:  return "TX3";
+    case CoreTxMsg::TX4:  return "TX4";
+    case CoreTxMsg::TX5:  return "TX5";
+    case CoreTxMsg::TX6:  return "TX6";
+    case CoreTxMsg::FREETEXT: return "FREETEXT";
+  }
+  return "?";
+}
+
+static std::string json_build_qso_queue() {
+  QsoSnapshot snap;
+  core_get_qso(snap);
+  cJSON* root   = cJSON_CreateObject();
+  cJSON* active = cJSON_CreateArray();
+  for (const auto& q : snap.active) {
+    cJSON* o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "call",    q.dxcall.c_str());
+    cJSON_AddStringToObject(o, "grid",    q.dxgrid.c_str());
+    cJSON_AddStringToObject(o, "state",   qso_state_name(q.state));
+    cJSON_AddStringToObject(o, "nextTx",  tx_name(q.next_tx));
+    cJSON_AddNumberToObject(o, "retry",   q.retry_counter);
+    cJSON_AddNumberToObject(o, "retryMax",q.retry_limit);
+    cJSON_AddNumberToObject(o, "slot",    q.slot_parity);
+    cJSON_AddNumberToObject(o, "snrTx",   q.snr_tx);
+    cJSON_AddNumberToObject(o, "snrRx",   q.snr_rx);
+    cJSON_AddBoolToObject  (o, "fd",      q.is_fd);
+    cJSON_AddBoolToObject  (o, "logged",  q.logged);
+    cJSON_AddItemToArray(active, o);
+  }
+  cJSON_AddItemToObject(root, "active", active);
+
+  cJSON* nx = cJSON_CreateObject();
+  cJSON_AddBoolToObject  (nx, "valid",    snap.next_tx.valid);
+  if (snap.next_tx.valid) {
+    cJSON_AddStringToObject(nx, "text",   snap.next_tx.text.c_str());
+    cJSON_AddStringToObject(nx, "call",   snap.next_tx.dxcall.c_str());
+    cJSON_AddNumberToObject(nx, "slot",   snap.next_tx.slot_parity);
+    cJSON_AddNumberToObject(nx, "offset", snap.next_tx.offset_hz);
+    cJSON_AddNumberToObject(nx, "retries",snap.next_tx.retries_remaining);
+  }
+  cJSON_AddItemToObject(root, "nextTx", nx);
+
+  char* s = cJSON_PrintUnformatted(root);
+  std::string out = s ? s : "{}";
+  if (s) free(s);
+  cJSON_Delete(root);
+  return out;
+}
+
+static const char* beacon_name(CoreBeaconMode m) {
+  switch (m) {
+    case CoreBeaconMode::OFF:  return "OFF";
+    case CoreBeaconMode::EVEN: return "EVEN";
+    case CoreBeaconMode::ODD:  return "ODD";
+  }
+  return "OFF";
+}
+static const char* cq_name(CoreCqType t) {
+  switch (t) {
+    case CoreCqType::CQ:       return "CQ";
+    case CoreCqType::SOTA:     return "SOTA";
+    case CoreCqType::POTA:     return "POTA";
+    case CoreCqType::QRP:      return "QRP";
+    case CoreCqType::FD:       return "FD";
+    case CoreCqType::FREETEXT: return "FREETEXT";
+  }
+  return "CQ";
+}
+static const char* offset_name(CoreOffsetSrc s) {
+  switch (s) {
+    case CoreOffsetSrc::RX:     return "RX";
+    case CoreOffsetSrc::CURSOR: return "CURSOR";
+    case CoreOffsetSrc::RANDOM: return "RANDOM";
+  }
+  return "RANDOM";
+}
+static const char* radio_name(CoreRadioType r) {
+  return (r == CoreRadioType::KH1) ? "KH1" : "QMX";
+}
+
+static std::string json_build_config() {
+  StationConfig cfg;
+  core_get_config(cfg);
+  cJSON* root = cJSON_CreateObject();
+  cJSON_AddStringToObject(root, "apiVer",    core_api_version());
+  cJSON_AddStringToObject(root, "bleVer",    BLE_NATIVE_VERSION);
+  cJSON_AddStringToObject(root, "call",      cfg.call.c_str());
+  cJSON_AddStringToObject(root, "grid",      cfg.grid.c_str());
+  cJSON_AddStringToObject(root, "comment",   cfg.comment.c_str());
+  cJSON_AddStringToObject(root, "radio",     radio_name(cfg.radio));
+  cJSON* bands = cJSON_CreateArray();
+  for (uint32_t hz : cfg.bands_hz) {
+    cJSON_AddItemToArray(bands, cJSON_CreateNumber((double)hz));
+  }
+  cJSON_AddItemToObject(root, "bands",     bands);
+  cJSON_AddNumberToObject(root, "bandIdx",   cfg.band_idx);
+  cJSON_AddStringToObject(root, "cqType",    cq_name(cfg.cq_type));
+  cJSON_AddStringToObject(root, "cqFreetext",cfg.cq_freetext.c_str());
+  cJSON_AddStringToObject(root, "beacon",    beacon_name(cfg.beacon));
+  cJSON_AddStringToObject(root, "offsetSrc", offset_name(cfg.offset_src));
+  cJSON_AddNumberToObject(root, "offsetHz",  cfg.offset_hz);
+  cJSON_AddBoolToObject  (root, "skipTx1",   cfg.skip_tx1);
+  cJSON_AddNumberToObject(root, "maxRetry",  cfg.max_retry);
+  cJSON_AddNumberToObject(root, "rtcComp",   cfg.rtc_comp);
+  cJSON_AddStringToObject(root, "date",      cfg.date.c_str());
+  cJSON_AddStringToObject(root, "time",      cfg.time.c_str());
+  cJSON* ig = cJSON_CreateArray();
+  for (const auto& p : cfg.ignore_prefixes) {
+    cJSON_AddItemToArray(ig, cJSON_CreateString(p.c_str()));
+  }
+  cJSON_AddItemToObject(root, "ignorePrefixes", ig);
+  char* s = cJSON_PrintUnformatted(root);
+  std::string out = s ? s : "{}";
+  if (s) free(s);
+  cJSON_Delete(root);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// GATT access callbacks (invoked by NimBLE on read/write)
+// ---------------------------------------------------------------------------
+
+static int access_read_str(struct ble_gatt_access_ctxt* ctxt, const std::string& body) {
+  return os_mbuf_append(ctxt->om, body.data(), body.size()) == 0
+             ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
+static int chr_rx_list_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt* ctxt, void*) {
+  if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_UNLIKELY;
+  return access_read_str(ctxt, json_build_rx_list());
+}
+static int chr_qso_queue_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt* ctxt, void*) {
+  if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_UNLIKELY;
+  return access_read_str(ctxt, json_build_qso_queue());
+}
+static int chr_config_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt* ctxt, void*) {
+  if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_UNLIKELY;
+  return access_read_str(ctxt, json_build_config());
+}
+
+static int chr_rpc_req_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt* ctxt, void*) {
+  if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
+  if (!ctxt->om || !s_rpc_req_queue) return 0;
+
+  // Flatten the mbuf chain into a single string.
+  uint16_t total = OS_MBUF_PKTLEN(ctxt->om);
+  std::string body;
+  body.resize(total);
+  uint16_t copied = 0;
+  if (ble_hs_mbuf_to_flat(ctxt->om, body.data(), total, &copied) != 0) return 0;
+  body.resize(copied);
+
+  RpcRequest req;
+  req.json = std::move(body);
+  xQueueSend(s_rpc_req_queue, &req, 0);
+  // Wake the TX task promptly.
+  if (s_tx_task) xTaskNotifyGive(s_tx_task);
+  return 0;
+}
+
+// Stubs for notify-only characteristics — they don't handle reads.
+static int chr_notify_only_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt*, void*) {
+  return BLE_ATT_ERR_READ_NOT_PERMITTED;
+}
+
+// ---------------------------------------------------------------------------
+// Characteristic + service tables
+// ---------------------------------------------------------------------------
+
+static const struct ble_gatt_chr_def k_chrs[] = {
+  { &k_chr_events.u,       chr_notify_only_cb, nullptr, nullptr,
+    BLE_GATT_CHR_F_NOTIFY, 0, &s_h_events, nullptr },
+  { &k_chr_rx_list.u,      chr_rx_list_cb,     nullptr, nullptr,
+    BLE_GATT_CHR_F_READ,   0, nullptr, nullptr },
+  { &k_chr_qso_queue.u,    chr_qso_queue_cb,   nullptr, nullptr,
+    BLE_GATT_CHR_F_READ,   0, nullptr, nullptr },
+  { &k_chr_config.u,       chr_config_cb,      nullptr, nullptr,
+    BLE_GATT_CHR_F_READ,   0, nullptr, nullptr },
+  { &k_chr_radio_stream.u, chr_notify_only_cb, nullptr, nullptr,
+    BLE_GATT_CHR_F_NOTIFY, 0, &s_h_radio_stream, nullptr },
+  { &k_chr_rpc_req.u,      chr_rpc_req_cb,     nullptr, nullptr,
+    BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP, 0, nullptr, nullptr },
+  { &k_chr_rpc_resp.u,     chr_notify_only_cb, nullptr, nullptr,
+    BLE_GATT_CHR_F_NOTIFY, 0, &s_h_rpc_resp, nullptr },
+  { &k_chr_adif_stream.u,  chr_notify_only_cb, nullptr, nullptr,
+    BLE_GATT_CHR_F_INDICATE, 0, &s_h_adif_stream, nullptr },
+  { nullptr, nullptr, nullptr, nullptr, 0, 0, nullptr, nullptr }
+};
+
+static const struct ble_gatt_svc_def k_svcs[] = {
+  { BLE_GATT_SVC_TYPE_PRIMARY, &k_svc_uuid.u, nullptr, k_chrs },
+  { 0, nullptr, nullptr, nullptr }
+};
+
+// ---------------------------------------------------------------------------
+// Connection lifecycle (called from gap_cb in main.cpp)
+// ---------------------------------------------------------------------------
+
+void ble_native_on_connect(uint16_t conn_handle) {
+  s_conn_handle = conn_handle;
+  s_sub_events  = s_sub_radio = s_sub_rpc_resp = s_sub_adif = false;
+  s_adif.active = false;
+  s_adif.handle = -1;
+}
+
+void ble_native_on_disconnect(void) {
+  s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+  s_sub_events  = s_sub_radio = s_sub_rpc_resp = s_sub_adif = false;
+  if (s_adif.active) {
+    core_adif_close(s_adif.handle);
+    s_adif.active = false;
+    s_adif.handle = -1;
+  }
+}
+
+void ble_native_on_mtu(uint16_t mtu) {
+  s_mtu = mtu;
+}
+
+void ble_native_on_subscribe(uint16_t attr_handle, bool notify_en, bool indicate_en) {
+  if (attr_handle == s_h_events)       s_sub_events   = notify_en;
+  if (attr_handle == s_h_radio_stream) s_sub_radio    = notify_en;
+  if (attr_handle == s_h_rpc_resp)     s_sub_rpc_resp = notify_en;
+  if (attr_handle == s_h_adif_stream)  s_sub_adif     = indicate_en;
+}
+
+// ---------------------------------------------------------------------------
+// Notification helpers
+// ---------------------------------------------------------------------------
+
+static void send_notify(uint16_t handle, const void* data, size_t len) {
+  if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || handle == 0) return;
+  struct os_mbuf* om = ble_hs_mbuf_from_flat(data, len);
+  if (!om) return;
+  ble_gatts_notify_custom(s_conn_handle, handle, om);
+}
+static void send_indicate(uint16_t handle, const void* data, size_t len) {
+  if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || handle == 0) return;
+  struct os_mbuf* om = ble_hs_mbuf_from_flat(data, len);
+  if (!om) return;
+  ble_gatts_indicate_custom(s_conn_handle, handle, om);
+}
+
+static void send_event_ping(const char* evt_tag) {
+  if (!s_sub_events) return;
+  char buf[32];
+  int n = snprintf(buf, sizeof(buf), "{\"e\":\"%s\"}", evt_tag);
+  if (n > 0) send_notify(s_h_events, buf, (size_t)n);
+}
+
+static void send_waterfall_row() {
+  if (!s_sub_radio || !s_wf_slot.valid) return;
+  s_wf_slot.valid = false;  // consume
+
+  const int num_bins = s_wf_slot.ptt ? 0 : s_wf_slot.num_bins;
+  const size_t total = BLE_NATIVE_RADIO_STREAM_HEADER_SIZE + (size_t)num_bins;
+
+  // If MTU can't fit the whole row, truncate (client still gets header + a prefix).
+  const size_t max_payload = (s_mtu > 3) ? (size_t)(s_mtu - 3) : 0;
+  const size_t send_len = total > max_payload ? max_payload : total;
+  if (send_len < BLE_NATIVE_RADIO_STREAM_HEADER_SIZE) return;
+
+  uint8_t buf[600];
+  if (send_len > sizeof(buf)) return;
+
+  BleRadioStreamHeader hdr;
+  hdr.sym      = (uint16_t)s_wf_slot.sym;
+  hdr.swr_q8   = (uint16_t)(s_wf_slot.swr * 256.0f);
+  hdr.pwr_q8   = (uint16_t)(s_wf_slot.pwr * 256.0f);
+  hdr.ptt      = s_wf_slot.ptt ? 1 : 0;
+  hdr.reserved = 0;
+  memcpy(buf, &hdr, sizeof(hdr));
+
+  const size_t body_len = send_len - sizeof(hdr);
+  if (body_len > 0) memcpy(buf + sizeof(hdr), s_wf_slot.mag, body_len);
+
+  send_notify(s_h_radio_stream, buf, send_len);
+}
+
+// ---------------------------------------------------------------------------
+// RPC dispatch
+// ---------------------------------------------------------------------------
+
+namespace {
+struct RpcResult { bool ok; std::string err; std::string extra_json; };
+
+RpcResult res_ok()                        { return {true,  {},  {}}; }
+RpcResult res_err(const char* m)          { return {false, m,   {}}; }
+RpcResult res_ok_extra(std::string extra) { return {true,  {},  std::move(extra)}; }
+
+int arg_int(cJSON* args, const char* key, int dflt) {
+  cJSON* v = cJSON_GetObjectItem(args, key);
+  return (v && cJSON_IsNumber(v)) ? v->valueint : dflt;
+}
+bool arg_bool(cJSON* args, const char* key, bool dflt) {
+  cJSON* v = cJSON_GetObjectItem(args, key);
+  return (v && cJSON_IsBool(v)) ? cJSON_IsTrue(v) : dflt;
+}
+std::string arg_str(cJSON* args, const char* key) {
+  cJSON* v = cJSON_GetObjectItem(args, key);
+  return (v && cJSON_IsString(v) && v->valuestring) ? v->valuestring : "";
+}
+
+CoreBeaconMode parse_beacon(const std::string& s) {
+  if (s == "EVEN") return CoreBeaconMode::EVEN;
+  if (s == "ODD")  return CoreBeaconMode::ODD;
+  return CoreBeaconMode::OFF;
+}
+CoreCqType parse_cq(const std::string& s) {
+  if (s == "SOTA")     return CoreCqType::SOTA;
+  if (s == "POTA")     return CoreCqType::POTA;
+  if (s == "QRP")      return CoreCqType::QRP;
+  if (s == "FD")       return CoreCqType::FD;
+  if (s == "FREETEXT") return CoreCqType::FREETEXT;
+  return CoreCqType::CQ;
+}
+CoreOffsetSrc parse_offset(const std::string& s) {
+  if (s == "RX")     return CoreOffsetSrc::RX;
+  if (s == "CURSOR") return CoreOffsetSrc::CURSOR;
+  return CoreOffsetSrc::RANDOM;
+}
+CoreRadioType parse_radio(const std::string& s) {
+  if (s == "KH1") return CoreRadioType::KH1;
+  return CoreRadioType::QMX;
+}
+
+RpcResult dispatch_rpc(const std::string& cmd, cJSON* args) {
+  if (cmd == BLE_NATIVE_RPC_TAP_RX) {
+    return core_cmd_tap_rx(arg_int(args, "idx", -1)) ? res_ok() : res_err("tap_rx failed");
+  }
+  if (cmd == BLE_NATIVE_RPC_CANCEL_TX) {
+    return core_cmd_cancel_tx() ? res_ok() : res_err("cancel_tx failed");
+  }
+  if (cmd == BLE_NATIVE_RPC_CLEAR_QSO_QUEUE) {
+    return core_cmd_clear_qso_queue() ? res_ok() : res_err("clear failed");
+  }
+  if (cmd == BLE_NATIVE_RPC_DROP_QSO) {
+    return core_cmd_drop_qso(arg_int(args, "idx", -1)) ? res_ok() : res_err("drop failed");
+  }
+  if (cmd == BLE_NATIVE_RPC_QUEUE_FREETEXT) {
+    return core_cmd_queue_freetext(arg_str(args, "text")) ? res_ok() : res_err("ft rejected");
+  }
+  if (cmd == BLE_NATIVE_RPC_SET_BAND) {
+    return core_cmd_set_band(arg_int(args, "idx", -1)) ? res_ok() : res_err("band idx");
+  }
+  if (cmd == BLE_NATIVE_RPC_SET_RADIO) {
+    return core_cmd_set_radio(parse_radio(arg_str(args, "radio"))) ? res_ok() : res_err("set_radio");
+  }
+  if (cmd == BLE_NATIVE_RPC_SET_CALL) {
+    return core_cmd_set_call(arg_str(args, "call")) ? res_ok() : res_err("set_call");
+  }
+  if (cmd == BLE_NATIVE_RPC_SET_GRID) {
+    return core_cmd_set_grid(arg_str(args, "grid")) ? res_ok() : res_err("set_grid");
+  }
+  if (cmd == BLE_NATIVE_RPC_SET_COMMENT) {
+    return core_cmd_set_comment(arg_str(args, "comment")) ? res_ok() : res_err("set_comment");
+  }
+  if (cmd == BLE_NATIVE_RPC_SET_CQ_TYPE) {
+    return core_cmd_set_cq_type(parse_cq(arg_str(args, "type"))) ? res_ok() : res_err("set_cq");
+  }
+  if (cmd == BLE_NATIVE_RPC_SET_CQ_FREETEXT) {
+    return core_cmd_set_cq_freetext(arg_str(args, "text")) ? res_ok() : res_err("set_cq_ft");
+  }
+  if (cmd == BLE_NATIVE_RPC_SET_BEACON) {
+    return core_cmd_set_beacon(parse_beacon(arg_str(args, "mode"))) ? res_ok() : res_err("set_beacon");
+  }
+  if (cmd == BLE_NATIVE_RPC_SET_OFFSET_SRC) {
+    return core_cmd_set_offset_src(parse_offset(arg_str(args, "src"))) ? res_ok() : res_err("offset_src");
+  }
+  if (cmd == BLE_NATIVE_RPC_SET_OFFSET_HZ) {
+    return core_cmd_set_offset_hz(arg_int(args, "hz", -1)) ? res_ok() : res_err("offset_hz");
+  }
+  if (cmd == BLE_NATIVE_RPC_SET_SKIP_TX1) {
+    return core_cmd_set_skip_tx1(arg_bool(args, "skip", false)) ? res_ok() : res_err("skip_tx1");
+  }
+  if (cmd == BLE_NATIVE_RPC_SET_MAX_RETRY) {
+    return core_cmd_set_max_retry(arg_int(args, "n", -1)) ? res_ok() : res_err("max_retry");
+  }
+  if (cmd == BLE_NATIVE_RPC_SET_RTC) {
+    cJSON* v = cJSON_GetObjectItem(args, "ms");
+    int64_t ms = (v && cJSON_IsNumber(v)) ? (int64_t)v->valuedouble : 0;
+    return core_cmd_set_rtc(ms) ? res_ok() : res_err("set_rtc");
+  }
+  if (cmd == BLE_NATIVE_RPC_SET_RTC_COMP) {
+    return core_cmd_set_rtc_comp(arg_int(args, "ppm", 0)) ? res_ok() : res_err("rtc_comp");
+  }
+  if (cmd == BLE_NATIVE_RPC_IGNORE_ADD) {
+    return core_cmd_ignore_add(arg_str(args, "prefix")) ? res_ok() : res_err("ignore_add");
+  }
+  if (cmd == BLE_NATIVE_RPC_IGNORE_REMOVE) {
+    return core_cmd_ignore_remove(arg_str(args, "prefix")) ? res_ok() : res_err("ignore_rm");
+  }
+  if (cmd == BLE_NATIVE_RPC_IGNORE_CLEAR) {
+    return core_cmd_ignore_clear() ? res_ok() : res_err("ignore_clear");
+  }
+  if (cmd == BLE_NATIVE_RPC_ADIF_OPEN) {
+    if (s_adif.active) return res_err("adif busy");
+    CoreAdifHandle h = core_adif_open();
+    if (h.id < 0) return res_err("adif open failed");
+    s_adif.handle   = h.id;
+    s_adif.total    = h.total;
+    s_adif.eof_sent = false;
+    s_adif.active   = true;
+    char extra[32];
+    snprintf(extra, sizeof(extra), ",\"size\":%d", h.total);
+    return res_ok_extra(extra);
+  }
+  if (cmd == BLE_NATIVE_RPC_ADIF_CLOSE) {
+    if (s_adif.active) {
+      core_adif_close(s_adif.handle);
+      s_adif.active = false;
+      s_adif.handle = -1;
+    }
+    return res_ok();
+  }
+  return res_err("unknown cmd");
+}
+
+void handle_rpc(const std::string& body) {
+  cJSON* root = cJSON_Parse(body.c_str());
+  if (!root) { ESP_LOGW(TAG, "rpc: bad json"); return; }
+
+  cJSON* id_j   = cJSON_GetObjectItem(root, "id");
+  cJSON* cmd_j  = cJSON_GetObjectItem(root, "cmd");
+  cJSON* args_j = cJSON_GetObjectItem(root, "args");
+  int id = (id_j && cJSON_IsNumber(id_j)) ? id_j->valueint : 0;
+  std::string cmd = (cmd_j && cJSON_IsString(cmd_j) && cmd_j->valuestring)
+                        ? cmd_j->valuestring : "";
+
+  RpcResult r = cmd.empty() ? res_err("no cmd") : dispatch_rpc(cmd, args_j);
+
+  // Build the response JSON by hand — small, predictable, no cJSON allocations.
+  RpcResponse resp;
+  char buf[160];
+  if (r.ok) {
+    if (r.extra_json.empty())
+      snprintf(buf, sizeof(buf), "{\"id\":%d,\"ok\":true}", id);
+    else
+      snprintf(buf, sizeof(buf), "{\"id\":%d,\"ok\":true%s}", id, r.extra_json.c_str());
+  } else {
+    snprintf(buf, sizeof(buf), "{\"id\":%d,\"ok\":false,\"err\":\"%s\"}",
+             id, r.err.c_str());
+  }
+  resp.json = buf;
+  if (s_rpc_resp_queue) xQueueSend(s_rpc_resp_queue, &resp, 0);
+
+  cJSON_Delete(root);
+}
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// TX task — pumps notifications and dispatches RPC requests.
+// ---------------------------------------------------------------------------
+
+static void pump_adif() {
+  if (!s_adif.active || !s_sub_adif) return;
+  // Chunk size = MTU - 3, capped at 200 for reliable indicate pacing.
+  size_t chunk = s_mtu > 3 ? (size_t)(s_mtu - 3) : 20;
+  if (chunk > 200) chunk = 200;
+
+  std::vector<uint8_t> buf;
+  if (core_adif_read(s_adif.handle, buf, chunk)) {
+    if (!buf.empty()) send_indicate(s_h_adif_stream, buf.data(), buf.size());
+  } else if (!s_adif.eof_sent) {
+    // Zero-length indication = EOF marker.
+    send_indicate(s_h_adif_stream, nullptr, 0);
+    s_adif.eof_sent = true;
+    core_adif_close(s_adif.handle);
+    s_adif.active = false;
+    s_adif.handle = -1;
+  }
+}
+
+static void tx_task_main(void*) {
+  while (true) {
+    // Wait up to 20 ms for a notification, then run a pump cycle either way.
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+
+    // Event pings: drain dirty flags into one notification each.
+    if (s_evt_dirty_rx)     { s_evt_dirty_rx     = false; send_event_ping(BLE_NATIVE_EVT_RX); }
+    if (s_evt_dirty_qso)    { s_evt_dirty_qso    = false; send_event_ping(BLE_NATIVE_EVT_QSO); }
+    if (s_evt_dirty_config) { s_evt_dirty_config = false; send_event_ping(BLE_NATIVE_EVT_CONFIG); }
+
+    // Waterfall: send the latest row if any.
+    send_waterfall_row();
+
+    // RPC requests: dispatch, response gets enqueued.
+    RpcRequest req;
+    while (s_rpc_req_queue && xQueueReceive(s_rpc_req_queue, &req, 0) == pdTRUE) {
+      handle_rpc(req.json);
+    }
+
+    // RPC responses: drain to RPC_RESP characteristic.
+    if (s_sub_rpc_resp) {
+      RpcResponse resp;
+      while (s_rpc_resp_queue && xQueueReceive(s_rpc_resp_queue, &resp, 0) == pdTRUE) {
+        send_notify(s_h_rpc_resp, resp.json.data(), resp.json.size());
+      }
+    }
+
+    // ADIF streaming: pump one chunk per cycle (paces reliably under indicate).
+    pump_adif();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Public init
+// ---------------------------------------------------------------------------
+
+bool ble_native_init(void) {
+  if (s_tx_task) return true;  // already initialized
+
+  s_rpc_req_queue  = xQueueCreate(8,  sizeof(RpcRequest));
+  s_rpc_resp_queue = xQueueCreate(16, sizeof(RpcResponse));
+  if (!s_rpc_req_queue || !s_rpc_resp_queue) {
+    ESP_LOGE(TAG, "queue create failed");
+    return false;
+  }
+
+  int rc = ble_gatts_count_cfg(k_svcs);
+  if (rc != 0) { ESP_LOGE(TAG, "count_cfg rc=%d", rc); return false; }
+  rc = ble_gatts_add_svcs(k_svcs);
+  if (rc != 0) { ESP_LOGE(TAG, "add_svcs rc=%d", rc); return false; }
+
+  core_on_rx_changed    (on_rx_changed);
+  core_on_qso_changed   (on_qso_changed);
+  core_on_config_changed(on_config_changed);
+  core_on_waterfall_row (on_waterfall_row);
+
+  BaseType_t ok = xTaskCreatePinnedToCore(tx_task_main, "ble_native", 4096,
+                                          nullptr, 5, &s_tx_task, 0);
+  if (ok != pdPASS) {
+    ESP_LOGE(TAG, "tx task create failed");
+    return false;
+  }
+  ESP_LOGI(TAG, "native BLE service registered, version %s", BLE_NATIVE_VERSION);
+  return true;
+}

@@ -79,6 +79,7 @@ static bool g_ble_enabled = true;
 #include "soc/soc_caps.h"
 #include "esp_bt.h"
 #include "esp_mac.h"
+#include "ble_native.h"
 
 #endif
 #ifndef FT8_SAMPLE_RATE
@@ -338,6 +339,12 @@ static void init_bluetooth(void)
         ESP_LOGE(BT_TAG, "ble_gatts_add_svcs failed: %d", rc);
         return;
     }
+    // Register the native client service alongside the text-terminal service.
+    // ble_native handles its own count_cfg + add_svcs.
+    if (!ble_native_init()) {
+        ESP_LOGE(BT_TAG, "ble_native_init failed");
+        // Continue — terminal service still works.
+    }
     ESP_LOGI(BT_TAG, "Services added");
 
     ble_hs_cfg.sync_cb = ble_on_sync;
@@ -371,6 +378,7 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
             g_ble_indicate_waiting = false;
             g_ble_indicate_status = 0;
             g_ble_att_mtu = 23;
+            ble_native_on_connect(g_conn_handle);
             ESP_LOGI(BT_TAG, "Connected, handle=%u", g_conn_handle);
         } else {
             g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -396,6 +404,7 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
         g_ble_indicate_status = 0;
         g_ble_att_mtu = 23;
         if (ble_cmd_queue) xQueueReset(ble_cmd_queue);
+        ble_native_on_disconnect();
         ESP_LOGW(BT_TAG, "Disconnected; restarting adv");
         ble_app_advertise();
         break;
@@ -409,6 +418,11 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
                      g_ble_tx_notify_enabled ? 1 : 0,
                      g_ble_tx_indicate_enabled ? 1 : 0);
         }
+        // Forward all subscribe events to the native server — it tracks
+        // its own characteristic handles and ignores unrelated events.
+        ble_native_on_subscribe(event->subscribe.attr_handle,
+                                event->subscribe.cur_notify != 0,
+                                event->subscribe.cur_indicate != 0);
         break;
 
     case BLE_GAP_EVENT_NOTIFY_TX:
@@ -427,6 +441,7 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_MTU:
         if (event->mtu.conn_handle == g_conn_handle && event->mtu.value > 0) {
             g_ble_att_mtu = event->mtu.value;
+            ble_native_on_mtu(event->mtu.value);
             ESP_LOGI(BT_TAG, "ATT MTU=%u", (unsigned)g_ble_att_mtu);
         }
         break;

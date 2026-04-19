@@ -64,10 +64,14 @@ bool ui_get_rx_entry(int idx, RxDecodeEntry* out);
 // ---------------------------------------------------------------------------
 
 namespace {
-CoreChangeCb    g_cb_rx_changed     = nullptr;
-CoreChangeCb    g_cb_qso_changed    = nullptr;
-CoreChangeCb    g_cb_config_changed = nullptr;
-CoreWaterfallCb g_cb_waterfall_row  = nullptr;
+// Multi-slot registry so Cardputer and BLE server can coexist.
+// No remove API — consumers live for the app lifetime.
+constexpr int kMaxConsumers = 4;
+CoreChangeCb    g_cb_rx_changed     [kMaxConsumers] = {};
+CoreChangeCb    g_cb_qso_changed    [kMaxConsumers] = {};
+CoreChangeCb    g_cb_config_changed [kMaxConsumers] = {};
+CoreWaterfallCb g_cb_waterfall_row  [kMaxConsumers] = {};
+int             g_cb_rx_n = 0, g_cb_qso_n = 0, g_cb_config_n = 0, g_cb_wf_n = 0;
 
 // Fake static values for SWR/PWR/PTT until real polling is wired up.
 std::atomic<bool>  g_ptt_state{false};
@@ -275,24 +279,37 @@ void core_get_config(StationConfig& out) {
 // Callback registration
 // ---------------------------------------------------------------------------
 
-void core_on_rx_changed    (CoreChangeCb cb)    { g_cb_rx_changed     = cb; }
-void core_on_qso_changed   (CoreChangeCb cb)    { g_cb_qso_changed    = cb; }
-void core_on_config_changed(CoreChangeCb cb)    { g_cb_config_changed = cb; }
-void core_on_waterfall_row (CoreWaterfallCb cb) { g_cb_waterfall_row  = cb; }
+void core_on_rx_changed(CoreChangeCb cb) {
+  if (g_cb_rx_n < kMaxConsumers) g_cb_rx_changed[g_cb_rx_n++] = cb;
+}
+void core_on_qso_changed(CoreChangeCb cb) {
+  if (g_cb_qso_n < kMaxConsumers) g_cb_qso_changed[g_cb_qso_n++] = cb;
+}
+void core_on_config_changed(CoreChangeCb cb) {
+  if (g_cb_config_n < kMaxConsumers) g_cb_config_changed[g_cb_config_n++] = cb;
+}
+void core_on_waterfall_row(CoreWaterfallCb cb) {
+  if (g_cb_wf_n < kMaxConsumers) g_cb_waterfall_row[g_cb_wf_n++] = cb;
+}
 
 // ---------------------------------------------------------------------------
 // Internal fire helpers (called by main.cpp / stream_uac.cpp on mutations)
 // ---------------------------------------------------------------------------
 
-void core_fire_rx_changed()     { if (g_cb_rx_changed)     g_cb_rx_changed(); }
-void core_fire_qso_changed()    { if (g_cb_qso_changed)    g_cb_qso_changed(); }
-void core_fire_config_changed() { if (g_cb_config_changed) g_cb_config_changed(); }
+void core_fire_rx_changed() {
+  for (int i = 0; i < g_cb_rx_n; ++i) if (g_cb_rx_changed[i]) g_cb_rx_changed[i]();
+}
+void core_fire_qso_changed() {
+  for (int i = 0; i < g_cb_qso_n; ++i) if (g_cb_qso_changed[i]) g_cb_qso_changed[i]();
+}
+void core_fire_config_changed() {
+  for (int i = 0; i < g_cb_config_n; ++i) if (g_cb_config_changed[i]) g_cb_config_changed[i]();
+}
 
 void core_fire_waterfall_row(int sym,
                              const uint8_t* mag, int num_bins,
                              float swr, float pwr, bool ptt) {
-  CoreWaterfallCb cb = g_cb_waterfall_row;
-  if (!cb) return;
+  if (g_cb_wf_n == 0) return;
   WaterfallRow row;
   row.sym      = sym;
   row.mag      = mag;
@@ -300,7 +317,7 @@ void core_fire_waterfall_row(int sym,
   row.swr      = swr;
   row.pwr      = pwr;
   row.ptt      = ptt;
-  cb(row);
+  for (int i = 0; i < g_cb_wf_n; ++i) if (g_cb_waterfall_row[i]) g_cb_waterfall_row[i](row);
 }
 
 // ---------------------------------------------------------------------------
