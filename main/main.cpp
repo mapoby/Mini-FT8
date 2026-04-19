@@ -725,7 +725,13 @@ static CopyLogsResult copy_logs_spiffs_to_sd_overwrite() {
   return result;
 }
 
-#define CALLSIGN_HASHTABLE_SIZE 256
+// 128 entries × 16 bytes = 2 KB of BSS. 256 was the original size but
+// well over typical working set (FT8 rarely sees >50 unique hashed
+// callsigns in an active period; the aging + eviction logic keeps it
+// fresh). Reducing by 2 KB gives the USB DMA buffer (4608 bytes) a
+// better chance at finding a contiguous block after BLE+USB host
+// fragmentation.
+#define CALLSIGN_HASHTABLE_SIZE 128
 
 static struct
 {
