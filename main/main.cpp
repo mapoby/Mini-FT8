@@ -113,6 +113,7 @@ static std::string g_ble_last_screen_lines[6];
 static std::string g_ble_last_line7;
 static bool g_ble_last_screen_valid = false;
 static int64_t g_ble_status_clock_slot_sent = -1;
+static int64_t g_ble_gps_slot_sent = -1;
 static int64_t g_ble_last_tick_slot = -1;
 static int g_ble_last_tick_sec = -1;
 static std::string g_ble_waterfall_header = "|                           |";
@@ -189,6 +190,7 @@ static char ble_parse_ui_command(const char* data, uint16_t len)
       case 'S':
       case 'R':
       case 'T':
+      case 'G':
       case 'M':
       case 'Q':
       case 'B':
@@ -359,6 +361,7 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
             g_ble_force_send = true;
             g_ble_last_screen_valid = false;
             g_ble_status_clock_slot_sent = -1;
+            g_ble_gps_slot_sent = -1;
             g_ble_last_tick_slot = -1;
             g_ble_last_tick_sec = -1;
             g_ble_waterfall_slot_idx = -1;
@@ -383,6 +386,7 @@ static int gap_cb(struct ble_gap_event *event, void *arg)
         g_ble_last_screen_valid = false;
         g_ble_last_line7.clear();
         g_ble_status_clock_slot_sent = -1;
+        g_ble_gps_slot_sent = -1;
         g_ble_last_tick_slot = -1;
         g_ble_last_tick_sec = -1;
         g_ble_waterfall_slot_idx = -1;
@@ -1050,11 +1054,11 @@ static std::vector<std::string> g_ctrl_lines = {
 };
 
 static std::vector<std::string> g_startup_lines = {
-    "** Mini-FT8 V2.0 **",
+    "** Mini-FT8 V2.0.1 *",
     " S/R/T: Operate",
     " M/N/O: Menu",
     " Q/F/D: File",
-    "      * * * *      ",
+    "      * * * * *     ",
     "  By N6HAN & AG6AQ "
 };
 
@@ -1067,6 +1071,7 @@ static bool is_startup_direct_mode_key(char c) {
     case 'S':
     case 'R':
     case 'T':
+    case 'G':
     case 'Q':
     case 'M':
     case 'N':
@@ -3590,6 +3595,8 @@ static void draw_gps_view(bool force_redraw) {
   M5.Display.setTextSize(2);
   for (size_t i = 0; i < 6; ++i) {
     std::string text = (i < lines.size()) ? lines[i] : "";
+    // Keep BLE mirror source in sync with GPS mode text regardless of LCD redraw.
+    ui_set_visible_text_line((int)i, text);
     if (force_redraw || text != s_last_gps_lines[i]) {
       s_last_gps_lines[i] = text;
       int y = start_y + i * line_h;
@@ -3788,6 +3795,7 @@ static void apply_ble_enabled_policy(bool runtime_apply) {
     g_ble_last_screen_valid = false;
     g_ble_last_line7.clear();
     g_ble_status_clock_slot_sent = -1;
+    g_ble_gps_slot_sent = -1;
     g_ble_last_tick_slot = -1;
     g_ble_last_tick_sec = -1;
     g_ble_waterfall_slot_idx = -1;
@@ -3802,6 +3810,7 @@ static void apply_ble_enabled_policy(bool runtime_apply) {
   g_ble_force_send = true;
   g_ble_last_screen_valid = false;
   g_ble_status_clock_slot_sent = -1;
+  g_ble_gps_slot_sent = -1;
   g_ble_last_tick_slot = -1;
   g_ble_last_tick_sec = -1;
   g_ble_waterfall_slot_idx = -1;
@@ -4129,6 +4138,16 @@ static bool ble_status_clock_only_delta(const std::vector<std::string>& lines,
   return changed;
 }
 
+static bool ble_gps_clock_only_delta(const std::vector<std::string>& lines,
+                                     const std::string& line7) {
+  if (!g_ble_last_screen_valid) return false;
+  if (line7 != g_ble_last_line7) return false;
+  for (int i = 0; i < 6; ++i) {
+    if (lines[i] != g_ble_last_screen_lines[i]) return true;
+  }
+  return false;
+}
+
 static void ble_mirror_tick() {
   if (!g_ble_enabled) return;
   if (g_ble_dump_in_progress) return;
@@ -4164,6 +4183,19 @@ static void ble_mirror_tick() {
       }
   }
 
+  int64_t gps_slot_idx = -1;
+  if (!g_ble_force_send &&
+      ui_mode == UIMode::GPS &&
+      !g_ble_text_mode &&
+      ble_gps_clock_only_delta(lines, line7)) {
+      int sec = 0;
+      bool even_slot = true;
+      ble_slot_second_now(gps_slot_idx, sec, even_slot);
+      if (g_ble_gps_slot_sent == gps_slot_idx) {
+        return;
+      }
+  }
+
   std::string screen_key;
   screen_key.reserve(256);
   for (int i = 0; i < 6; ++i) {
@@ -4187,6 +4219,14 @@ static void ble_mirror_tick() {
       ble_slot_second_now(status_slot_idx, sec, even_slot);
     }
     g_ble_status_clock_slot_sent = status_slot_idx;
+  }
+  if (ui_mode == UIMode::GPS && !g_ble_text_mode) {
+    if (gps_slot_idx < 0) {
+      int sec = 0;
+      bool even_slot = true;
+      ble_slot_second_now(gps_slot_idx, sec, even_slot);
+    }
+    g_ble_gps_slot_sent = gps_slot_idx;
   }
 
   if (g_ble_last_tick_slot < 0 || g_ble_last_tick_sec < 0) {
