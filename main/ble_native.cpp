@@ -449,7 +449,10 @@ static void send_waterfall_row() {
   const size_t send_len = total > max_payload ? max_payload : total;
   if (send_len < BLE_NATIVE_RADIO_STREAM_HEADER_SIZE) return;
 
-  uint8_t buf[600];
+  // Static — only the single TX task calls this, no re-entrancy.
+  // Kept off the stack to leave headroom for NimBLE's notify path
+  // (ble_gatts_notify_custom builds a PDU using substantial stack).
+  static uint8_t buf[600];
   if (send_len > sizeof(buf)) return;
 
   BleRadioStreamHeader hdr;
@@ -729,9 +732,10 @@ bool ble_native_init(void) {
   // Priority 3 (below app_task_core0's 5) so the local UI never gets
   // starved by BLE TX work. Pinned to core 1 so it runs alongside the
   // audio task but doesn't contend with the main UI loop on core 0.
-  // 3 KB stack is plenty — the task body does shallow JSON building
-  // and fixed-size notifications, no deep recursion or large locals.
-  BaseType_t ok = xTaskCreatePinnedToCore(tx_task_main, "ble_native", 3072,
+  // 4 KB stack: JSON building is shallow, but ble_gatts_notify_custom
+  // uses significant stack on the NimBLE internal PDU path. 3 KB
+  // overflowed under sustained 6 Hz waterfall streaming.
+  BaseType_t ok = xTaskCreatePinnedToCore(tx_task_main, "ble_native", 4096,
                                           nullptr, 3, &s_tx_task, 1);
   if (ok != pdPASS) {
     ESP_LOGE(TAG, "tx task create failed");
