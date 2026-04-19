@@ -4285,17 +4285,32 @@ static void ble_app_advertise(void) {
   adv.conn_mode = BLE_GAP_CONN_MODE_UND;
   adv.disc_mode = BLE_GAP_DISC_MODE_GEN;
 
+  // Primary AD carries flags + the 128-bit service UUID so iOS can pre-filter
+  // (a custom 128-bit UUID + flags is already 21 of the 31 AD bytes, leaving
+  // no room for the name). The complete name travels in the scan response.
+  static ble_uuid128_t svc_uuid = BLE_UUID128_INIT(BLE_NATIVE_SVC_UUID);
+
   struct ble_hs_adv_fields fields{};
   fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+  fields.uuids128 = &svc_uuid;
+  fields.num_uuids128 = 1;
+  fields.uuids128_is_complete = 1;
+
   const std::string name = g_ble_adv_name.empty() ? std::string("Mini-FT8") : g_ble_adv_name;
-  fields.name = (uint8_t*)name.c_str();
-  fields.name_len = name.size();
-  fields.name_is_complete = 1;
+  struct ble_hs_adv_fields rsp_fields{};
+  rsp_fields.name = (uint8_t*)name.c_str();
+  rsp_fields.name_len = name.size();
+  rsp_fields.name_is_complete = 1;
 
   ble_gap_adv_stop();
   int rc = ble_gap_adv_set_fields(&fields);
   if (rc != 0) {
     ESP_LOGE(BT_TAG, "adv_set_fields failed: %d", rc);
+    return;
+  }
+  rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
+  if (rc != 0) {
+    ESP_LOGE(BT_TAG, "adv_rsp_set_fields failed: %d", rc);
     return;
   }
   rc = ble_gap_adv_start(g_own_addr_type, nullptr, BLE_HS_FOREVER, &adv, gap_cb, nullptr);
