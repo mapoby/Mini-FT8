@@ -610,23 +610,31 @@ static void stream_uac_task(void* arg) {
     monitor_init(&mon, &mon_cfg);
     monitor_reset(&mon);
 
-    // Allocate buffers
-    uint8_t* usb_buffer = (uint8_t*)heap_caps_malloc(UAC_READ_BUFFER_SIZE, MALLOC_CAP_DEFAULT);
-    float* ft8_buffer = (float*)heap_caps_malloc(sizeof(float) * mon.block_size, MALLOC_CAP_DEFAULT);
-    // Intermediate 6kHz output buffer from PCM conversion/resampling.
-    float* temp_dec = (float*)heap_caps_malloc(sizeof(float) * 512, MALLOC_CAP_DEFAULT);
-    log_heap("UAC_AFTER_FFT_ALLOC");
-
-    if (!usb_buffer || !ft8_buffer || !temp_dec) {
-        ESP_LOGE(TAG, "Buffer allocation failed");
-        if (usb_buffer) free(usb_buffer);
-        if (ft8_buffer) free(ft8_buffer);
-        if (temp_dec) free(temp_dec);
+    // Static stream-task buffers — sized for our current config:
+    //   UAC USB read:  4608 bytes (UAC_READ_BUFFER_SIZE)
+    //   FT8 block:     mon.block_size floats at 6kHz = 960 × 4 = 3840 bytes
+    //                  (max 1920 × 4 = 7680 if we ever revert to 12kHz)
+    //   Resample temp: 512 floats = 2048 bytes
+    // Moving these from heap to BSS eliminates the fragmentation failure
+    // where 3 separate heap allocations couldn't find contiguous blocks
+    // after BLE+USB host init.
+    static uint8_t s_usb_buffer[UAC_READ_BUFFER_SIZE];
+    static float   s_ft8_buffer[1920];   // max block_size across 6k/12k
+    static float   s_temp_dec[512];
+    uint8_t* usb_buffer = s_usb_buffer;
+    float*   ft8_buffer = s_ft8_buffer;
+    float*   temp_dec   = s_temp_dec;
+    if (mon.block_size > (int)(sizeof(s_ft8_buffer) / sizeof(float))) {
+        ESP_LOGE(TAG, "block_size %d exceeds static ft8_buffer %u",
+                 mon.block_size,
+                 (unsigned)(sizeof(s_ft8_buffer) / sizeof(float)));
         monitor_free(&mon);
         s_stream_task_handle = NULL;
         vTaskDelete(NULL);
         return;
     }
+    log_heap("UAC_AFTER_FFT_ALLOC");
+    // Buffers are static; no NULL check or free needed.
 
     const int target_blocks = 80;
     int ft8_buffer_idx = 0;  // Current position in ft8_buffer
@@ -768,10 +776,7 @@ static void stream_uac_task(void* arg) {
         }
     }
 
-    // Cleanup
-    free(usb_buffer);
-    free(ft8_buffer);
-    free(temp_dec);
+    // Cleanup — stream-task buffers are static, no free needed.
     monitor_free(&mon);
 
     g_streaming = false;
