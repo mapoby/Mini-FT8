@@ -1065,8 +1065,12 @@ static std::vector<std::string> g_startup_lines = {
     "  By N6HAN & AG6AQ "
 };
 
-// Runtime latch: when true, we keep showing the startup screen until any key is pressed.
-static bool g_startup_active = true;
+// Runtime latch: when true, we're still showing the startup screen. Either
+// a keypress or the 1 s auto-dismiss timer (g_startup_start_ms) takes us
+// out.
+static bool    g_startup_active  = true;
+static int64_t g_startup_start_ms = 0;    // set on the first tick we see in the splash branch
+static constexpr int64_t kStartupAutoDismissMs = 1000;
 
 static bool is_startup_direct_mode_key(char c) {
   const char k = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
@@ -5090,6 +5094,51 @@ static void ble_commit_text_input(const BleUiInput& input) {
 }
 #endif
 
+// Perform the STATUS -> '2' action: start the UAC audio source that feeds
+// the QMX (or KH1) into the decoder, and sync CAT to the currently selected
+// band. Shared between the on-device keypress path and the 1 s splash
+// auto-dismiss on boot.
+static void begin_usb_host_mode() {
+  // The status-view feedback only makes sense when we're actually on the
+  // STATUS page (manual S -> '2' path). The splash auto-dismiss lands on
+  // RX, so skip the status redraws to avoid painting over the RX view.
+  const bool on_status_page = (ui_mode == UIMode::STATUS);
+  if (on_status_page) {
+    status_edit_idx = 1;
+    draw_status_view();
+  }
+  if (canonical_radio_type(g_radio) == RadioType::KH1 && !g_kh1_connected) {
+    g_kh1_connected = true;
+    apply_radio_profile_binding();
+  }
+  if (!audio_source_is_streaming()) {
+    debug_log_line("UAC2 start");
+    apply_radio_profile_binding();
+    debug_log_line("UAC2 bind");
+    if (!audio_source_start()) {
+      debug_log_line("UAC2 afail");
+    } else {
+      debug_log_line("UAC2 aok");
+      g_decode_enabled = true;
+      ui_set_paused(false);
+      ui_clear_waterfall();
+      esp_err_t rc = radio_control_on_audio_start();
+      debug_log_line(rc == ESP_OK ? "UAC2 catok" : "UAC2 catng");
+    }
+  }
+  int freq_hz = g_bands[g_band_sel].freq * 1000;
+  if (radio_control_ready()) {
+    bool ok = (radio_control_sync_frequency_mode(freq_hz) == ESP_OK);
+    debug_log_line(ok ? "CAT sync sent" : "CAT sync failed");
+  } else {
+    debug_log_line("CAT not ready");
+  }
+  if (on_status_page) {
+    status_edit_idx = -1;
+    draw_status_view();
+  }
+}
+
 static void app_task_core0(void* /*param*/) {
   esp_vfs_spiffs_conf_t conf = {
     .base_path = "/spiffs",
@@ -5272,33 +5321,48 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       }
       debug_update_app_core0_stack_hud(true);
     }
-    // Startup screen overlay on RX page: show until any key press, and only once
+    // Startup splash: show for kStartupAutoDismissMs, then auto-enter
+    // USB-host mode (= STATUS -> '2'). A direct-mode key during the splash
+    // window still short-circuits — most usefully 'c', which drops into the
+    // USB serial terminal instead of starting the QMX audio path.
     if (g_startup_active) {
-      if (c == 0) {
+      if (g_startup_start_ms == 0) {
+        g_startup_start_ms = esp_timer_get_time() / 1000;
+      }
+
+      if (c != 0 && c != last_key) {
+        const bool direct_mode_entry = is_startup_direct_mode_key(c);
+        g_startup_active = false;
+        save_station_data();
+        if (!direct_mode_entry) {
+          // Non-mode key: dismiss, show RX, consume the key.
+          last_key = c;
+          ui_force_redraw_rx();
+          ui_draw_rx();
+          vTaskDelay(pdMS_TO_TICKS(10));
+          continue;
+        }
+        // Direct-mode key: fall through so the main dispatcher handles it.
         last_key = 0;
+      } else {
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - g_startup_start_ms >= kStartupAutoDismissMs) {
+          // No key within the window — auto-start USB host mode and land
+          // on the RX page.
+          g_startup_active = false;
+          save_station_data();
+          enter_mode(UIMode::RX);
+          begin_usb_host_mode();
+          ui_force_redraw_rx();
+          ui_draw_rx();
+          last_key = 0;
+          vTaskDelay(pdMS_TO_TICKS(10));
+          continue;
+        }
+        last_key = c;  // 0 or the same key still held
         vTaskDelay(pdMS_TO_TICKS(10));
         continue;
       }
-      if (c == last_key) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-        continue;
-      }
-      const bool direct_mode_entry = is_startup_direct_mode_key(c);
-
-      g_startup_active = false;
-      save_station_data();
-
-      if (!direct_mode_entry) {
-        // Non-mode startup dismissal keeps prior behavior: show RX and consume key.
-        last_key = c;
-        ui_force_redraw_rx();
-        ui_draw_rx();
-        vTaskDelay(pdMS_TO_TICKS(10));
-        continue;
-      }
-
-      // Let the first mode key both dismiss startup and perform normal mode switch.
-      last_key = 0;
     }
 
     rtc_tick();
@@ -5653,36 +5717,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         if (status_edit_idx == -1) {
           if (c == '1') { g_status_beacon_temp = (BeaconMode)(((int)g_status_beacon_temp + 1) % 3); draw_status_view(); }
           else if (c == '2') {
-            status_edit_idx = 1;
-            draw_status_view();
-            if (canonical_radio_type(g_radio) == RadioType::KH1 && !g_kh1_connected) {
-              g_kh1_connected = true;
-              apply_radio_profile_binding();
-            }
-            if (!audio_source_is_streaming()) {
-              debug_log_line("UAC2 start");
-              apply_radio_profile_binding();
-              debug_log_line("UAC2 bind");
-              if (!audio_source_start()) {
-                debug_log_line("UAC2 afail");
-              } else {
-                debug_log_line("UAC2 aok");
-                g_decode_enabled = true;
-                ui_set_paused(false);
-                ui_clear_waterfall();
-                esp_err_t rc = radio_control_on_audio_start();
-                debug_log_line(rc == ESP_OK ? "UAC2 catok" : "UAC2 catng");
-              }
-            }
-            int freq_hz = g_bands[g_band_sel].freq * 1000;
-            if (radio_control_ready()) {
-              bool ok = (radio_control_sync_frequency_mode(freq_hz) == ESP_OK);
-              debug_log_line(ok ? "CAT sync sent" : "CAT sync failed");
-            } else {
-              debug_log_line("CAT not ready");
-            }
-            status_edit_idx = -1;
-            draw_status_view();
+            begin_usb_host_mode();
           }
           else if (c == '3') {
             advance_active_band(1);
