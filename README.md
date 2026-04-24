@@ -137,11 +137,11 @@ Notes:
 - Use `pc_terminal.py`
   - On the M5 Cardputer, press `C` to enter communication mode.
   - On the PC, run `python .\pc_terminal.py COM11` for interactive use with multiple commands.
-  - On the PC, run `python .\pc_terminal.py COM11 read 20260113.adi` for a single command.
+  - On the PC, run `python .\pc_terminal.py COM11 read 20260113.txt` for a single command.
 
 ## GPS Connections
 
-Both 9600 and 115200 baud GPS modules are supported (auto-detected). Once Mini-FT8 gets its time/grid, the GPS can be removed, this is important for KH1.
+Both 9600 and 115200 baud GPS modules are supported (auto-detected). **Make sure the micro swithch is on the left.** Once Mini-FT8 gets its time/grid, the GPS can be removed, this is important for KH1.
 ```text
 ┌──────────────────┐                 ┌─────────────────────────────┐
 │ GPS              │                 │ Cardputer ADV               │
@@ -153,9 +153,10 @@ Both 9600 and 115200 baud GPS modules are supported (auto-detected). Once Mini-F
 └──────────────────┘                 │                             │
                                      │ SW: 5VOUT (Left)            │
                                      └─────────────────────────────┘
-                                     ** For M5 GPSV1.1, SW: 5VIN(Rigth) works too
 ```
 ## KH1 Connections
+
+![KH1 Cables](kh1_cables.jpeg)
 
  - TX Only ([sotamat](https://sotamat.com/))
 ```text
@@ -172,7 +173,7 @@ Both 9600 and 115200 baud GPS modules are supported (auto-detected). Once Mini-F
 ```
 - TX + RX (FT8 QSO)
   - Use a USB-C audio/mic adapter for RX. Tested adapter: Amazon `B0FWC9ZFC4`. Other adapters may also work, but this one is confirmed.
-  - Supply 5 V to PORTA; otherwise, the USB-C OTG port will not be powered.
+  - Supply 5 V to PORTA; otherwise, the USB-C OTG port will not be powered. **Make sure the micro swithch is on the right**
 ```text
 ┌──────────────────┐
 │ Power Cable      │
