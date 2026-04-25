@@ -20,14 +20,19 @@ static esp_err_t qmx_send_cmd(const char* cmd, uint32_t timeout_ms) {
 }
 
 static esp_err_t qmx_sync_frequency_mode(int freq_hz) {
-    char fa[32];
-    snprintf(fa, sizeof(fa), "FA%011d;", freq_hz);
-
-    esp_err_t err = qmx_send_cmd(fa, 200);
+    const char* md = "MD6;";
+    esp_err_t err = qmx_send_cmd(md, 200);
     if (err != ESP_OK) return err;
 
-    const char* md = "MD6;";
-    err = qmx_send_cmd(md, 200);
+    err = qmx_send_cmd("FR0;", 200);
+    if (err != ESP_OK) return err;
+
+    err = qmx_send_cmd("FT0;", 200);
+    if (err != ESP_OK) return err;
+
+    char fa[32];
+    snprintf(fa, sizeof(fa), "FA%011d;", freq_hz);
+    err = qmx_send_cmd(fa, 200);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "QMX sync ok freq=%d", freq_hz);
     }
