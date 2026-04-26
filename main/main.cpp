@@ -1022,6 +1022,10 @@ void save_station_data();  // visible to core_api.cpp
 // above — core_api.cpp's tap_rx RPC arms these on user-pick events.
 AutoseqTxEntry g_pending_tx;
 bool g_pending_tx_valid = false;
+
+// Forward declarations — definitions live near check_slot_boundary, where
+// g_offset_src has been declared.
+void arm_pending_tx(const AutoseqTxEntry& pending);
 volatile bool g_tx_cancel_requested = false;   // visible to core_api.cpp
 static void host_process_bytes(const uint8_t* buf, size_t len);
 static void poll_host_uart();
@@ -2632,6 +2636,38 @@ static void tx_tick();
 
 // Slot boundary check - called from main loop
 // Matches reference project: tick after TX slot ends, TX trigger at slot start
+// Compute the actual audio offset the next TX will use, given the
+// configured g_offset_src and the autoseq pending entry. Storing the
+// resolved value at scheduling time (rather than at the slot boundary,
+// as the firmware used to do) means BLE clients reading core_get_qso
+// see the same number that will actually go on air — important for the
+// waterfall offset marker, especially in RANDOM / beacon-CQ modes where
+// the random was previously rolled inside check_slot_boundary.
+static int resolve_tx_offset(const AutoseqTxEntry& e) {
+  if (g_offset_src == OffsetSrc::CURSOR) {
+    return g_offset_hz;
+  }
+  if (g_offset_src == OffsetSrc::RX &&
+      e.offset_hz > 0 &&
+      e.text.rfind("CQ ", 0) != 0) {
+    return e.offset_hz;
+  }
+  // RANDOM, or RX mode + CQ: roll a fresh offset in [500, 2500] Hz.
+  return 500 + (int)(esp_random() % 2001);
+}
+
+// Single point of truth for arming the next TX. Replaces the 4-line
+// "g_qso_xmit / g_target_slot_parity / g_pending_tx / g_pending_tx_valid"
+// block that used to be repeated at every scheduling site (autoseq tick,
+// beacon-on, freetext queue, BLE tap_rx, …).
+void arm_pending_tx(const AutoseqTxEntry& pending) {
+  g_qso_xmit           = true;
+  g_target_slot_parity = pending.slot_id & 1;
+  g_pending_tx         = pending;
+  g_pending_tx.offset_hz = resolve_tx_offset(g_pending_tx);
+  g_pending_tx_valid   = true;
+}
+
 static void check_slot_boundary() {
   int64_t now_ms = rtc_now_ms();
   int64_t slot_idx = now_ms / 15000;
@@ -2682,20 +2718,10 @@ static void check_slot_boundary() {
         g_qso_xmit = false;  // Clear flag only AFTER validation succeeds
         g_was_txing = true;  // Set IMMEDIATELY when TX starts (prevents decode_monitor_results from re-setting flags)
 
-        // Compute actual TX offset now (before logging) based on offset_src setting
-        int actual_offset;
-        if (g_offset_src == OffsetSrc::CURSOR) {
-          actual_offset = g_offset_hz;
-        } else if (g_offset_src == OffsetSrc::RX &&
-                   g_pending_tx.offset_hz > 0 &&
-                   g_pending_tx.text.rfind("CQ ", 0) != 0) {
-          actual_offset = g_pending_tx.offset_hz;
-        } else {
-          // RANDOM mode or CQ in RX mode: generate random offset
-          actual_offset = 500 + (int)(esp_random() % 2001);
-        }
-        g_pending_tx.offset_hz = actual_offset;  // Store for tx_start to use
-        log_rxtx_line('T', 0, actual_offset, g_pending_tx.text, g_pending_tx.repeat_counter);
+        // Offset was resolved at scheduling time by arm_pending_tx, so
+        // g_pending_tx.offset_hz is already what's going on air.
+        log_rxtx_line('T', 0, g_pending_tx.offset_hz, g_pending_tx.text,
+                      g_pending_tx.repeat_counter);
         tx_start(skip_tones);
       }
     }
@@ -3195,18 +3221,12 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
 
     AutoseqTxEntry pending;
     if (autoseq_fetch_pending_tx(pending)) {
-      g_qso_xmit = true;
-      g_target_slot_parity = pending.slot_id & 1;
-      g_pending_tx = pending;
-      g_pending_tx_valid = true;
+      arm_pending_tx(pending);
       ESP_LOGI(TAG, "TX ready: %s parity=%d", pending.text.c_str(), g_target_slot_parity);
     } else if (g_beacon != BeaconMode::OFF) {
       enqueue_beacon_cq();
       if (autoseq_fetch_pending_tx(pending)) {
-        g_qso_xmit = true;
-        g_target_slot_parity = pending.slot_id & 1;
-        g_pending_tx = pending;
-        g_pending_tx_valid = true;
+        arm_pending_tx(pending);
         ESP_LOGI(TAG, "Beacon CQ ready: %s parity=%d", pending.text.c_str(), g_target_slot_parity);
       }
     }
@@ -3342,18 +3362,9 @@ static bool schedule_manual_pending_tx(const AutoseqTxEntry& pending) {
     return false;
   }
 
-  int target_parity = pending.slot_id & 1;
-
-  // Set up pending TX
-  g_pending_tx = pending;
-  g_pending_tx_valid = true;
-
-  // Set flags for check_slot_boundary() to trigger TX
-  g_qso_xmit = true;
-  g_target_slot_parity = target_parity;
-
+  arm_pending_tx(pending);
   ESP_LOGI(TAG, "schedule_manual_pending_tx: queued TX=%s for parity=%d",
-           pending.text.c_str(), target_parity);
+           pending.text.c_str(), g_target_slot_parity);
   return true;
 }
 
@@ -4860,10 +4871,7 @@ static void enter_mode(UIMode new_mode) {
         enqueue_beacon_cq();
         AutoseqTxEntry pending;
         if (autoseq_fetch_pending_tx(pending)) {
-          g_qso_xmit = true;
-          g_target_slot_parity = pending.slot_id & 1;
-          g_pending_tx = pending;
-          g_pending_tx_valid = true;
+          arm_pending_tx(pending);
         }
       }
     }
@@ -5658,10 +5666,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
             // Re-evaluate TX after queue change
             AutoseqTxEntry pending;
             if (autoseq_fetch_pending_tx(pending)) {
-              g_qso_xmit = true;
-              g_target_slot_parity = pending.slot_id & 1;
-              g_pending_tx = pending;
-              g_pending_tx_valid = true;
+              arm_pending_tx(pending);
             }
           }
         } else if (c == '1') {
@@ -5671,10 +5676,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
             // Re-evaluate TX after queue change
             AutoseqTxEntry pending;
             if (autoseq_fetch_pending_tx(pending)) {
-              g_qso_xmit = true;
-              g_target_slot_parity = pending.slot_id & 1;
-              g_pending_tx = pending;
-              g_pending_tx_valid = true;
+              arm_pending_tx(pending);
             }
           }
         } else if (c == 'e' || c == 'E') {
@@ -6075,10 +6077,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   // still fire instead of the FT.
                   AutoseqTxEntry pending;
                   if (autoseq_fetch_pending_tx(pending)) {
-                    g_qso_xmit = true;
-                    g_pending_tx = pending;
-                    g_pending_tx_valid = true;
-                    g_target_slot_parity = pending.slot_id & 1;
+                    arm_pending_tx(pending);
                   }
                   menu_flash_idx = 1; // absolute index of "Send FreeText"
                   menu_flash_deadline = rtc_now_ms() + 500;

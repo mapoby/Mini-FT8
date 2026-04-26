@@ -210,6 +210,11 @@ void core_get_rx_list(std::vector<RxDecodeEntry>& out) {
   }
 }
 
+// Defined in main.cpp. Read by core_get_qso so the BLE snapshot reflects
+// the firmware's resolved offset, not autoseq's pre-resolution placeholder.
+extern AutoseqTxEntry g_pending_tx;
+extern bool           g_pending_tx_valid;
+
 void core_get_qso(QsoSnapshot& out) {
   out.active.clear();
   out.next_tx = NextTxEntry{};
@@ -233,14 +238,31 @@ void core_get_qso(QsoSnapshot& out) {
     out.active.push_back(std::move(e));
   }
 
-  AutoseqTxEntry pending{};
-  if (autoseq_fetch_pending_tx(pending)) {
+  // Prefer g_pending_tx when arm_pending_tx has fired — it carries the
+  // resolved offset (matching the actual TX, including the random roll
+  // for RANDOM mode and beacon CQ). autoseq's own pending entry only
+  // holds the *unresolved* offset (often 0 for fresh CQs), which is
+  // what was reaching BLE before and pinning the marker at the config
+  // default.
+  if (g_pending_tx_valid && !g_pending_tx.text.empty()) {
     out.next_tx.valid             = true;
-    out.next_tx.text              = pending.text;
-    out.next_tx.dxcall            = pending.dxcall;
-    out.next_tx.slot_parity       = pending.slot_id & 1;
-    out.next_tx.offset_hz         = pending.offset_hz;
-    out.next_tx.retries_remaining = pending.repeat_counter;
+    out.next_tx.text              = g_pending_tx.text;
+    out.next_tx.dxcall            = g_pending_tx.dxcall;
+    out.next_tx.slot_parity       = g_pending_tx.slot_id & 1;
+    out.next_tx.offset_hz         = g_pending_tx.offset_hz;
+    out.next_tx.retries_remaining = g_pending_tx.repeat_counter;
+  } else {
+    // Not yet armed — surface autoseq's intent so the client at least
+    // knows a TX is queued, even if the offset is still placeholder.
+    AutoseqTxEntry pending{};
+    if (autoseq_fetch_pending_tx(pending)) {
+      out.next_tx.valid             = true;
+      out.next_tx.text              = pending.text;
+      out.next_tx.dxcall            = pending.dxcall;
+      out.next_tx.slot_parity       = pending.slot_id & 1;
+      out.next_tx.offset_hz         = pending.offset_hz;
+      out.next_tx.retries_remaining = pending.repeat_counter;
+    }
   }
 }
 
@@ -338,13 +360,10 @@ bool apply_config_write(T&& mutator) {
 }
 }  // namespace
 
-// Globals owned by main.cpp. Arming them here makes a user-pick take
-// effect at the very next slot boundary; without this the autoseq tick
-// only picks the new TX up on its next pass — typically 1-2 slots later.
-extern volatile bool   g_qso_xmit;
-extern volatile int    g_target_slot_parity;
-extern AutoseqTxEntry  g_pending_tx;
-extern bool            g_pending_tx_valid;
+// Defined in main.cpp; resolves the offset_src semantics and writes
+// g_qso_xmit / g_target_slot_parity / g_pending_tx[.offset_hz] /
+// g_pending_tx_valid in one shot.
+extern void arm_pending_tx(const AutoseqTxEntry& pending);
 
 bool core_cmd_tap_rx(int rx_list_idx) {
   RxDecodeEntry entry{};
@@ -366,13 +385,10 @@ bool core_cmd_tap_rx(int rx_list_idx) {
   // Arm the TX state machine for the next matching slot boundary so the
   // user's pick is honoured immediately instead of waiting for the next
   // autoseq tick to pull in the pending TX (which would delay by 1-2
-  // slots). Mirrors what the Cardputer RX-key handler used to do inline.
+  // slots). Mirrors the Cardputer RX-key handler.
   AutoseqTxEntry pending{};
   if (autoseq_fetch_pending_tx(pending)) {
-    g_qso_xmit           = true;
-    g_target_slot_parity = pending.slot_id & 1;
-    g_pending_tx         = pending;
-    g_pending_tx_valid   = true;
+    arm_pending_tx(pending);
   }
   core_fire_qso_changed();
   return true;
