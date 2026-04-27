@@ -13,6 +13,7 @@ extern "C" {
   #include "common/monitor.h"
   }
 
+#include "board_power.h"
 #include "ui.h"
 #include <vector>
 #include <string>
@@ -2542,11 +2543,16 @@ std::string grid_ft8_4(const std::string& grid) {
 }
 
 static std::string menu_sleep_batt_line() {
-  int level = (int)M5.Power.getBatteryLevel();
-  if (level < 0 || level > 100) level = 0;
-  char buf[32];
-  snprintf(buf, sizeof(buf), "Sleep/Batt %d%%", level);
-  return buf;
+  board_power_status_t ps = {};
+  char buf[48];
+
+  if (board_power_read(&ps) == ESP_OK && ps.valid) {
+    snprintf(buf, sizeof(buf), "Sleep/Batt %d%%", ps.percent);
+  } else {
+    snprintf(buf, sizeof(buf), "Sleep/Batt --");
+  }
+
+  return std::string(buf);
 }
 
 static std::string elide_right(const std::string& s, size_t max_len = 22) {
@@ -5497,9 +5503,11 @@ static void app_task_core0(void* /*param*/) {
   log_mutex = xSemaphoreCreateMutex();
 
   sync_station_txt_from_sd_to_spiffs();
+  board_power_init();
   g_radio = load_station_radio_type_only();
   ui_init(radio_type_uses_display_only(g_radio));
   hashtable_init();
+
 
   // Initialize autoseq engine
   autoseq_init();
