@@ -21,8 +21,15 @@ enum class CqType { CQ, CQSOTA, CQPOTA, CQQRP, CQFD, CQFREETEXT };
 // How the TX audio offset is chosen for new QSOs.
 enum class OffsetSrc { RANDOM, CURSOR, RX };
 
-// Supported radios.
-enum class RadioType { NONE, TRUSDX, QMX, KH1 };
+// Supported radios. Keep explicit values stable for station.txt radio= saves.
+enum class RadioType {
+    NONE = 0,
+    TRUSDX = 1,
+    QMX = 2,
+    KH1_USBC = 3,
+    KH1 = KH1_USBC, // Backward-compatible alias for old KH1 USB-C mode.
+    KH1_MIC = 4,
+};
 
 // One entry in the band list (name + frequency in kHz).
 struct BandItem {
