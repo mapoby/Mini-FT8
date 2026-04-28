@@ -155,28 +155,26 @@ static void on_waterfall_row(const WaterfallRow& row) {
 // JSON serialization helpers
 // ---------------------------------------------------------------------------
 
-static std::string json_build_rx_list() {
-  std::vector<RxDecodeEntry> list;
-  core_get_rx_list(list);
-  cJSON* root  = cJSON_CreateObject();
-  cJSON* lines = cJSON_CreateArray();
-  for (const auto& e : list) {
-    cJSON* o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "t",  e.text);
-    cJSON_AddNumberToObject(o, "s",  e.snr);
-    cJSON_AddNumberToObject(o, "o",  e.offset_hz);
-    cJSON_AddNumberToObject(o, "p",  e.slot_id);
-    cJSON_AddBoolToObject  (o, "cq", e.is_cq);
-    cJSON_AddBoolToObject  (o, "me", e.is_to_me);
-    cJSON_AddItemToArray(lines, o);
-  }
-  cJSON_AddItemToObject(root, "lines", lines);
-  char* s = cJSON_PrintUnformatted(root);
-  std::string out = s ? s : "{}";
-  if (s) free(s);
-  cJSON_Delete(root);
-  return out;
-}
+// RX_LIST wire format (binary, replaces the old JSON encoding):
+//
+//   u8  version  = 1
+//   u8  count    (number of decode rows that follow)
+//   per row:
+//     i16 snr           (little-endian)
+//     i16 offset_hz     (little-endian)
+//     u8  slot_id       (0=even, 1=odd; the firmware's slot parity)
+//     u8  flags         bit0 = is_cq, bit1 = is_to_me
+//     u8  text_len      (0..RX_TEXT_MAX)
+//     char text[text_len]
+//
+// True zero-copy on the firmware side: each row's header is built on a
+// few stack bytes, the text comes from the static rx_lines[] array via
+// ui_get_rx_entry's stack copy, and the bytes go straight into the
+// NimBLE mbuf pool with no intermediate scratch on the main heap.
+// Important under heap fragmentation — after a heavy decode pass the
+// largest contiguous block can drop below 2 KB and the previous cJSON
+// + std::string + std::vector path used to abort.
+constexpr uint8_t kRxListWireVersion = 1;
 
 static const char* qso_state_name(CoreQsoState s) {
   switch (s) {
@@ -324,7 +322,43 @@ static int access_read_str(struct ble_gatt_access_ctxt* ctxt, const std::string&
 
 static int chr_rx_list_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt* ctxt, void*) {
   if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_UNLIKELY;
-  return access_read_str(ctxt, json_build_rx_list());
+
+  const int total = ui_get_rx_count();
+  uint8_t count = (total < 0) ? 0 : (total > 255 ? 255 : (uint8_t)total);
+
+  uint8_t hdr[2] = { kRxListWireVersion, count };
+  if (os_mbuf_append(ctxt->om, hdr, sizeof(hdr)) != 0) {
+    return BLE_ATT_ERR_INSUFFICIENT_RES;
+  }
+
+  for (uint8_t i = 0; i < count; ++i) {
+    RxDecodeEntry e;
+    if (!ui_get_rx_entry(i, &e)) continue;
+
+    // RX_TEXT_MAX is 64; bound length to one byte just in case.
+    size_t tlen = strnlen(e.text, sizeof(e.text));
+    if (tlen > 255) tlen = 255;
+
+    struct __attribute__((packed)) {
+      int16_t snr;
+      int16_t offset_hz;
+      uint8_t slot_id;
+      uint8_t flags;
+      uint8_t text_len;
+    } row{
+      .snr       = (int16_t)e.snr,
+      .offset_hz = (int16_t)e.offset_hz,
+      .slot_id   = (uint8_t)e.slot_id,
+      .flags     = (uint8_t)((e.is_cq ? 0x01 : 0) | (e.is_to_me ? 0x02 : 0)),
+      .text_len  = (uint8_t)tlen,
+    };
+
+    if (os_mbuf_append(ctxt->om, &row, sizeof(row)) != 0 ||
+        (tlen > 0 && os_mbuf_append(ctxt->om, e.text, tlen) != 0)) {
+      return BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+  }
+  return 0;
 }
 static int chr_qso_queue_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt* ctxt, void*) {
   if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_UNLIKELY;
