@@ -862,9 +862,10 @@ bool ble_native_init(void) {
   // Priority 3 (below app_task_core0's 5) so the local UI never gets
   // starved by BLE TX work. Pinned to core 1 so it runs alongside the
   // audio task but doesn't contend with the main UI loop on core 0.
-  // 4 KB stack: JSON building is shallow, but ble_gatts_notify_custom
-  // uses significant stack on the NimBLE internal PDU path. 3 KB
-  // overflowed under sustained 6 Hz waterfall streaming.
+  // 4 KB stack. The save_station_data fprintf chain (22 fprintfs into
+  // a SPIFFS file) is the deep frame on this task — deferred to the
+  // main task via g_config_save_pending so it never runs here. With
+  // that out of the path, 4 KB is comfortable.
   BaseType_t ok = xTaskCreatePinnedToCore(tx_task_main, "ble_native", 4096,
                                           nullptr, 3, &s_tx_task, 1);
   if (ok != pdPASS) {

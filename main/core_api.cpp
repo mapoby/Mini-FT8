@@ -363,7 +363,14 @@ void core_fire_waterfall_row(int sym,
 // Commands
 // ---------------------------------------------------------------------------
 
-// Helper: apply a string setter + save + fire config event.
+// Save deferral: every save_station_data call below would otherwise run
+// on the ble_native task, whose 4 KB stack can't accommodate the 22-
+// fprintf chain in save_station_data plus SPIFFS internals. Set the
+// flag instead — the main UI loop on the deeper app_task_core0 stack
+// drains it within ~10 ms.
+extern volatile bool g_config_save_pending;
+
+// Helper: apply a string setter + request save + fire config event.
 namespace {
 template <typename T>
 bool apply_config_write(T&& mutator) {
@@ -371,7 +378,7 @@ bool apply_config_write(T&& mutator) {
     ConfigGuard g;
     mutator();
   }
-  save_station_data();
+  g_config_save_pending = true;
   core_fire_config_changed();
   return true;
 }
@@ -463,7 +470,7 @@ bool core_cmd_set_radio(CoreRadioType r) {
     g_radio = nr;
   }
   apply_radio_profile_binding();
-  save_station_data();
+  g_config_save_pending = true;
   core_fire_config_changed();
   return true;
 }
@@ -495,7 +502,7 @@ bool core_cmd_set_cq_type(CoreCqType t) {
     g_cq_type = map_in(t);
   }
   update_autoseq_cq_type();
-  save_station_data();
+  g_config_save_pending = true;
   core_fire_config_changed();
   return true;
 }
@@ -505,7 +512,7 @@ bool core_cmd_set_cq_freetext(const std::string& text) {
     g_cq_freetext = text;
   }
   update_autoseq_cq_type();
-  save_station_data();
+  g_config_save_pending = true;
   core_fire_config_changed();
   return true;
 }
@@ -527,7 +534,7 @@ bool core_cmd_set_skip_tx1(bool skip) {
     g_skip_tx1 = skip;
   }
   autoseq_set_skip_tx1(skip);
-  save_station_data();
+  g_config_save_pending = true;
   core_fire_config_changed();
   return true;
 }
@@ -538,7 +545,7 @@ bool core_cmd_set_max_retry(int n) {
     g_autoseq_max_retry = n;
   }
   autoseq_set_max_retry(n);
-  save_station_data();
+  g_config_save_pending = true;
   core_fire_config_changed();
   return true;
 }
@@ -564,7 +571,7 @@ bool core_cmd_set_rtc(int64_t epoch_ms) {
   }
   if (!rtc_set_from_strings()) return false;
   rtc_sync_to_hw();
-  save_station_data();
+  g_config_save_pending = true;
   core_fire_config_changed();
   return true;
 }
@@ -582,7 +589,7 @@ bool core_cmd_ignore_add(const std::string& prefix) {
     g_ignore_prefixes.push_back(prefix);
   }
   rebuild_ignore_prefixes();
-  save_station_data();
+  g_config_save_pending = true;
   core_fire_config_changed();
   return true;
 }
@@ -596,7 +603,7 @@ bool core_cmd_ignore_remove(const std::string& prefix) {
   }
   if (!removed) return false;
   rebuild_ignore_prefixes();
-  save_station_data();
+  g_config_save_pending = true;
   core_fire_config_changed();
   return true;
 }
@@ -606,13 +613,13 @@ bool core_cmd_ignore_clear() {
     g_ignore_prefixes.clear();
   }
   rebuild_ignore_prefixes();
-  save_station_data();
+  g_config_save_pending = true;
   core_fire_config_changed();
   return true;
 }
 
 bool core_cmd_save_config() {
-  save_station_data();
+  g_config_save_pending = true;
   return true;
 }
 

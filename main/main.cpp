@@ -972,6 +972,10 @@ volatile int64_t g_decode_applied_slot_idx = -1;
 // STATUS-exit auto-sync in enter_mode handles the analogous case.
 volatile bool g_cdc_initial_sync_pending = false;
 
+// Deferred-save flag — see extern declaration above. Storage lives on
+// main.cpp side; ble_native / core_api.cpp's RPC dispatch only flips it.
+volatile bool g_config_save_pending = false;
+
 // State machine variables (matching reference project architecture)
 // TX is scheduled by setting these flags; actual TX starts at slot boundary
 // Global TX-arming state: read by tx_tick on the next slot boundary.
@@ -1021,6 +1025,13 @@ static UIMode g_ble_qso_return_mode = UIMode::RX;
 
 static void host_handle_line(const std::string& line);
 void save_station_data();  // visible to core_api.cpp
+
+// Deferred-save flag. core_api.cpp's RPC handlers (running on the
+// shallow ble_native task) flip this to ask the main task to flush
+// station data — the 22-fprintf chain is too deep for that 4 KB
+// stack. The main app_task_core0 has 12 KB and processes the flag
+// once per loop tick (~10 ms latency).
+extern volatile bool g_config_save_pending;
 // TX entry for display and scheduling (populated by autoseq)
 // Non-static for the same reason as g_qso_xmit / g_target_slot_parity
 // above — core_api.cpp's tap_rx RPC arms these on user-pick events.
@@ -5568,6 +5579,15 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     consume_cdc_initial_sync();  // auto-sync VFO on first QMX connect (every iter)
     check_slot_boundary();  // TX trigger at slot boundary (matching reference architecture)
     tx_tick();              // Process TX state machine (single-threaded, non-blocking)
+
+    // Drain deferred config saves requested by the BLE RPC dispatch.
+    // Clear before saving so a write that lands during the save just
+    // re-arms us for the next tick (we never lose an update; we may
+    // re-save once unnecessarily, which is fine).
+    if (g_config_save_pending) {
+      g_config_save_pending = false;
+      save_station_data();
+    }
 
     // No-QMX fallback: if begin_usb_host_mode armed the timer and nothing
     // has enumerated by the deadline, tear USB host down and switch to
