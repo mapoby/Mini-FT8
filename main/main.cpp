@@ -975,6 +975,11 @@ volatile bool g_cdc_initial_sync_pending = false;
 // Deferred-save flag — see extern declaration above. Storage lives on
 // main.cpp side; ble_native / core_api.cpp's RPC dispatch only flips it.
 volatile bool g_config_save_pending = false;
+// Set true once the stream task has finished its heap_caps_malloc for
+// ft8_buffer/temp_dec, OR fall_back_to_control_mode has decided no
+// stream task will run. NimBLE init waits on this so its ~28 KB
+// controller pool doesn't drain heap out from under the stream task.
+volatile bool g_uac_stream_alloc_done = false;
 
 // State machine variables (matching reference project architecture)
 // TX is scheduled by setting these flags; actual TX starts at slot boundary
@@ -5284,6 +5289,8 @@ static constexpr int64_t kQmxDetectTimeoutMs = 10000;
 // resumes ownership and the PC re-enumerates Mini-FT8 as a serial device.
 static void fall_back_to_control_mode(const char* reason) {
   g_qmx_detect_active = false;
+  // No stream task will run; release the BLE init gate.
+  g_uac_stream_alloc_done = true;
   ESP_LOGI(TAG, "USB host fallback: %s — entering CONTROL", reason);
   debug_log_line("No QMX -> CONTROL");
   audio_source_stop();
@@ -5623,12 +5630,17 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     tx_tick();              // Process TX state machine (single-threaded, non-blocking)
 
     // One-shot NimBLE init, deferred until USB host has finished
-    // enumerating. Running NimBLE before USB host install fragmented the
-    // heap with ~12 KB of small chunks, which left no 512-byte-aligned
-    // DMA holes for hcd_dwc.c's endpoint-pipe descriptor lists and broke
-    // CDC iface claim with ESP_ERR_NO_MEM.
+    // enumerating AND the stream task has grabbed its heap working
+    // buffers. The latter is the race-killer: NimBLE's controller pool
+    // and the stream task's ft8_buffer alloc otherwise compete on a
+    // FreeRTOS-scheduling-dependent order — sometimes BLE wins (stream
+    // task malloc returns NULL, no UAC) and sometimes the stream task
+    // wins (NimBLE silently fails to advertise). Gating BLE on
+    // g_uac_stream_alloc_done makes the stream task always allocate
+    // first; NimBLE then fits in the remaining ~70 K cleanly.
     static bool s_ble_init_done = false;
-    if (!s_ble_init_done && !g_startup_active && !g_qmx_detect_active) {
+    if (!s_ble_init_done && !g_startup_active && !g_qmx_detect_active
+        && g_uac_stream_alloc_done) {
       init_bluetooth();
       apply_ble_enabled_policy(true);
       ESP_LOGI(TAG, "BLE init complete (deferred until post-USB-host)");
