@@ -52,8 +52,14 @@ int64_t rtc_now_ms();
 #define STREAM_TASK_STACK_SIZE  8192
 
 // UAC read buffer size (bytes) - must be multiple of 288 (USB transfer size at 48kHz/24bit/stereo)
-// 288 bytes = 48 stereo samples per 1ms USB transfer, 4608 = 288 * 16
-#define UAC_READ_BUFFER_SIZE    4608
+// 288 bytes = 48 stereo samples per 1ms USB transfer.
+// 2304 = 288 * 8 — halved from the original 4608 to free 2304 B of
+// DMA-capable BSS for the heap pool. The decoder is offline (FFT runs
+// for ~13 s with the sample pump effectively paused), so a smaller
+// in-flight USB EP IN buffer only matters during live collection — and
+// 8 ms of headroom is still well above what the host scheduler needs.
+// Regression canary: waterfall artifacts from the UAC signal generator.
+#define UAC_READ_BUFFER_SIZE    2304
 
 // USB host DMAs into this buffer. Placed in DMA-capable BSS via DMA_ATTR so
 // task start-up doesn't depend on finding a large DMA-capable heap block —
