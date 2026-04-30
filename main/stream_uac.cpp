@@ -612,17 +612,11 @@ static void stream_uac_task(void* arg) {
     // Initialize resampler
     resample_init(&s_resample_state);
 
-    // Wait until the next 15s boundary
-    {
-        int64_t now_ms = rtc_now_ms();
-        int64_t rem = now_ms % 15000;
-        int64_t wait_ms = (rem < 100) ? 0 : (15000 - rem);
-        if (wait_ms > 0) {
-            vTaskDelay(pdMS_TO_TICKS((uint32_t)wait_ms));
-        }
-    }
-
-    // Initialize FT8 monitor
+    // Initialize FT8 monitor and grab heap working buffers FIRST, before
+    // the slot-boundary wait below. NimBLE init runs deferred in the main
+    // loop and races against this task creation; if we malloc'd after the
+    // wait, NimBLE's controller pool would already have drained the heap
+    // and ft8_buffer would come back NULL.
     monitor_config_t mon_cfg = {
         .f_min = 200.0f,
         .f_max = 2900.0f,
@@ -653,6 +647,18 @@ static void stream_uac_task(void* arg) {
         s_stream_task_handle = NULL;
         vTaskDelete(NULL);
         return;
+    }
+
+    // Wait until the next 15s boundary so the sample-pump loop below aligns
+    // to FT8 slot edges. Buffers were grabbed above so heap state during
+    // this sleep doesn't matter.
+    {
+        int64_t now_ms = rtc_now_ms();
+        int64_t rem = now_ms % 15000;
+        int64_t wait_ms = (rem < 100) ? 0 : (15000 - rem);
+        if (wait_ms > 0) {
+            vTaskDelay(pdMS_TO_TICKS((uint32_t)wait_ms));
+        }
     }
 
     const int target_blocks = 80;

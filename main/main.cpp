@@ -1025,7 +1025,6 @@ static UIMode g_ble_qso_return_mode = UIMode::RX;
 
 static void host_handle_line(const std::string& line);
 void save_station_data();  // visible to core_api.cpp
-static bool storage_is_mounted();   // defined alongside the FATFS mount helpers
 
 // Deferred-save flag. core_api.cpp's RPC handlers (running on the
 // shallow ble_native task) flip this to ask the main task to flush
@@ -4974,16 +4973,10 @@ static void load_station_data() {
 }
 
 void save_station_data() {
-  // During the boot-load window, FATFS is unmounted so the USB-host
-  // stack can claim DMA-capable heap. Defer until the main loop's
-  // post-init drain re-mounts and processes the pending flag.
-  if (!storage_is_mounted()) {
-    g_config_save_pending = true;
-    return;
-  }
   FILE* f = fopen(STATION_FILE, "w");
   if (!f) {
-    ESP_LOGE(TAG, "Failed to open %s for write", STATION_FILE);
+    ESP_LOGE(TAG, "Failed to open %s for write: errno=%d (%s)",
+             STATION_FILE, errno, strerror(errno));
     return;
   }
   for (size_t i = 0; i < g_bands.size(); ++i) {
@@ -5357,9 +5350,6 @@ static void begin_usb_host_mode() {
 }
 
 static wl_handle_t s_storage_wl_handle = WL_INVALID_HANDLE;
-// True between the boot-load unmount and the post-USB-init re-mount;
-// reads/writes during this window have to defer.
-static bool s_storage_init_phase = false;
 
 static bool storage_is_mounted() {
   return s_storage_wl_handle != WL_INVALID_HANDLE;
@@ -5379,24 +5369,32 @@ static esp_err_t mount_storage() {
   // tighter than the default but still way more capacity than a season
   // of ADIF logs.
   mount_config.allocation_unit_size = 4096;
-  return esp_vfs_fat_spiflash_mount_rw_wl(
-      "/storage", "storage", &mount_config, &s_storage_wl_handle);
-}
-
-static void unmount_storage() {
-  if (!storage_is_mounted()) return;
-  esp_vfs_fat_spiflash_unmount_rw_wl("/storage", s_storage_wl_handle);
-  s_storage_wl_handle = WL_INVALID_HANDLE;
+  // Use a local handle and only commit on success. ESP-IDF's mount fn has
+  // incomplete cleanup when wl_mount succeeds but a later step (vfs_register,
+  // s_f_mount_rw, ctx calloc) ENOMEMs — the fail: label does not wl_unmount,
+  // leaving the WL layer half-initialised. If we let s_storage_wl_handle
+  // hold that leaked value, a retry sees corrupt state, IDF returns ESP_OK
+  // without actually registering /storage with VFS, and every fopen there
+  // fails with ENOENT. Recover by wl_unmount-ing on failure ourselves.
+  wl_handle_t handle = WL_INVALID_HANDLE;
+  esp_err_t err = esp_vfs_fat_spiflash_mount_rw_wl(
+      "/storage", "storage", &mount_config, &handle);
+  if (err == ESP_OK) {
+    s_storage_wl_handle = handle;
+  } else {
+    if (handle != WL_INVALID_HANDLE) {
+      wl_unmount(handle);
+    }
+    s_storage_wl_handle = WL_INVALID_HANDLE;
+  }
+  return err;
 }
 
 static void app_task_core0(void* /*param*/) {
-  // Boot-load window. Mount FATFS just long enough to read Station.txt,
-  // then unmount so the USB-host stack's DMA-capable allocations during
-  // begin_usb_host_mode have a clear heap budget. The main loop below
-  // re-mounts permanently once the USB-host init window has closed
-  // (QMX detected, or no-QMX fallback resolved).
+  // Mount FATFS first, while heap is fresh — WL grabs its 4 KB sector
+  // buffer before USB host or NimBLE start fragmenting things. Stays
+  // mounted for the rest of the run; saves write straight through.
   ESP_ERROR_CHECK(mount_storage());
-  s_storage_init_phase = true;
 
   // Initialize mutexes for thread-safe operations
   log_mutex = xSemaphoreCreateMutex();
@@ -5431,12 +5429,11 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
   ui_mode = UIMode::RX;
   load_station_data();
-  // Boot-load complete — release FATFS heap before NimBLE/USB host
-  // initialise. Re-mounted in the main loop after the USB-host init
-  // window closes.
-  unmount_storage();
-  init_bluetooth();
-  apply_ble_enabled_policy(true);
+  // NimBLE init is deferred until after USB host has finished enumerating
+  // (main-loop one-shot below). NimBLE allocates ~12 KB of small,
+  // fragmenting chunks; running it before USB host install would leave
+  // hcd_dwc.c with no 512-byte-aligned DMA holes for its endpoint-pipe
+  // descriptor lists, and CDC iface claim would fail ENOMEM.
   apply_radio_profile_binding();
   update_autoseq_cq_type();
 
@@ -5625,40 +5622,23 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     check_slot_boundary();  // TX trigger at slot boundary (matching reference architecture)
     tx_tick();              // Process TX state machine (single-threaded, non-blocking)
 
-    // Re-mount FATFS once USB host has settled.
-    //
-    // Subtle: g_qmx_detect_active clears the moment UAC sees the mic, but
-    // cdc_acm_host_open is still claiming DMA-capable transfer buffers for
-    // ~200 ms after that. Mounting FATFS in that gap starves CDC and trips
-    // a tlsf double-free inside cdc_acm's error path. Wait for cat_cdc_ready
-    // (CDC fully open) OR a grace timeout after eligibility — the timeout
-    // covers CONTROL fallback, generic UAC, and QMX-lookalikes whose CDC
-    // never opens.
-    static int64_t s_remount_eligible_ms = 0;
-    constexpr int64_t kRemountSettleMs = 2000;
-    if (s_storage_init_phase && !g_startup_active && !g_qmx_detect_active) {
-      int64_t now_ms = esp_timer_get_time() / 1000;
-      if (s_remount_eligible_ms == 0) s_remount_eligible_ms = now_ms;
-      bool cdc_settled = cat_cdc_ready();
-      bool grace_elapsed = (now_ms - s_remount_eligible_ms) >= kRemountSettleMs;
-      if (cdc_settled || grace_elapsed) {
-        esp_err_t err = mount_storage();
-        if (err == ESP_OK) {
-          ESP_LOGI(TAG, "Storage re-mounted post-USB-init (cdc_ready=%d)",
-                   cdc_settled ? 1 : 0);
-        } else {
-          ESP_LOGE(TAG, "Storage re-mount failed: %s — saves will be skipped",
-                   esp_err_to_name(err));
-        }
-        s_storage_init_phase = false;
-      }
+    // One-shot NimBLE init, deferred until USB host has finished
+    // enumerating. Running NimBLE before USB host install fragmented the
+    // heap with ~12 KB of small chunks, which left no 512-byte-aligned
+    // DMA holes for hcd_dwc.c's endpoint-pipe descriptor lists and broke
+    // CDC iface claim with ESP_ERR_NO_MEM.
+    static bool s_ble_init_done = false;
+    if (!s_ble_init_done && !g_startup_active && !g_qmx_detect_active) {
+      init_bluetooth();
+      apply_ble_enabled_policy(true);
+      ESP_LOGI(TAG, "BLE init complete (deferred until post-USB-host)");
+      s_ble_init_done = true;
     }
 
-    // Drain deferred config saves requested by the BLE RPC dispatch
-    // (and by save_station_data calls that landed during the boot-load
-    // window). Skip while storage is unmounted; the flag stays set and
-    // will be drained on a future tick once mount succeeds.
-    if (g_config_save_pending && storage_is_mounted()) {
+    // Drain deferred config saves requested by core_api RPC dispatch
+    // (BLE writes land on a 4 KB task stack that can't carry FATFS work
+    // buffers; the RPC sets the flag and we run the save here).
+    if (g_config_save_pending) {
       g_config_save_pending = false;
       save_station_data();
     }
