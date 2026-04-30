@@ -30,9 +30,6 @@ extern void log_heap(const char* tag);
 
 // External references from main.cpp
 extern bool g_streaming;
-// Gates the deferred NimBLE init in main.cpp's main loop. Set after the
-// stream task either grabs its float buffers or gives up trying.
-extern volatile bool g_uac_stream_alloc_done;
 extern bool g_decode_enabled;
 extern int g_time_osr;
 extern int g_freq_osr;
@@ -647,9 +644,6 @@ static void stream_uac_task(void* arg) {
     float*   temp_dec   = (float*)heap_caps_malloc(sizeof(float) * 512,
                                                    MALLOC_CAP_DEFAULT);
     log_heap("UAC_AFTER_FFT_ALLOC");
-    // Release the NimBLE init gate (success or failure — heap state is
-    // settled either way; we just don't want NimBLE racing against us).
-    g_uac_stream_alloc_done = true;
     if (!ft8_buffer || !temp_dec) {
         ESP_LOGE(TAG, "Buffer allocation failed: ft8=%p temp=%p",
                  ft8_buffer, temp_dec);
