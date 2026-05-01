@@ -35,8 +35,8 @@ int64_t rtc_now_ms();
 #define STREAM_TASK_STACK_SIZE  8192
 
 // UAC read buffer size (bytes) - must be multiple of 288 (USB transfer size at 48kHz/24bit/stereo)
-// 288 bytes = 48 stereo samples per 1ms USB transfer, 4608 = 288 * 16
-#define UAC_READ_BUFFER_SIZE    4608
+// 288 bytes = 48 stereo samples per 1ms USB transfer, 2304 = 288 * 8
+#define UAC_READ_BUFFER_SIZE    2304
 
 // USB host DMAs into this buffer. Placed in DMA-capable BSS via DMA_ATTR so
 // task start-up doesn't depend on finding a large DMA-capable heap block —
@@ -353,8 +353,25 @@ static void usb_lib_task(void* arg) {
         ESP_LOGI(TAG, "CDC-ACM driver uninstalled");
     }
 
+    // Drain pending USB host events before uninstall. usb_host_uninstall()
+    // refuses to release the PHY while client-detach/all-free events are
+    // still pending, which blocks the subsequent TinyUSB device-mode MSC path.
+    for (int i = 0; i < 50; ++i) {
+        uint32_t event_flags = 0;
+        usb_host_lib_handle_events(pdMS_TO_TICKS(20), &event_flags);
+        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
+            usb_host_device_free_all();
+        }
+        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) {
+            break;
+        }
+    }
+
     ESP_LOGI(TAG, "USB Host uninstalling");
-    usb_host_uninstall();
+    esp_err_t uerr = usb_host_uninstall();
+    if (uerr != ESP_OK) {
+        ESP_LOGW(TAG, "usb_host_uninstall: %s", esp_err_to_name(uerr));
+    }
     s_usb_task_handle = NULL;
     vTaskDelete(NULL);
 }

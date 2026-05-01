@@ -365,7 +365,7 @@ void core_fire_waterfall_row(int sym,
 
 // Save deferral: every save_station_data call below would otherwise run
 // on the ble_native task, whose 4 KB stack can't accommodate the 22-
-// fprintf chain in save_station_data plus SPIFFS internals. Set the
+// fprintf chain in save_station_data plus filesystem internals. Set the
 // flag instead — the main UI loop on the deeper app_task_core0 stack
 // drains it within ~10 ms.
 extern volatile bool g_config_save_pending;
@@ -641,10 +641,10 @@ CoreAdifHandle core_adif_open() {
   CoreAdifHandle h{-1, -1};
   if (g_adif.fp) return h;  // single-reader invariant
 
-  // Find most recent .adi file in /spiffs.
+  // Find most recent .adi file in /storage.
   // For simplicity, we just try today's filename; step 3 can add the
   // full "pick most recent from listing" logic.
-  // Build "/spiffs/YYYYMMDD.adi" from g_date.
+  // Build "/storage/YYYYMMDD.adi" from g_date.
   char path[64];
   const char* d = g_date.c_str();
   // strip dashes
@@ -653,7 +653,7 @@ CoreAdifHandle core_adif_open() {
   for (int i = 0; d[i] && o < 8; ++i) {
     if (d[i] >= '0' && d[i] <= '9') yyyymmdd[o++] = d[i];
   }
-  snprintf(path, sizeof(path), "/spiffs/%s.adi", yyyymmdd);
+  snprintf(path, sizeof(path), "/storage/%s.adi", yyyymmdd);
 
   FILE* f = fopen(path, "rb");
   if (!f) return h;

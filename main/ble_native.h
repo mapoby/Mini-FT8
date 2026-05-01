@@ -159,6 +159,10 @@ extern "C" {
 // Also starts the TX helper task that pumps notifications.
 bool ble_native_init(void);
 
+// Stops the TX helper task and releases its queues before NimBLE teardown.
+// Used only by one-way MSC mode; BLE cannot be restarted afterward.
+void ble_native_shutdown(void);
+
 // Notify server of a new connection / disconnect so it can track
 // subscription state. Called from gap_cb.
 void ble_native_on_connect(uint16_t conn_handle);

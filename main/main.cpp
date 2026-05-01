@@ -3,7 +3,7 @@
 #include <cstdio>
 #include <cmath>
 #include "esp_log.h"
-#include "esp_spiffs.h"
+#include "wear_levelling.h"
 extern "C" {
   #include "ft8/decode.h"
   #include "ft8/constants.h"
@@ -61,8 +61,12 @@ extern "C" {
 #include "driver/sdspi_host.h"
 #include "sdmmc_cmd.h"
 #include "esp_vfs_fat.h"
+#include "esp_partition.h"
+#include "tinyusb.h"
+#include "tinyusb_default_config.h"
+#include "tinyusb_msc.h"
 
-static const char* STATION_FILE = "/spiffs/Station.txt";
+static const char* STATION_FILE = "/storage/Station.txt";
 static sdmmc_card_t* g_sd_card = NULL;
 static bool g_sd_mounted = false;
 static bool g_ble_enabled = true;
@@ -345,6 +349,37 @@ static void init_bluetooth(void)
     ESP_LOGI(BT_TAG, "Host task started");
 }
 
+static void nimble_teardown(void)
+{
+    ESP_LOGI(BT_TAG, "nimble_teardown start");
+    uint32_t before = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+
+    if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        ble_gap_terminate(g_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    }
+    if (g_ble_synced) {
+        ble_gap_adv_stop();
+        g_ble_synced = false;
+    }
+
+    ble_native_shutdown();
+
+    nimble_port_stop();
+    nimble_port_freertos_deinit();
+    nimble_port_deinit();
+
+    esp_err_t err = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+    if (err != ESP_OK) {
+        ESP_LOGW(BT_TAG, "esp_bt_controller_mem_release: %s",
+                 esp_err_to_name(err));
+    }
+
+    uint32_t after = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+    ESP_LOGI(BT_TAG, "nimble_teardown done: heap %u -> %u (+%d)",
+             (unsigned)before, (unsigned)after, (int)(after - before));
+}
+
 static int gap_cb(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
@@ -544,7 +579,7 @@ static void build_rxtx_log_path(char* path, size_t path_sz) {
   localtime_r(&now, &t);
 
   // RT[YYMMDD].txt
-  snprintf(path, path_sz, "/spiffs/RT%02d%02d%02d.txt",
+  snprintf(path, path_sz, "/storage/RT%02d%02d%02d.txt",
            (t.tm_year + 1900) % 100,
            (t.tm_mon + 1) % 100,
            t.tm_mday % 100);
@@ -563,23 +598,23 @@ static void sync_station_txt_from_sd_to_spiffs() {
   g_station_txt_sync_attempted = true;
 
   if (ensure_sdcard_mounted() != ESP_OK) {
-    ESP_LOGI(TAG, "SD not mounted, using SPIFFS Station.txt");
+    ESP_LOGI(TAG, "SD not mounted, using storage Station.txt");
     return;
   }
 
   const char* sd_path = "/sdcard/Station.txt";
-  const char* spiffs_path = "/spiffs/Station.txt";
+  const char* spiffs_path = "/storage/Station.txt";
 
   if (!file_exists(sd_path)) {
-    ESP_LOGI(TAG, "No Station.txt on SD, using SPIFFS Station.txt");
+    ESP_LOGI(TAG, "No Station.txt on SD, using storage Station.txt");
     unmount_sd_spi("/sdcard");
     return;
   }
 
   if (copy_file_overwrite(sd_path, spiffs_path) == ESP_OK) {
-    ESP_LOGI(TAG, "Copied Station.txt from SD to SPIFFS");
+    ESP_LOGI(TAG, "Copied Station.txt from SD to storage");
   } else {
-    ESP_LOGW(TAG, "Failed to copy Station.txt from SD, using SPIFFS Station.txt");
+    ESP_LOGW(TAG, "Failed to copy Station.txt from SD, using storage Station.txt");
   }
 
   unmount_sd_spi("/sdcard");
@@ -636,14 +671,14 @@ static esp_err_t copy_file_overwrite_retry(const char* src_path, const char* dst
 
 static bool collect_spiffs_regular_files(std::vector<std::string>& out_files) {
   out_files.clear();
-  DIR* d = opendir("/spiffs");
+  DIR* d = opendir("/storage");
   if (!d) return false;
 
   struct dirent* ent;
   while ((ent = readdir(d)) != nullptr) {
     const char* name = ent->d_name;
     if (!name || name[0] == '.') continue;
-    std::string src = std::string("/spiffs/") + name;
+    std::string src = std::string("/storage/") + name;
     struct stat st;
     if (stat(src.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
     out_files.emplace_back(name);
@@ -663,7 +698,7 @@ static std::string today_qso_file_name() {
   return name;
 }
 
-// Copy all regular files from SPIFFS -> SD card, overwriting destination.
+// Copy all regular files from internal storage -> SD card, overwriting destination.
 static CopyLogsResult copy_logs_spiffs_to_sd_overwrite() {
   CopyLogsResult result{};
   esp_err_t mret = ensure_sdcard_mounted();
@@ -700,7 +735,7 @@ static CopyLogsResult copy_logs_spiffs_to_sd_overwrite() {
     for (const auto& name : files) {
       auto it = copied_ok.find(name);
       if (it != copied_ok.end() && it->second) continue;
-      const std::string src = std::string("/spiffs/") + name;
+      const std::string src = std::string("/storage/") + name;
       const std::string dst = std::string("/sdcard/") + name;
       esp_err_t err = copy_file_overwrite_retry(src.c_str(), dst.c_str());
       set_copy_status(name, err);
@@ -713,7 +748,7 @@ static CopyLogsResult copy_logs_spiffs_to_sd_overwrite() {
 
   // Explicit post-pass for current-day QSO file.
   const std::string qso_name = today_qso_file_name();
-  const std::string qso_src = std::string("/spiffs/") + qso_name;
+  const std::string qso_src = std::string("/storage/") + qso_name;
   struct stat qso_st;
   if (stat(qso_src.c_str(), &qso_st) == 0 && S_ISREG(qso_st.st_mode)) {
     const std::string qso_dst = std::string("/sdcard/") + qso_name;
@@ -952,7 +987,7 @@ static bool rewrite_dxpedition_for_mycall(const std::string& raw_text,
 }
 
 static const char* TAG = "FT8";
-enum class UIMode { RX, TX, BAND, MENU, CONTROL, DEBUG, STATUS, QSO, GPS };
+enum class UIMode { RX, TX, BAND, MENU, MSC, DEBUG, STATUS, QSO, GPS };
 static UIMode ui_mode = UIMode::RX;
 static int tx_page = 0;
 // NOTE: previous `std::vector<UiRxLine> g_rx_lines` was removed to eliminate
@@ -1028,8 +1063,11 @@ static bool g_ble_qso_pick_mode = false;
 static bool g_ble_dump_in_progress = false;
 static UIMode g_ble_qso_return_mode = UIMode::RX;
 
+static void enter_msc_mode(const char* reason);
 static void host_handle_line(const std::string& line);
 void save_station_data();  // visible to core_api.cpp
+static bool storage_is_mounted();
+static void unmount_storage();
 
 // Deferred-save flag. core_api.cpp's RPC handlers (running on the
 // shallow ble_native task) flip this to ask the main task to flush
@@ -1048,7 +1086,7 @@ bool g_pending_tx_valid = false;
 void arm_pending_tx(const AutoseqTxEntry& pending);
 volatile bool g_tx_cancel_requested = false;   // visible to core_api.cpp
 static void host_process_bytes(const uint8_t* buf, size_t len);
-static void poll_host_uart();
+[[maybe_unused]] static void poll_host_uart();
 static bool ble_pop_input(BleUiInput& out);
 static void ble_update_name_from_station(bool restart_adv);
 static void ble_mirror_tick();
@@ -1072,17 +1110,13 @@ static void ble_try_dump_qso_file_by_key(char key);
 
 
 
-static std::vector<std::string> g_ctrl_lines = {
-    "C MODE: USB serial",
-    "Commands:",
-    "WRITEBIN <file> <size> <crc32_hex>",
-    "WRITE/APPEND",
-    "READ/DELETE",
-    "DATE [YYYY-MM-DD]",
-    "TIME [HH:MM:SS]",
-    "SLEEP - deep sleep",
-    "LIST/INFO/HELP",
-    "EXIT to leave"
+static std::vector<std::string> g_msc_lines = {
+    "Mini-FT8 USB drive",
+    "now mounted on PC.",
+    "",
+    "Copy ADIF logs,",
+    "then press any key",
+    "to reboot."
 };
 
 static std::vector<std::string> g_startup_lines = {
@@ -1428,7 +1462,7 @@ static void log_cabrillo_fd_entry(const std::string& dxcall, const std::string& 
   // Frequency: use selected band dial frequency (kHz)
   int freq_khz = (int)g_bands[g_band_sel].freq;
 
-  const char* path = "/spiffs/fieldday.txt";
+  const char* path = "/storage/fieldday.txt";
 
   std::string location = fd_get_section_from_exchange(my_fd);
   cabrillo_fd_ensure_header(path, g_call, location);
@@ -1506,7 +1540,7 @@ static void qso_load_file_list() {
   g_q_files.clear();
   g_q_entries.clear();
   g_q_lines.clear();
-  DIR* dir = opendir("/spiffs");
+  DIR* dir = opendir("/storage");
   if (!dir) {
     g_q_lines.push_back("No QSO logs");
     return;
@@ -1531,13 +1565,13 @@ static void qso_load_file_list() {
 
 static void load_spiffs_regular_files(std::vector<std::string>& files) {
   files.clear();
-  DIR* dir = opendir("/spiffs");
+  DIR* dir = opendir("/storage");
   if (!dir) return;
   struct dirent* ent;
   while ((ent = readdir(dir)) != nullptr) {
     const char* name = ent->d_name;
     if (!name || name[0] == '.') continue;
-    std::string path = std::string("/spiffs/") + name;
+    std::string path = std::string("/storage/") + name;
     struct stat st;
     if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
     files.emplace_back(name);
@@ -1552,7 +1586,7 @@ static void delete_load_file_list() {
   load_spiffs_regular_files(g_d_files);
   g_d_files.erase(std::remove(g_d_files.begin(), g_d_files.end(), "Station.txt"), g_d_files.end());
   if (g_d_files.empty()) {
-    g_d_lines.push_back("No SPIFFS files");
+    g_d_lines.push_back("No storage files");
     return;
   }
   for (size_t i = 0; i < g_d_files.size(); ++i) {
@@ -1566,7 +1600,7 @@ static void qso_load_fetch_file_list() {
   g_q_lines.clear();
   load_spiffs_regular_files(g_q_files);
   if (g_q_files.empty()) {
-    g_q_lines.push_back("No SPIFFS files");
+    g_q_lines.push_back("No storage files");
     return;
   }
   for (size_t i = 0; i < g_q_files.size(); ++i) {
@@ -1632,7 +1666,7 @@ static void qso_rebuild_entry_lines() {
 static void qso_load_entries(const std::string& path) {
   g_q_entries.clear();
   g_q_lines.clear();
-  std::string full = std::string("/spiffs/") + path;
+  std::string full = std::string("/storage/") + path;
   FILE* f = fopen(full.c_str(), "r");
   if (!f) {
     g_q_lines.push_back("Open fail");
@@ -1721,7 +1755,7 @@ static void log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
   int day = t.tm_mday;
   snprintf(date, sizeof(date), "%04d%02d%02d", year % 10000, month % 100, day % 100);
   char path[64];
-  snprintf(path, sizeof(path), "/spiffs/%s.txt", date);
+  snprintf(path, sizeof(path), "/storage/%s.txt", date);
 
   bool need_header = false;
   struct stat st;
@@ -1855,7 +1889,7 @@ static const char* uart_mirror_mode_label(UIMode mode) {
     case UIMode::TX:      return "TX";
     case UIMode::BAND:    return "BAND";
     case UIMode::MENU:    return "MENU";
-    case UIMode::CONTROL: return "CONTROL";
+    case UIMode::MSC:     return "MSC";
     case UIMode::DEBUG:   return "DEBUG";
     case UIMode::STATUS:  return "STATUS";
     case UIMode::QSO:     return "QSO";
@@ -4134,7 +4168,7 @@ static const char* ble_page_label(UIMode mode) {
     case UIMode::TX: return "TX";
     case UIMode::BAND: return "BAND";
     case UIMode::MENU: return "MENU";
-    case UIMode::CONTROL: return "CONTROL";
+    case UIMode::MSC: return "MSC";
     case UIMode::DEBUG: return "DELETE";
     case UIMode::STATUS: return "STATUS";
     case UIMode::QSO: return "QSO";
@@ -4345,7 +4379,7 @@ static void ble_dump_qso_file(const std::string& file_name) {
   g_ble_dump_in_progress = true;
   const bool use_indicate = g_ble_tx_indicate_enabled;
   ble_dump_reset_transfer_state(use_indicate);
-  std::string full_path = std::string("/spiffs/") + file_name;
+  std::string full_path = std::string("/storage/") + file_name;
   if (!use_indicate) {
     (void)ble_dump_send_line("fallback notify mode (best effort)");
   }
@@ -4638,6 +4672,7 @@ static void apply_ble_enabled_policy(bool runtime_apply) {
 static void ble_mirror_tick() {}
 static void ble_countdown_tick() {}
 static void init_bluetooth(void) {}
+static void nimble_teardown(void) {}
 #endif // ENABLE_BLE
 
 static std::string trim_copy(const std::string& s) {
@@ -4721,7 +4756,7 @@ static void host_handle_line(const std::string& line_in) {
     if (fname.empty()) {
       send("ERROR: filename required");
     } else {
-      std::string path = std::string("/spiffs/") + fname;
+      std::string path = std::string("/storage/") + fname;
       const char* mode = (cmd_up == "WRITE") ? "w" : "a";
       FILE* f = fopen(path.c_str(), mode);
       if (!f) send("ERROR: open failed");
@@ -4730,7 +4765,7 @@ static void host_handle_line(const std::string& line_in) {
   } else if (cmd_up == "READ") {
     if (rest.empty()) send("ERROR: filename required");
     else {
-      std::string path = std::string("/spiffs/") + rest;
+      std::string path = std::string("/storage/") + rest;
       FILE* f = fopen(path.c_str(), "r");
       if (!f) send("ERROR: open failed");
       else {
@@ -4744,11 +4779,11 @@ static void host_handle_line(const std::string& line_in) {
   } else if (cmd_up == "DELETE") {
     if (rest.empty()) send("ERROR: filename required");
     else {
-      std::string path = std::string("/spiffs/") + rest;
+      std::string path = std::string("/storage/") + rest;
       if (unlink(path.c_str()) == 0) send("OK"); else send("ERROR: delete failed");
     }
   } else if (cmd_up == "LIST") {
-    DIR* d = opendir("/spiffs");
+    DIR* d = opendir("/storage");
     if (!d) send("ERROR: opendir failed");
     else {
       struct dirent* ent;
@@ -4770,7 +4805,7 @@ static void host_handle_line(const std::string& line_in) {
     } else if (host_bin_active) {
       send("ERROR: binary upload in progress");
     } else {
-      std::string path = std::string("/spiffs/") + fname;
+      std::string path = std::string("/storage/") + fname;
       FILE* f = fopen(path.c_str(), "wb");
       if (!f) {
         send("ERROR: open failed");
@@ -4850,7 +4885,7 @@ static void host_handle_line(const std::string& line_in) {
     send("Heap: " + std::to_string(heap_caps_get_free_size(MALLOC_CAP_DEFAULT)));
     send("OK");
   } else if (cmd_up == "HELP") {
-    for (auto& l : g_ctrl_lines) send(l);
+    for (auto& l : g_msc_lines) send(l);
   } else if (cmd_up == "EXIT") {
     send("OK: exit host");
     enter_mode(UIMode::RX);
@@ -4990,7 +5025,7 @@ static void host_process_bytes(const uint8_t* buf, size_t len) {
   }
 }
 
-static void poll_host_uart() {
+[[maybe_unused]] static void poll_host_uart() {
   ensure_usb();
   if (!usb_ready) return;
   uint8_t buf[512];
@@ -5018,7 +5053,7 @@ static RadioType load_station_radio_type_only() {
 }
 
 static void load_station_data() {
-  // Sync only Station.txt from SD to SPIFFS (no legacy fallback).
+  // Sync only Station.txt from SD to internal storage (no legacy fallback).
   sync_station_txt_from_sd_to_spiffs();
 
   // Load-time defaults for runtime settings.
@@ -5115,6 +5150,10 @@ static void load_station_data() {
 }
 
 void save_station_data() {
+  if (!storage_is_mounted()) {
+    g_config_save_pending = true;
+    return;
+  }
   FILE* f = fopen(STATION_FILE, "w");
   if (!f) {
     ESP_LOGE(TAG, "Failed to open %s for write", STATION_FILE);
@@ -5215,16 +5254,8 @@ static void enter_mode(UIMode new_mode) {
       delete_load_file_list();
       ui_draw_list(g_d_lines, d_page, -1);
       break;
-    case UIMode::CONTROL:
-      ui_draw_debug(g_ctrl_lines, 0);
-      host_input.clear();
-      ensure_usb();
-      if (usb_ready) {
-        host_write_str("READY\r\n");
-        host_write_str(std::string(HOST_PROMPT));
-      } else {
-        debug_log_line("USB serial not ready");
-      }
+    case UIMode::MSC:
+      ui_draw_debug(g_msc_lines, 0);
       break;
     case UIMode::QSO:
       g_q_show_entries = false;
@@ -5411,7 +5442,7 @@ static void ble_commit_text_input(const BleUiInput& input) {
 }
 #endif
 
-// "No QMX in N seconds → fall back to USB Serial JTAG / CONTROL mode" timer.
+// "No QMX in N seconds -> enter MSC mode" timer.
 // Set when begin_usb_host_mode arms it; cleared once we either see a QMX
 // enumerate (mic or CDC handle) or after we've fallen back. Used by the
 // main loop's periodic check below.
@@ -5419,19 +5450,70 @@ static bool    g_qmx_detect_active     = false;
 static int64_t g_qmx_detect_deadline_ms = 0;
 static constexpr int64_t kQmxDetectTimeoutMs = 10000;
 
-// Tear down the USB host stack and switch to CONTROL mode. usb_host_uninstall
-// (driven by audio_source_stop's synchronous teardown chain) releases the
-// USB-OTG bus, at which point the always-installed USB Serial JTAG driver
-// resumes ownership and the PC re-enumerates Mini-FT8 as a serial device.
-static void fall_back_to_control_mode(const char* reason) {
+// Switch to MSC (USB Mass Storage) mode. This is a one-way transition:
+// BLE controller memory is released and USB-OTG is re-claimed as a device
+// port until reboot.
+static void enter_msc_mode(const char* reason) {
   g_qmx_detect_active = false;
-  ESP_LOGI(TAG, "USB host fallback: %s — entering CONTROL", reason);
-  debug_log_line("No QMX -> CONTROL");
+  ESP_LOGI(TAG, "Entering MSC mode: %s", reason);
+  debug_log_line("Entering MSC mode");
   audio_source_stop();
-  // Small settle window so USB Serial JTAG fully reclaims the bus before
-  // host_handle_line starts pumping bytes through it.
+  // Small settle window so the USB host teardown can release the PHY.
   vTaskDelay(pdMS_TO_TICKS(200));
-  enter_mode(UIMode::CONTROL);
+
+  nimble_teardown();
+
+  if (g_config_save_pending) {
+    g_config_save_pending = false;
+    save_station_data();
+  }
+
+  unmount_storage();
+
+  const esp_partition_t* part = esp_partition_find_first(
+      ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, "storage");
+  if (!part) {
+    ESP_LOGE(TAG, "MSC: storage partition not found");
+    enter_mode(UIMode::MSC);
+    return;
+  }
+
+  wl_handle_t wl = WL_INVALID_HANDLE;
+  esp_err_t err = wl_mount(part, &wl);
+  if (err != ESP_OK || wl == WL_INVALID_HANDLE) {
+    ESP_LOGE(TAG, "MSC: wl_mount failed: %s", esp_err_to_name(err));
+    enter_mode(UIMode::MSC);
+    return;
+  }
+
+  tinyusb_msc_driver_config_t msc_drv_cfg = {};
+  err = tinyusb_msc_install_driver(&msc_drv_cfg);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "MSC: install_driver failed: %s", esp_err_to_name(err));
+    enter_mode(UIMode::MSC);
+    return;
+  }
+
+  tinyusb_msc_storage_config_t msc_storage_cfg = {};
+  msc_storage_cfg.medium.wl_handle = wl;
+  tinyusb_msc_storage_handle_t msc_storage_hdl = nullptr;
+  err = tinyusb_msc_new_storage_spiflash(&msc_storage_cfg, &msc_storage_hdl);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "MSC: new_storage_spiflash failed: %s", esp_err_to_name(err));
+    enter_mode(UIMode::MSC);
+    return;
+  }
+
+  const tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
+  err = tinyusb_driver_install(&tusb_cfg);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "MSC: tinyusb_driver_install failed: %s", esp_err_to_name(err));
+    enter_mode(UIMode::MSC);
+    return;
+  }
+
+  ESP_LOGI(TAG, "MSC ready: PC will see Mini-FT8 as a USB drive");
+  enter_mode(UIMode::MSC);
   ui_force_redraw_rx();
 }
 
@@ -5467,10 +5549,9 @@ static void begin_usb_host_mode() {
       debug_log_line(rc == ESP_OK ? "UAC2 catok" : "UAC2 catng");
       // Headless-friendly fallback: arm a 10 s "no-QMX" timer when the
       // selected radio is QMX. If neither the UAC mic nor the CDC-ACM
-      // endpoint enumerates by then, the main loop calls audio_source_stop
-      // and drops into CONTROL so the PC sees the USB Serial JTAG terminal.
-      // Gated on QMX so a future "KH1 via Cardputer I2S mic" backend (which
-      // never enumerates a USB device) doesn't trip the fallback.
+      // endpoint enumerates by then, the main loop enters MSC so the PC
+      // sees the log partition as a USB drive. Gated on QMX so KH1-MIC
+      // does not trip the fallback.
       if (canonical_radio_type(g_radio) == RadioType::QMX) {
         g_qmx_detect_deadline_ms = esp_timer_get_time() / 1000 + kQmxDetectTimeoutMs;
         g_qmx_detect_active = true;
@@ -5490,14 +5571,36 @@ static void begin_usb_host_mode() {
   }
 }
 
+static wl_handle_t s_storage_wl_handle = WL_INVALID_HANDLE;
+
+static bool storage_is_mounted() {
+  return s_storage_wl_handle != WL_INVALID_HANDLE;
+}
+
+static esp_err_t mount_storage() {
+  if (storage_is_mounted()) return ESP_OK;
+
+  esp_vfs_fat_mount_config_t mount_config = {};
+  mount_config.format_if_mount_failed = true;
+  mount_config.max_files = 3;
+  mount_config.allocation_unit_size = 4096;
+
+  esp_err_t err = esp_vfs_fat_spiflash_mount_rw_wl(
+      "/storage", "storage", &mount_config, &s_storage_wl_handle);
+  if (err != ESP_OK) {
+    s_storage_wl_handle = WL_INVALID_HANDLE;
+  }
+  return err;
+}
+
+static void unmount_storage() {
+  if (!storage_is_mounted()) return;
+  esp_vfs_fat_spiflash_unmount_rw_wl("/storage", s_storage_wl_handle);
+  s_storage_wl_handle = WL_INVALID_HANDLE;
+}
+
 static void app_task_core0(void* /*param*/) {
-  esp_vfs_spiffs_conf_t conf = {
-    .base_path = "/spiffs",
-    .partition_label = NULL,
-    .max_files = 5,
-    .format_if_mount_failed = true
-  };
-  ESP_ERROR_CHECK(esp_vfs_spiffs_register(&conf));
+  ESP_ERROR_CHECK(mount_storage());
 
   // Initialize mutexes for thread-safe operations
   log_mutex = xSemaphoreCreateMutex();
@@ -5679,7 +5782,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     // Startup splash: show for kStartupAutoDismissMs, then auto-enter
     // USB-host mode (= STATUS -> '2'). A direct-mode key during the splash
     // window still short-circuits — most usefully 'c', which drops into the
-    // USB serial terminal instead of starting the QMX audio path.
+    // MSC instead of starting the QMX audio path.
     if (g_startup_active) {
       if (g_startup_start_ms == 0) {
         g_startup_start_ms = esp_timer_get_time() / 1000;
@@ -5736,80 +5839,27 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     }
 
     // No-QMX fallback: if begin_usb_host_mode armed the timer and nothing
-    // has enumerated by the deadline, tear USB host down and switch to
-    // CONTROL so a button-less StampS3Bat can still expose the USB serial
-    // terminal to the host PC. Detection clears the timer immediately.
+    // has enumerated by the deadline, switch to MSC so a button-less
+    // StampS3Bat can still expose logs to the host PC.
     if (g_qmx_detect_active) {
       if (audio_source_qmx_detected()) {
         g_qmx_detect_active = false;
         ESP_LOGI(TAG, "QMX detected; staying in USB host mode");
       } else if (esp_timer_get_time() / 1000 >= g_qmx_detect_deadline_ms) {
-        fall_back_to_control_mode("no QMX after 10s");
+        enter_msc_mode("no QMX after 10s");
       }
     }
 
-  // CONTROL mode: legacy host serial protocol over USB only
-  if (ui_mode == UIMode::CONTROL) {
-    poll_host_uart();
-    if (host_bin_active) { // block keyboard exits during binary upload
-      vTaskDelay(pdMS_TO_TICKS(10));
-      continue;
-    }
-    if (c == 0) {
-      last_key = 0;
-      vTaskDelay(pdMS_TO_TICKS(10));
-      continue;
-    }
-    if (c == last_key) {
-      vTaskDelay(pdMS_TO_TICKS(10));
-      continue;
-    }
-    last_key = c;
-    if (!c_from_ble) {
-      char mode_key = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-      switch (mode_key) {
-        case 'R':
-          enter_mode(UIMode::RX);
-          break;
-        case 'T':
-          enter_mode(UIMode::TX);
-          break;
-        case 'B':
-          enter_mode(UIMode::BAND);
-          break;
-        case 'Q':
-          enter_mode(UIMode::QSO);
-          break;
-        case 'D':
-          enter_mode(UIMode::DEBUG);
-          break;
-        case 'S':
-          enter_mode(UIMode::STATUS);
-          break;
-        case 'M':
-          enter_mode(UIMode::MENU);
-          break;
-        case 'N':
-          enter_mode(UIMode::MENU);
-          if (menu_page < 2) menu_page++;
-          draw_menu_view();
-          break;
-        case 'O':
-          enter_mode(UIMode::MENU);
-          if (menu_page < 2) menu_page++;
-          if (menu_page < 2) menu_page++;
-          draw_menu_view();
-          break;
-        case 'C':
-          enter_mode(UIMode::RX);
-          break;
-        default:
-          break;
+    if (ui_mode == UIMode::MSC) {
+      if (c != 0 && c != last_key && !c_from_ble) {
+        ESP_LOGI(TAG, "Keypress in MSC mode -> reboot");
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_restart();
       }
+      last_key = c;
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
     }
-    vTaskDelay(pdMS_TO_TICKS(10));
-    continue;
-  }
 
     // Global TX cancel (Esc/` in RX/TX/Status when not editing)
     if (c == '`' &&
@@ -5988,7 +6038,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 #endif
         {
           cancel_status_edit();
-          enter_mode(ui_mode == UIMode::CONTROL ? UIMode::RX : UIMode::CONTROL);
+          if (ui_mode != UIMode::MSC) {
+            enter_msc_mode("user pressed C");
+          }
           switched = true;
         }
       }
@@ -6184,7 +6236,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
             int idx = d_page * 6 + (c - '1');
             if (idx >= 0 && idx < (int)g_d_files.size()) {
               std::string deleted = g_d_files[idx];
-              std::string path = std::string("/spiffs/") + deleted;
+              std::string path = std::string("/storage/") + deleted;
               if (unlink(path.c_str()) == 0) {
                 debug_log_line(std::string("Deleted: ") + deleted);
               } else {
@@ -6262,7 +6314,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
           }
           break;
         }
-        case UIMode::CONTROL:
+        case UIMode::MSC:
           break;
         case UIMode::MENU: {
           if (ui_mode == UIMode::MENU) {
@@ -6601,7 +6653,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                          copy_res.copied_count, copy_res.missed_count);
                 debug_log_line(log_msg);
                 if (copy_res.err == ESP_OK) {
-                  debug_log_line("Copied SPIFFS files to SD");
+                  debug_log_line("Copied storage files to SD");
                 }
 
                 draw_menu_view();

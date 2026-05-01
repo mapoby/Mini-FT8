@@ -20,5 +20,7 @@ dependencies:
   espressif/usb: '*'
   # USB Host CDC for CAT
   espressif/usb_host_cdc_acm: ^2.2.0
+  # TinyUSB device stack for MSC log export.
+  espressif/esp_tinyusb: ^2.1.0
   # Cardputer-Adv ES8311 mic capture
   espressif/esp_codec_dev: ^1.5.9

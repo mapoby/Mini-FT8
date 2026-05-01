@@ -123,6 +123,7 @@ static QueueHandle_t s_rpc_resp_queue = nullptr;
 // ---------------------------------------------------------------------------
 
 static TaskHandle_t s_tx_task = nullptr;
+static volatile bool s_tx_task_exit = false;
 
 // ---------------------------------------------------------------------------
 // Core-API consumer callbacks (set dirty flags only; no BLE calls here)
@@ -801,6 +802,12 @@ static void pump_adif() {
 
 static void tx_task_main(void*) {
   while (true) {
+    if (s_tx_task_exit) {
+      s_tx_task = nullptr;
+      vTaskDelete(NULL);
+      return;
+    }
+
     // Wait for a notification (event, waterfall, RPC). ADIF streaming
     // progresses by self-notifying on each chunk. Fallback 250 ms
     // timeout guarantees forward progress even if a notify is ever lost.
@@ -839,6 +846,7 @@ static void tx_task_main(void*) {
 
 bool ble_native_init(void) {
   if (s_tx_task) return true;  // already initialized
+  s_tx_task_exit = false;
 
   // Small queues — RPC traffic is human-paced, 4 in-flight is plenty.
   // Each RpcMsg is 258 bytes, so depth × size is the heap cost.
@@ -874,4 +882,22 @@ bool ble_native_init(void) {
   }
   ESP_LOGI(TAG, "native BLE service registered, version %s", BLE_NATIVE_VERSION);
   return true;
+}
+
+void ble_native_shutdown(void) {
+  if (s_tx_task) {
+    s_tx_task_exit = true;
+    xTaskNotifyGive(s_tx_task);
+    for (int i = 0; i < 50 && s_tx_task != nullptr; ++i) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+  }
+  if (s_rpc_req_queue) {
+    vQueueDelete(s_rpc_req_queue);
+    s_rpc_req_queue = nullptr;
+  }
+  if (s_rpc_resp_queue) {
+    vQueueDelete(s_rpc_resp_queue);
+    s_rpc_resp_queue = nullptr;
+  }
 }

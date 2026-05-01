@@ -102,13 +102,6 @@ void ft8_audio_pipeline_run(const ft8_audio_pipeline_config_t* cfg)
     if (!cfg || !cfg->read || !cfg->should_stop) return;
     const char* tag = cfg->tag ? cfg->tag : "FT8_AUDIO";
 
-    int64_t now_ms = rtc_now_ms();
-    int64_t rem = now_ms % 15000;
-    int64_t wait_ms = (rem < 100) ? 0 : (15000 - rem);
-    if (wait_ms > 0) {
-        vTaskDelay(pdMS_TO_TICKS((uint32_t)wait_ms));
-    }
-
     monitor_config_t mon_cfg = {
         .f_min = 200.0f,
         .f_max = 2900.0f,
@@ -135,6 +128,13 @@ void ft8_audio_pipeline_run(const ft8_audio_pipeline_config_t* cfg)
         if (temp_dec) free(temp_dec);
         monitor_free(&mon);
         return;
+    }
+
+    int64_t now_ms = rtc_now_ms();
+    int64_t rem = now_ms % 15000;
+    int64_t wait_ms = (rem < 100) ? 0 : (15000 - rem);
+    if (wait_ms > 0) {
+        vTaskDelay(pdMS_TO_TICKS((uint32_t)wait_ms));
     }
 
     const int target_blocks = 80;
