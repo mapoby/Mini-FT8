@@ -799,8 +799,15 @@ static void pump_adif() {
   }
 }
 
+static volatile bool s_tx_task_exit = false;
+
 static void tx_task_main(void*) {
   while (true) {
+    if (s_tx_task_exit) {
+      s_tx_task = nullptr;
+      vTaskDelete(NULL);
+      return;
+    }
     // Wait for a notification (event, waterfall, RPC). ADIF streaming
     // progresses by self-notifying on each chunk. Fallback 250 ms
     // timeout guarantees forward progress even if a notify is ever lost.
@@ -874,4 +881,17 @@ bool ble_native_init(void) {
   }
   ESP_LOGI(TAG, "native BLE service registered, version %s", BLE_NATIVE_VERSION);
   return true;
+}
+
+void ble_native_shutdown(void) {
+  if (s_tx_task) {
+    s_tx_task_exit = true;
+    xTaskNotifyGive(s_tx_task);
+    // Wait briefly for the task to clear its handle and self-delete.
+    for (int i = 0; i < 50 && s_tx_task != nullptr; ++i) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+  }
+  if (s_rpc_req_queue)  { vQueueDelete(s_rpc_req_queue);  s_rpc_req_queue  = nullptr; }
+  if (s_rpc_resp_queue) { vQueueDelete(s_rpc_resp_queue); s_rpc_resp_queue = nullptr; }
 }

@@ -159,6 +159,11 @@ extern "C" {
 // Also starts the TX helper task that pumps notifications.
 bool ble_native_init(void);
 
+// Shut the TX helper task down and free its queues. Call BEFORE
+// nimble_port_deinit() — otherwise the task body may invoke
+// ble_gatts_* against torn-down state and crash.
+void ble_native_shutdown(void);
+
 // Notify server of a new connection / disconnect so it can track
 // subscription state. Called from gap_cb.
 void ble_native_on_connect(uint16_t conn_handle);

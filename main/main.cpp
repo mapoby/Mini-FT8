@@ -343,6 +343,50 @@ static void init_bluetooth(void)
     ESP_LOGI(BT_TAG, "Host task started");
 }
 
+// One-way teardown of the BLE stack. Releases the BT controller pool
+// (~60 KB) back to the heap via esp_bt_controller_mem_release. Once
+// called, BLE cannot be re-enabled until the chip resets — used only
+// from enter_msc_mode where MSC owns the system until reboot.
+static void nimble_teardown(void)
+{
+    ESP_LOGI(BT_TAG, "nimble_teardown start");
+    uint32_t before = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+
+    // 1. Drop active connection (if any) and stop advertising.
+    if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        ble_gap_terminate(g_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    }
+    if (g_ble_synced) {
+        ble_gap_adv_stop();
+        g_ble_synced = false;
+    }
+
+    // 2. Stop the ble_native TX task BEFORE deinit so it can't call
+    // ble_gatts_* against torn-down state.
+    ble_native_shutdown();
+
+    // 3. Stop the host event loop, wait for nimble_host_task to exit,
+    // then deinit (which internally also disables + deinits the BT
+    // controller via the IDF NimBLE port).
+    nimble_port_stop();
+    nimble_port_freertos_deinit();
+    nimble_port_deinit();
+
+    // 4. Release the BT controller's static BSS+data back to the heap.
+    // This is the big win — the controller pool is the bulk of the
+    // ~60 KB we want back for TinyUSB MSC.
+    esp_err_t err = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+    if (err != ESP_OK) {
+        ESP_LOGW(BT_TAG, "esp_bt_controller_mem_release: %s",
+                 esp_err_to_name(err));
+    }
+
+    uint32_t after = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+    ESP_LOGI(BT_TAG, "nimble_teardown done: heap %u -> %u (+%d)",
+             (unsigned)before, (unsigned)after, (int)(after - before));
+}
+
 static int gap_cb(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
@@ -4881,17 +4925,17 @@ static constexpr int64_t kQmxDetectTimeoutMs = 10000;
 // Switch to MSC (USB Mass Storage) mode. This is a one-way transition:
 // to leave MSC, the operator copies their logs off and reboots.
 //
-// Stage 1 (this commit): renames CONTROL -> MSC, renders the MSC
-// instruction screen, but no actual USB device is exposed yet.
-// Stage 2 will add NimBLE teardown to free ~60 KB of heap.
-// Stage 3 will tear down USB host, unmount FATFS, and bring up
-// TinyUSB MSC so the host PC sees Mini-FT8 as a USB drive.
+// Stages 1+2: renames CONTROL -> MSC, renders the instruction screen,
+// tears down NimBLE to free ~60 KB heap. No USB drive yet.
+// Stage 3 will tear down USB host, unmount FATFS, and bring up TinyUSB
+// MSC so the host PC sees Mini-FT8 as a USB drive.
 static void enter_msc_mode(const char* reason) {
   g_qmx_detect_active = false;
   ESP_LOGI(TAG, "Entering MSC mode: %s", reason);
   debug_log_line("Entering MSC mode");
   audio_source_stop();
   vTaskDelay(pdMS_TO_TICKS(200));
+  nimble_teardown();
   enter_mode(UIMode::MSC);
   ui_force_redraw_rx();
 }
