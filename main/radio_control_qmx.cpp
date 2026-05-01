@@ -52,20 +52,23 @@ static esp_err_t qmx_begin_tx(int freq_hz, int tx_base_hz) {
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "QMX TX start");
     }
+    // EXPERIMENTAL test bench: instead of feeding the QMX with TA
+    // tone-set commands, push UAC OUT samples to the speaker iface so
+    // we exercise the PTX FIFO under the 364/364 custom split.
+    uac_tx_test_start();
     return err;
 }
 
 static esp_err_t qmx_set_tone_hz(float tone_hz) {
-    int ta_int = (int)lrintf(tone_hz);
-    float frac = tone_hz - (float)ta_int;
-    int ta_frac = (int)lrintf(frac * 100.0f);
-
-    char ta[16];
-    snprintf(ta, sizeof(ta), "TA%04d.%02d;", ta_int, ta_frac);
-    return qmx_send_cmd(ta, 10);
+    // EXPERIMENTAL: tone is generated from a fixed 1.5 kHz LUT pumped
+    // through UAC OUT — TA-based tone scheduling is bypassed for the
+    // duration of the test bench.
+    (void)tone_hz;
+    return ESP_OK;
 }
 
 static esp_err_t qmx_end_tx(void) {
+    uac_tx_test_stop();
     const char* rx = "RX;";
     esp_err_t err = qmx_send_cmd(rx, 200);
     if (err == ESP_OK) {

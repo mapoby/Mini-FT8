@@ -72,6 +72,17 @@ bool uac_get_latest_waterfall_row(uint8_t* out_row, int out_len);
 bool cat_cdc_ready(void);
 esp_err_t cat_cdc_send(const uint8_t* data, size_t len, uint32_t timeout_ms);
 
+// EXPERIMENTAL: open the QMX speaker UAC OUT endpoint and stream a
+// fixed 1.5 kHz tone (full-scale 24-bit, 48 kHz, stereo) until
+// uac_tx_test_stop() is called. Used as a test bench for the 364/364
+// custom FIFO split — wired into qmx_begin_tx / qmx_end_tx so a normal
+// FT8 TX slot drives a ~13 s OUT-streaming run. Logs packet count and
+// any write errors when stopped. Returns false if the speaker hasn't
+// been enumerated yet, or if any of the open/start/task-create steps
+// fails.
+bool uac_tx_test_start(void);
+void uac_tx_test_stop(void);
+
 #ifdef __cplusplus
 }
 #endif

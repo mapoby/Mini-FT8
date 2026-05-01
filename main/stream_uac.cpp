@@ -12,6 +12,7 @@
 #include "usb/uac_host.h"
 #include "usb/cdc_acm_host.h"
 #include "usb/usb_types_ch9.h"
+#include "test_tone_lut.h"
 
 extern "C" {
 #include "ft8/decode.h"
@@ -102,6 +103,20 @@ static uac_host_device_handle_t s_mic_handle = NULL;
 static cdc_acm_dev_hdl_t s_cdc_handle = NULL;
 static TaskHandle_t s_usb_task_handle = NULL;
 static TaskHandle_t s_uac_task_handle = NULL;
+
+// Speaker (UAC OUT) — captured when UAC_HOST_DRIVER_EVENT_TX_CONNECTED
+// fires during enumeration. Used by uac_tx_test_start() to validate the
+// PTX FIFO under the experimental 364/364 split: open the speaker
+// endpoint, push a fixed 1.5 kHz tone for the TX duration, close. This
+// replaces the QMX TA-based tone path during the test bench.
+static uint8_t s_spk_addr = 0;
+static uint8_t s_spk_iface = 0;
+static bool s_spk_known = false;
+static uac_host_device_handle_t s_spk_handle = NULL;
+static TaskHandle_t s_spk_writer_task = NULL;
+static volatile bool s_spk_writer_stop = false;
+static uint32_t s_spk_packets_sent = 0;
+static uint32_t s_spk_write_errors = 0;
 static TaskHandle_t s_stream_task_handle = NULL;
 static volatile bool s_stop_requested = false;
 static char s_status_string[64] = "Idle";
@@ -639,7 +654,11 @@ static void uac_lib_task(void* arg) {
                     }
 
                 } else if (evt.driver.event == UAC_HOST_DRIVER_EVENT_TX_CONNECTED) {
-                    ESP_LOGI(TAG, "Speaker connected (ignored)");
+                    s_spk_addr  = evt.driver.addr;
+                    s_spk_iface = evt.driver.iface_num;
+                    s_spk_known = true;
+                    ESP_LOGI(TAG, "Speaker captured: addr=%u iface=%u",
+                             (unsigned)s_spk_addr, (unsigned)s_spk_iface);
                 }
             }
         }
@@ -991,6 +1010,143 @@ void uac_stop(void) {
     taskEXIT_CRITICAL(&s_latest_waterfall_row_lock);
     snprintf(s_status_string, sizeof(s_status_string), "Idle");
     ESP_LOGI(TAG, "UAC host stopped");
+}
+
+// ===== UAC TX test bench =====
+//
+// Validates the experimental 364/364 PTX FIFO split by streaming a fixed
+// 1.5 kHz pure tone (full-scale 24-bit) to the QMX speaker endpoint at
+// 48 kHz/stereo. wMaxPacketSize = 288 B (48 stereo samples × 6 B), so
+// the PTX FIFO must hold one full packet plus enough headroom for the
+// host scheduler. 364 B = 1.21x MPS — should be sufficient if the host
+// task isn't delayed >1 ms between IN packets.
+//
+// Hooked into radio_control_qmx_get_ops()'s begin_tx / end_tx so a
+// normal Mini-FT8 TX slot drives the test (~13 s of continuous OUT
+// streaming). Logs packet count and write-error count when stopped.
+
+static const uint32_t SPK_PACKET_BYTES = 288;   // 48 stereo samples * 6 B
+static const uint32_t SPK_PACKETS_PER_SEC = 1000;  // 1 ms per packet
+static const uint32_t SPK_BUFFER_SIZE = 8192;     // ~28 packets in flight
+static const uint32_t SPK_BUFFER_THRESHOLD = 2048;
+
+static void spk_event_cb(uac_host_device_handle_t /*dev*/,
+                         const uac_host_device_event_t event,
+                         void* /*arg*/) {
+    if (event == UAC_HOST_DEVICE_EVENT_TRANSFER_ERROR) {
+        s_spk_write_errors++;
+        ESP_LOGW(TAG, "spk transfer error");
+    }
+}
+
+static void spk_writer_task(void* /*arg*/) {
+    // Build one stereo packet at a time from the 32-sample mono LUT.
+    // Phase index walks the LUT modulo 32 across packet boundaries so
+    // the tone is continuous (no glitch every 1 ms).
+    uint8_t pkt[SPK_PACKET_BYTES];
+    int phase = 0;
+
+    while (!s_spk_writer_stop) {
+        for (int i = 0; i < 48; ++i) {
+            const uint8_t* mono = &k_test_tone_lut_24bit[(phase % 32) * 3];
+            // L
+            pkt[i*6 + 0] = mono[0];
+            pkt[i*6 + 1] = mono[1];
+            pkt[i*6 + 2] = mono[2];
+            // R (duplicated)
+            pkt[i*6 + 3] = mono[0];
+            pkt[i*6 + 4] = mono[1];
+            pkt[i*6 + 5] = mono[2];
+            phase++;
+        }
+        esp_err_t err = uac_host_device_write(s_spk_handle, pkt,
+                                              SPK_PACKET_BYTES, 100);
+        if (err == ESP_OK) {
+            s_spk_packets_sent++;
+        } else {
+            s_spk_write_errors++;
+            // Don't spam — log first few then back off.
+            if (s_spk_write_errors <= 5) {
+                ESP_LOGW(TAG, "spk write err=%s", esp_err_to_name(err));
+            }
+        }
+    }
+
+    s_spk_writer_task = NULL;
+    vTaskDelete(NULL);
+}
+
+bool uac_tx_test_start(void) {
+    if (s_spk_handle) {
+        return true;  // already running
+    }
+    if (!s_spk_known) {
+        ESP_LOGW(TAG, "uac_tx_test: speaker not enumerated yet");
+        return false;
+    }
+
+    s_spk_packets_sent = 0;
+    s_spk_write_errors = 0;
+
+    uac_host_device_config_t cfg = {};
+    cfg.addr = s_spk_addr;
+    cfg.iface_num = s_spk_iface;
+    cfg.buffer_size = SPK_BUFFER_SIZE;
+    cfg.buffer_threshold = SPK_BUFFER_THRESHOLD;
+    cfg.callback = spk_event_cb;
+    cfg.callback_arg = nullptr;
+    esp_err_t err = uac_host_device_open(&cfg, &s_spk_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "uac_tx_test: open spk: %s", esp_err_to_name(err));
+        s_spk_handle = NULL;
+        return false;
+    }
+
+    uac_host_stream_config_t stream_cfg = {};
+    stream_cfg.channels = 2;
+    stream_cfg.bit_resolution = 24;
+    stream_cfg.sample_freq = 48000;
+    stream_cfg.flags = 0;
+    err = uac_host_device_start(s_spk_handle, &stream_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "uac_tx_test: start spk: %s", esp_err_to_name(err));
+        uac_host_device_close(s_spk_handle);
+        s_spk_handle = NULL;
+        return false;
+    }
+
+    s_spk_writer_stop = false;
+    BaseType_t ok = xTaskCreatePinnedToCore(spk_writer_task, "uac_tx_test",
+                                            4096, NULL, 5,
+                                            &s_spk_writer_task, 1);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "uac_tx_test: writer task create failed");
+        uac_host_device_stop(s_spk_handle);
+        uac_host_device_close(s_spk_handle);
+        s_spk_handle = NULL;
+        return false;
+    }
+
+    ESP_LOGI(TAG, "uac_tx_test: streaming 1.5 kHz tone at full scale");
+    return true;
+}
+
+void uac_tx_test_stop(void) {
+    if (!s_spk_writer_task && !s_spk_handle) return;
+
+    s_spk_writer_stop = true;
+    for (int i = 0; i < 50 && s_spk_writer_task; ++i) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    if (s_spk_handle) {
+        uac_host_device_stop(s_spk_handle);
+        uac_host_device_close(s_spk_handle);
+        s_spk_handle = NULL;
+    }
+
+    ESP_LOGI(TAG, "uac_tx_test: stopped, packets=%u errors=%u",
+             (unsigned)s_spk_packets_sent, (unsigned)s_spk_write_errors);
 }
 
 const char* uac_get_status_string(void) {
