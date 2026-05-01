@@ -395,6 +395,31 @@ static void usb_lib_task(void* arg) {
     host_config.skip_phy_setup = false;
     host_config.intr_flags = ESP_INTR_FLAG_LEVEL1;
 
+    // Custom FIFO partitioning to enable simultaneous bidirectional ISO
+    // streaming with QMX. ESP32-S3's FS host has a 200-line (800-byte)
+    // FIFO total. Built-in Kconfig biases give either RX 608 / PTX 128
+    // (BIAS_IN, our previous setting) or RX 136 / PTX 600 — neither
+    // covers QMX's 24-bit/48k/stereo MPS=300 in both directions at once.
+    //
+    // This split reserves 364 B for RX and 364 B for PTX (91 lines each)
+    // plus 72 B for non-periodic OUT (CDC CAT bulk-OUT). 364 B is enough
+    // for one 300-byte ISO packet plus 64-byte status overhead — i.e.
+    // 1.21x MPS, vs the 2x MPS the USB-OTG programming guide recommends
+    // for back-to-back ISO IN reception. Should be fine as long as the
+    // USB host task drains each packet within the 1 ms inter-frame
+    // window (typical drain takes <100 us); under heavy core 0 load
+    // (decode + BLE notification storm) we may see occasional glitches.
+    //
+    // Test-bench purpose: validate whether this margin is acceptable for
+    // a future QMX console design that needs full bidirectional UAC.
+    // Empirical canary: waterfall artifacts on the UAC signal generator,
+    // and runs of "Decoded 0 unique messages" that don't track band
+    // conditions. If those appear, fall back to BIAS_IN or implement a
+    // runtime FIFO swap around RX/TX boundaries.
+    host_config.fifo_settings_custom.rx_fifo_lines   = 91;   // 364 B
+    host_config.fifo_settings_custom.nptx_fifo_lines = 18;   // 72 B
+    host_config.fifo_settings_custom.ptx_fifo_lines  = 91;   // 364 B
+
     esp_err_t err = usb_host_install(&host_config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to install USB host: %s", esp_err_to_name(err));
