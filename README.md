@@ -20,11 +20,11 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
   - Must order: https://shop.m5stack.com/products/m5stack-cardputer-adv-version-esp32-s3 or from digikey: https://www.digikey.com/en/products/detail/m5stack-technology-co-ltd/K132-ADV/27685158
   - Optional: [https://shop.m5stack.com/products/gps-bds-unit-v1-1-at6668](https://shop.m5stack.com/products/gps-bds-unit-v1-1-at6668) (for Date/Time/Grid, other GPS modules work too)
   - For KH1 TX : https://shop.m5stack.com/products/4pin-buckled-grove-cable, for a custmized serial cable
-  - For KH1 RX: [USB C Microphone Adapter](https://www.amazon.com/dp/B0FWC9ZFC4?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1), Other adapters may also work, but this one is confirmed.
+  - For KH1 RX: [USB C Microphone Adapter](https://www.amazon.com/dp/B0FWC9ZFC4?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1), Other adapters may also work, but this one is confirmed. (V2.0.2 Supports Cardputer direct microphone in, so the USB-C adapter becomes **optional, choose KH1-Mic**)
 
 73, Wei AG6AQ
 
-# Mini-FT8 Operation Manual (V2.0.1)
+# Mini-FT8 Operation Manual (V2.0.2)
 
 ## Quick Mode Map
 
@@ -155,7 +155,6 @@ Both 9600 and 115200 baud GPS modules are supported (auto-detected). **Make sure
                                      └─────────────────────────────┘
 ```
 ## KH1 Connections
-
 ![KH1 Cables](kh1_cables.jpeg)
 
  - TX Only ([sotamat](https://sotamat.com/))
@@ -171,7 +170,7 @@ Both 9600 and 115200 baud GPS modules are supported (auto-detected). **Make sure
                                      │ SW: NA                     │
                                      └────────────────────────────┘
 ```
-- TX + RX (FT8 QSO)
+- TX + RX (FT8 QSO) (V2.0.2 Supports Cardputer direct microphone in, so the **USB-C adapter becomes optional, choose KH1-Mic**)
   - Use a USB-C audio/mic adapter for RX. Tested adapter: Amazon `B0FWC9ZFC4`. Other adapters may also work, but this one is confirmed.
   - Supply 5 V to PORTA; otherwise, the USB-C OTG port will not be powered. **Make sure the micro swithch is on the right**
 ```text
