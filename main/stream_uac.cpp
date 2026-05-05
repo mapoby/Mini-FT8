@@ -507,13 +507,13 @@ static void usb_lib_task(void* arg) {
         .xCoreID = 0,
         .new_dev_cb = cdc_new_dev_cb,
     };
-    // TEST BENCH: skip CDC entirely. The STM32 loopback device on the OTG
-    // bus has no CDC interface, so cdc_try_open's iface scan would just
-    // spam EP Alloc errors against UAC ifaces. CAT control isn't needed
-    // for the 1.5 kHz tone validator.
-    (void)cdc_cfg;
-    s_cdc_installed = false;
-    ESP_LOGI(TAG, "CDC-ACM install skipped (test bench)");
+    err = cdc_acm_host_install(&cdc_cfg);
+    if (err == ESP_OK) {
+        s_cdc_installed = true;
+        ESP_LOGI(TAG, "CDC-ACM driver installed");
+    } else {
+        ESP_LOGW(TAG, "CDC-ACM driver install failed: %s", esp_err_to_name(err));
+    }
 
     xTaskNotifyGive((TaskHandle_t)arg);
 
@@ -713,15 +713,6 @@ static void uac_lib_task(void* arg) {
                     s_spk_known = true;
                     ESP_LOGI(TAG, "Speaker captured: addr=%u iface=%u",
                              (unsigned)s_spk_addr, (unsigned)s_spk_iface);
-                    // TEST BENCH: kick off the 1.5 kHz pump immediately —
-                    // no waiting for FT8 TX scheduling. Lets us run the
-                    // OUT-side validator against the STM32 loopback
-                    // without depending on QMX/CAT/beacon scheduling.
-                    if (uac_tx_test_start()) {
-                        ESP_LOGI(TAG, "TEST BENCH: speaker pump auto-started");
-                    } else {
-                        ESP_LOGE(TAG, "TEST BENCH: speaker pump auto-start failed");
-                    }
                 }
             }
         }
@@ -784,10 +775,17 @@ static void stream_uac_task(void* arg) {
         return;
     }
 
-    // TEST BENCH: skip the 15s slot-boundary wait. We just want sample
-    // flow to start as soon as possible so the verifier can compare
-    // against k_expected_tone. FT8 slot alignment is irrelevant here.
-    // (Original wait code preserved in git history.)
+    // Wait until the next 15s boundary so the sample-pump loop below aligns
+    // to FT8 slot edges. Buffers were grabbed above so heap state during
+    // this sleep doesn't matter.
+    {
+        int64_t now_ms = rtc_now_ms();
+        int64_t rem = now_ms % 15000;
+        int64_t wait_ms = (rem < 100) ? 0 : (15000 - rem);
+        if (wait_ms > 0) {
+            vTaskDelay(pdMS_TO_TICKS((uint32_t)wait_ms));
+        }
+    }
 
     const int target_blocks = 80;
     int ft8_buffer_idx = 0;  // Current position in ft8_buffer
@@ -811,14 +809,6 @@ static void stream_uac_task(void* arg) {
             }
             continue;
         }
-
-        // TEST BENCH: byte-level verification against k_expected_tone.
-        // The STM32 loopback echoes our OUT samples back via IN, so a
-        // mismatch here means our OUT path is putting wrong bytes on
-        // the wire (and tells us exactly which bytes differ).
-        verify_mic_samples(usb_buffer, bytes_read,
-                           s_format.bit_resolution / 8 * s_format.channels,
-                           s_format.channels);
 
         int frame_bytes = (s_format.bit_resolution / 8) * s_format.channels;
         if (frame_bytes <= 0) {
