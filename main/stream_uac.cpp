@@ -1025,10 +1025,17 @@ void uac_stop(void) {
 // normal Mini-FT8 TX slot drives the test (~13 s of continuous OUT
 // streaming). Logs packet count and write-error count when stopped.
 
-static const uint32_t SPK_PACKET_BYTES = 288;   // 48 stereo samples * 6 B
-static const uint32_t SPK_PACKETS_PER_SEC = 1000;  // 1 ms per packet
-static const uint32_t SPK_BUFFER_SIZE = 8192;     // ~28 packets in flight
-static const uint32_t SPK_BUFFER_THRESHOLD = 2048;
+// Match the validated ~/esp/uac_host loopback_validator reference exactly:
+// large driver-side ringbuffer, large pre-built pump buffer, big write
+// chunks with generous timeout. Anything smaller starves the driver
+// between writes and produces dropouts / scrambled samples on the wire.
+static const uint32_t SPK_PACKET_BYTES = 288;          // 48 stereo frames * 6 B
+static const uint32_t SPK_PUMP_PACKETS = 48;           // 48 packets per write
+static const uint32_t SPK_PUMP_BYTES   = SPK_PACKET_BYTES * SPK_PUMP_PACKETS;  // 13824
+static const uint32_t SPK_FRAME_BYTES  = 6;            // L+R, 24-bit each
+static const uint32_t SPK_BUFFER_SIZE  = 16000;        // driver ringbuffer
+static const uint32_t SPK_BUFFER_THRESHOLD = 1000;     // ~3.5 ms at 48k/24/stereo
+static const uint32_t SPK_WRITE_TIMEOUT_MS = 200;
 
 static void spk_event_cb(uac_host_device_handle_t /*dev*/,
                          const uac_host_device_event_t event,
@@ -1040,38 +1047,48 @@ static void spk_event_cb(uac_host_device_handle_t /*dev*/,
 }
 
 static void spk_writer_task(void* /*arg*/) {
-    // Build one stereo packet at a time from the 32-sample mono LUT.
-    // Phase index walks the LUT modulo 32 across packet boundaries so
-    // the tone is continuous (no glitch every 1 ms).
-    uint8_t pkt[SPK_PACKET_BYTES];
-    int phase = 0;
+    // Pre-build the entire pump buffer once. SPK_PUMP_BYTES (13824) is an
+    // exact multiple of the 32-frame stereo LUT stride (32 frames * 6 B = 192 B,
+    // and 13824 / 192 = 72), so successive writes wrap seamlessly with no
+    // phase glitch at the buffer boundary.
+    uint8_t* pump = (uint8_t*)heap_caps_malloc(SPK_PUMP_BYTES, MALLOC_CAP_DEFAULT);
+    if (!pump) {
+        ESP_LOGE(TAG, "spk pump alloc failed");
+        s_spk_writer_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    const uint32_t total_frames = SPK_PUMP_BYTES / SPK_FRAME_BYTES;  // 2304
+    for (uint32_t frame = 0; frame < total_frames; ++frame) {
+        const uint8_t* mono = &k_test_tone_lut_24bit[(frame % TEST_TONE_LUT_SAMPLES) * 3];
+        uint32_t off = frame * SPK_FRAME_BYTES;
+        // L channel
+        pump[off + 0] = mono[0];
+        pump[off + 1] = mono[1];
+        pump[off + 2] = mono[2];
+        // R channel (mono duplicated)
+        pump[off + 3] = mono[0];
+        pump[off + 4] = mono[1];
+        pump[off + 5] = mono[2];
+    }
 
     while (!s_spk_writer_stop) {
-        for (int i = 0; i < 48; ++i) {
-            const uint8_t* mono = &k_test_tone_lut_24bit[(phase % 32) * 3];
-            // L
-            pkt[i*6 + 0] = mono[0];
-            pkt[i*6 + 1] = mono[1];
-            pkt[i*6 + 2] = mono[2];
-            // R (duplicated)
-            pkt[i*6 + 3] = mono[0];
-            pkt[i*6 + 4] = mono[1];
-            pkt[i*6 + 5] = mono[2];
-            phase++;
-        }
-        esp_err_t err = uac_host_device_write(s_spk_handle, pkt,
-                                              SPK_PACKET_BYTES, 100);
+        esp_err_t err = uac_host_device_write(s_spk_handle, pump, SPK_PUMP_BYTES,
+                                              pdMS_TO_TICKS(SPK_WRITE_TIMEOUT_MS));
         if (err == ESP_OK) {
-            s_spk_packets_sent++;
-        } else {
+            s_spk_packets_sent += SPK_PUMP_PACKETS;
+        } else if (err != ESP_ERR_TIMEOUT) {
             s_spk_write_errors++;
-            // Don't spam — log first few then back off.
             if (s_spk_write_errors <= 5) {
                 ESP_LOGW(TAG, "spk write err=%s", esp_err_to_name(err));
             }
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
+        // Yield so IDLE0 can run (watchdog appeasement).
+        vTaskDelay(1);
     }
 
+    free(pump);
     s_spk_writer_task = NULL;
     vTaskDelete(NULL);
 }
@@ -1091,8 +1108,8 @@ bool uac_tx_test_start(void) {
     uac_host_device_config_t cfg = {};
     cfg.addr = s_spk_addr;
     cfg.iface_num = s_spk_iface;
-    cfg.buffer_size = SPK_BUFFER_SIZE;
-    cfg.buffer_threshold = SPK_BUFFER_THRESHOLD;
+    cfg.buffer_size = SPK_BUFFER_SIZE;          // 16000 (matches reference)
+    cfg.buffer_threshold = SPK_BUFFER_THRESHOLD; // 1000  (matches reference)
     cfg.callback = spk_event_cb;
     cfg.callback_arg = nullptr;
     esp_err_t err = uac_host_device_open(&cfg, &s_spk_handle);
