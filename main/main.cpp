@@ -3074,6 +3074,22 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
       g_decode_applied_slot_idx = g_decode_slot_idx;
     }
     g_decode_in_progress = false;
+    // TEST BENCH: still need to enqueue beacon CQ on no-decode slots so
+    // the test rig (impersonator carries no FT8 traffic, so every slot
+    // is "no candidates") can fire a beacon TX. This branch normally
+    // returns early before the beacon path further down — short-circuit
+    // here.
+    if (!g_was_txing && g_beacon != BeaconMode::OFF) {
+      AutoseqTxEntry pending;
+      if (!autoseq_fetch_pending_tx(pending)) {
+        enqueue_beacon_cq();
+        if (autoseq_fetch_pending_tx(pending)) {
+          arm_pending_tx(pending);
+          ESP_LOGI(TAG, "TEST BENCH beacon CQ ready: %s parity=%d",
+                   pending.text.c_str(), g_target_slot_parity);
+        }
+      }
+    }
     return;
   }
 
@@ -4630,12 +4646,13 @@ static void load_station_data() {
   }
   rebuild_active_bands();
   rebuild_ignore_prefixes();
-  // TEST BENCH: hardcode beacon ODD so the first 15s slot boundary
-  // after boot fires a TX (parity = (now_ms / 15000) & 1; with RTC at
-  // 0 right after boot, slot 1 at t=15s is odd). Drives the speaker
-  // pump against the QMX impersonator's CDC + UAC loopback so we can
-  // verify what we put on the OUT wire byte-for-byte.
-  g_beacon = BeaconMode::ODD;
+  // TEST BENCH: hardcode beacon EVEN. With RTC starting near 0 and
+  // mic streaming kicking off after the first 15s slot wait, the first
+  // decode happens in odd slot 117696521 (~t=15-30s). Beacon CQ is
+  // enqueued at decode end and arms for the NEXT parity-0 slot, which
+  // is slot 117696522 (~t=30s). EVEN gets us the first TX about 15s
+  // sooner than ODD.
+  g_beacon = BeaconMode::EVEN;
   apply_ble_enabled_policy(false);
 }
 
