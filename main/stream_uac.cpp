@@ -1270,7 +1270,7 @@ bool uac_tx_test_start(void) {
         return false;
     }
 
-    ESP_LOGI(TAG, "uac_tx_test: streaming 1.5 kHz tone at full scale");
+    ESP_LOGI(TAG, "uac_tx_test: pump started (NCO-driven FT8 audio)");
     return true;
 }
 
