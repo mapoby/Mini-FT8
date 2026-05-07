@@ -1,6 +1,7 @@
 #include "stream_uac.h"
 #include "resample.h"
 
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -12,7 +13,6 @@
 #include "usb/uac_host.h"
 #include "usb/cdc_acm_host.h"
 #include "usb/usb_types_ch9.h"
-#include "test_tone_lut.h"
 
 extern "C" {
 #include "ft8/decode.h"
@@ -162,19 +162,36 @@ static const uint8_t k_expected_tone[EXPECTED_TONE_BYTES] = {
     /* 31: -1636536 */ 0x48, 0x07, 0xE7,  0x48, 0x07, 0xE7,
 };
 
-// Mic loopback verification state (matches reference's verify_samples).
-// s_verify_active gates the comparator so we only count errors during TX
-// windows when the QMX impersonator is echoing our OUT samples back.
-// At all other times mic carries whatever the impersonator emits idle
-// (silence / its own LUT / random) and would otherwise be counted as
-// noise.
-static volatile bool s_verify_active = false;
-static bool     s_verify_synced = false;
-static uint32_t s_verify_pos = 0;
-static uint32_t s_verify_total_checked = 0;
-static uint32_t s_verify_errors = 0;
-static uint32_t s_verify_samples_since_connect = 0;
-static uint32_t s_verify_grace_samples = 1500;  // skip startup jitter
+// Speaker pump health counters. The verifier was bit-exact (591k frames,
+// 0 errors) but visible waterfall artifacts on both the impersonator and
+// real QMX point at PTX FIFO underruns — brief gaps when the driver
+// ringbuffer empties between SOFs, hardware emits an empty/short ISO
+// packet, audio gets a 1 ms blip, receiver shows wideband scatter.
+//
+//   tx_done_count:   driver ringbuffer fell below threshold (1 KB).
+//                    Approaching-underrun event, fires often even on a
+//                    healthy stream — useful as a rate signal.
+//   write_ok_count:  uac_host_device_write returned ESP_OK promptly
+//                    (ringbuffer had room — writer ahead of consumer).
+//   write_to_count:  uac_host_device_write hit ESP_ERR_TIMEOUT (ring-
+//                    buffer was full — backpressure, healthy state).
+//
+// A healthy run should look mostly like write_to_count >> write_ok_count
+// (writer pinned by ringbuffer-full backpressure, refilling at consumer
+// pace). If write_ok_count dominates, the ringbuffer is starving and
+// underruns are likely.
+static uint32_t s_spk_tx_done_count = 0;
+static uint32_t s_spk_write_ok_count = 0;
+static uint32_t s_spk_write_to_count = 0;
+// Write-elapsed-time histogram. The 14 KB pump write blocks waiting for
+// ringbuffer drain at the consumer's pace. Steady state should be ~30-50 ms
+// per write. Spikes >55 ms = scheduling stall long enough to drain the
+// 16 KB ringbuffer = PTX FIFO underrun = audible glitch.
+static uint32_t s_spk_write_max_ms = 0;
+static uint32_t s_spk_write_lt_30ms = 0;   // fast — buffer was empty (underrun risk)
+static uint32_t s_spk_write_30_55ms = 0;   // healthy steady state
+static uint32_t s_spk_write_55_100ms = 0;  // stalled — possible underrun already
+static uint32_t s_spk_write_gt_100ms = 0;  // long stall — definite underrun
 static TaskHandle_t s_stream_task_handle = NULL;
 static volatile bool s_stop_requested = false;
 static char s_status_string[64] = "Idle";
@@ -209,8 +226,6 @@ static void stream_uac_task(void* arg);
 static void cdc_close(void);
 static void cdc_try_open(void);
 static void cdc_event_cb(const cdc_acm_host_dev_event_data_t* event, void* user_ctx);
-static void verify_mic_samples(const uint8_t* buf, uint32_t bytes,
-                               uint32_t frame_bytes, uint8_t channels);
 static void cdc_new_dev_cb(usb_device_handle_t usb_dev);
 
 static const char* profile_name(uac_stream_profile_t profile) {
@@ -842,17 +857,6 @@ static void stream_uac_task(void* arg) {
             continue;
         }
 
-        // TEST BENCH: byte-level verify against k_expected_tone whenever
-        // the speaker pump is running. The QMX impersonator echoes our
-        // OUT samples back via mic IN, so a mismatch tells us the OUT
-        // path is putting wrong bytes on the wire — the same direct
-        // signal the standalone uac_host validator uses.
-        if (s_verify_active) {
-            verify_mic_samples(usb_buffer, bytes_read,
-                               s_format.bit_resolution / 8 * s_format.channels,
-                               s_format.channels);
-        }
-
         int frame_bytes = (s_format.bit_resolution / 8) * s_format.channels;
         if (frame_bytes <= 0) {
             ESP_LOGW(TAG, "Invalid stream format bytes/frame=%d", frame_bytes);
@@ -1130,8 +1134,10 @@ static const uint32_t SPK_PACKET_BYTES = 288;          // 48 stereo frames * 6 B
 static const uint32_t SPK_PUMP_PACKETS = 48;           // 48 packets per write
 static const uint32_t SPK_PUMP_BYTES   = SPK_PACKET_BYTES * SPK_PUMP_PACKETS;  // 13824
 static const uint32_t SPK_FRAME_BYTES  = 6;            // L+R, 24-bit each
-static const uint32_t SPK_BUFFER_SIZE  = 16000;        // driver ringbuffer
-static const uint32_t SPK_BUFFER_THRESHOLD = 1000;     // ~3.5 ms at 48k/24/stereo
+static const uint32_t SPK_BUFFER_SIZE  = 49152;        // 48 KB driver ringbuffer
+                                                       //   = ~170 ms of audio at 288 B/ms
+                                                       //   absorbs scheduling jitter at any layer
+static const uint32_t SPK_BUFFER_THRESHOLD = 8192;     // 8 KB threshold ~ 28 ms ahead
 static const uint32_t SPK_WRITE_TIMEOUT_MS = 200;
 
 static void spk_event_cb(uac_host_device_handle_t /*dev*/,
@@ -1140,6 +1146,8 @@ static void spk_event_cb(uac_host_device_handle_t /*dev*/,
     if (event == UAC_HOST_DEVICE_EVENT_TRANSFER_ERROR) {
         s_spk_write_errors++;
         ESP_LOGW(TAG, "spk transfer error");
+    } else if (event == UAC_HOST_DEVICE_EVENT_TX_DONE) {
+        s_spk_tx_done_count++;
     }
 }
 
@@ -1162,11 +1170,24 @@ static void spk_writer_task(void* /*arg*/) {
     }
 
     while (!s_spk_writer_stop) {
+        int64_t t0 = esp_timer_get_time();
         esp_err_t err = uac_host_device_write(s_spk_handle, pump, SPK_PUMP_BYTES,
                                               pdMS_TO_TICKS(SPK_WRITE_TIMEOUT_MS));
+        uint32_t elapsed_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+        if (elapsed_ms > s_spk_write_max_ms) s_spk_write_max_ms = elapsed_ms;
+        if      (elapsed_ms < 30)  s_spk_write_lt_30ms++;
+        else if (elapsed_ms < 55)  s_spk_write_30_55ms++;
+        else if (elapsed_ms < 100) s_spk_write_55_100ms++;
+        else                       s_spk_write_gt_100ms++;
         if (err == ESP_OK) {
             s_spk_packets_sent += SPK_PUMP_PACKETS;
-        } else if (err != ESP_ERR_TIMEOUT) {
+            s_spk_write_ok_count++;
+        } else if (err == ESP_ERR_TIMEOUT) {
+            // Ringbuffer was still full at end of timeout — backpressure
+            // is what we WANT (means the consumer is keeping up and the
+            // writer doesn't get ahead). Healthy steady-state log.
+            s_spk_write_to_count++;
+        } else {
             s_spk_write_errors++;
             if (s_spk_write_errors <= 5) {
                 ESP_LOGW(TAG, "spk write err=%s", esp_err_to_name(err));
@@ -1193,13 +1214,14 @@ bool uac_tx_test_start(void) {
 
     s_spk_packets_sent = 0;
     s_spk_write_errors = 0;
-
-    // Reset mic verifier state so this TX window's errors are clean.
-    s_verify_synced = false;
-    s_verify_pos = 0;
-    s_verify_total_checked = 0;
-    s_verify_errors = 0;
-    s_verify_samples_since_connect = 0;
+    s_spk_tx_done_count = 0;
+    s_spk_write_ok_count = 0;
+    s_spk_write_to_count = 0;
+    s_spk_write_max_ms = 0;
+    s_spk_write_lt_30ms = 0;
+    s_spk_write_30_55ms = 0;
+    s_spk_write_55_100ms = 0;
+    s_spk_write_gt_100ms = 0;
 
     uac_host_device_config_t cfg = {};
     cfg.addr = s_spk_addr;
@@ -1240,19 +1262,12 @@ bool uac_tx_test_start(void) {
         return false;
     }
 
-    s_verify_active = true;
     ESP_LOGI(TAG, "uac_tx_test: streaming 1.5 kHz tone at full scale");
     return true;
 }
 
 void uac_tx_test_stop(void) {
     if (!s_spk_writer_task && !s_spk_handle) return;
-
-    s_verify_active = false;
-    ESP_LOGI(TAG, "uac_tx_test: VERIFY final checked=%u errors=%u synced=%d",
-             (unsigned)s_verify_total_checked,
-             (unsigned)s_verify_errors,
-             s_verify_synced ? 1 : 0);
 
     s_spk_writer_stop = true;
     for (int i = 0; i < 50 && s_spk_writer_task; ++i) {
@@ -1265,125 +1280,19 @@ void uac_tx_test_stop(void) {
         s_spk_handle = NULL;
     }
 
-    ESP_LOGI(TAG, "uac_tx_test: stopped, packets=%u errors=%u",
-             (unsigned)s_spk_packets_sent, (unsigned)s_spk_write_errors);
-}
-
-// ===== Mic loopback verification =====
-//
-// The STM32 loopback device echoes whatever we send via UAC OUT back to
-// us via UAC IN, so a byte-for-byte comparison of mic samples against
-// k_expected_tone tells us directly whether our OUT path is putting
-// the right bytes on the wire.
-//
-// This mirrors the logic in ~/esp/uac_host/main/main.c verify_samples():
-// once we've seen SYNC_SAMPLES_REQUIRED consecutive samples that match a
-// known phase, we lock and start counting per-frame mismatches. Skip the
-// first STARTUP_GRACE_SAMPLES to avoid USB streaming startup jitter.
-
-#define VERIFY_SYNC_SAMPLES_REQUIRED 3
-
-static int verify_find_sync_pos(const uint8_t* run, uint32_t run_count) {
-    if (run_count < VERIFY_SYNC_SAMPLES_REQUIRED) return -1;
-    for (uint32_t start = 0; start < EXPECTED_TONE_FRAMES; ++start) {
-        bool match = true;
-        for (uint32_t i = 0; i < run_count; ++i) {
-            uint32_t pos = (start + i) % EXPECTED_TONE_FRAMES;
-            if (memcmp(&run[i * EXPECTED_TONE_FRAME_BYTES],
-                       &k_expected_tone[pos * EXPECTED_TONE_FRAME_BYTES],
-                       EXPECTED_TONE_FRAME_BYTES) != 0) {
-                match = false;
-                break;
-            }
-        }
-        if (match) return (int)start;
-    }
-    return -1;
-}
-
-static void verify_mic_samples(const uint8_t* buf, uint32_t bytes,
-                               uint32_t frame_bytes, uint8_t channels) {
-    // We assume 24-bit stereo when frame_bytes == 6 — that's what the
-    // STM32 loopback advertises. Bail otherwise (FT8 6 kHz path runs
-    // 24-bit stereo too via resampling, but the bytes here are still the
-    // raw 48 kHz samples from the device).
-    if (frame_bytes != EXPECTED_TONE_FRAME_BYTES || channels != 2) return;
-
-    // Multi-sample sync state lives in module-static buffer.
-    static uint8_t sync_run[VERIFY_SYNC_SAMPLES_REQUIRED * EXPECTED_TONE_FRAME_BYTES];
-    static uint32_t sync_run_count = 0;
-
-    uint32_t num_frames = bytes / frame_bytes;
-    for (uint32_t i = 0; i < num_frames; ++i) {
-        const uint8_t* sample = &buf[i * frame_bytes];
-        s_verify_samples_since_connect++;
-
-        // Skip startup grace window — USB ringbuffer fill can have
-        // initial jitter that produces "errors" against a strict LUT.
-        if (s_verify_samples_since_connect < s_verify_grace_samples) continue;
-
-        if (!s_verify_synced) {
-            // Build up a run; try to phase-align against k_expected_tone.
-            memcpy(&sync_run[sync_run_count * EXPECTED_TONE_FRAME_BYTES],
-                   sample, EXPECTED_TONE_FRAME_BYTES);
-            sync_run_count++;
-            if (sync_run_count >= VERIFY_SYNC_SAMPLES_REQUIRED) {
-                int pos = verify_find_sync_pos(sync_run, sync_run_count);
-                if (pos >= 0) {
-                    s_verify_synced = true;
-                    s_verify_pos =
-                        (pos + sync_run_count) % EXPECTED_TONE_FRAMES;
-                    sync_run_count = 0;
-                    ESP_LOGI(TAG, "VERIFY: synced at expected pos=%d "
-                                  "(after %u samples)",
-                             pos, (unsigned)s_verify_samples_since_connect);
-                } else {
-                    // Slide the run by one to keep trying.
-                    memmove(sync_run, &sync_run[EXPECTED_TONE_FRAME_BYTES],
-                            (sync_run_count - 1) * EXPECTED_TONE_FRAME_BYTES);
-                    sync_run_count--;
-                }
-            }
-            continue;
-        }
-
-        // Synced — compare against expected.
-        const uint8_t* expected =
-            &k_expected_tone[s_verify_pos * EXPECTED_TONE_FRAME_BYTES];
-        if (memcmp(sample, expected, EXPECTED_TONE_FRAME_BYTES) != 0) {
-            s_verify_errors++;
-            if (s_verify_errors <= 5) {
-                ESP_LOGW(TAG, "VERIFY: err at pos=%u sample=%02X%02X%02X "
-                              "%02X%02X%02X expected=%02X%02X%02X %02X%02X%02X "
-                              "(checked=%u)",
-                         (unsigned)s_verify_pos,
-                         sample[0], sample[1], sample[2],
-                         sample[3], sample[4], sample[5],
-                         expected[0], expected[1], expected[2],
-                         expected[3], expected[4], expected[5],
-                         (unsigned)s_verify_total_checked);
-            }
-            // Re-sync from this point.
-            s_verify_synced = false;
-            sync_run_count = 0;
-            memcpy(sync_run, sample, EXPECTED_TONE_FRAME_BYTES);
-            sync_run_count = 1;
-            continue;
-        }
-        s_verify_total_checked++;
-        s_verify_pos = (s_verify_pos + 1) % EXPECTED_TONE_FRAMES;
-    }
-
-    // Periodic summary log every ~24000 frames (~0.5 s at 48 kHz).
-    static uint32_t since_log = 0;
-    since_log += num_frames;
-    if (since_log >= 24000) {
-        ESP_LOGI(TAG, "VERIFY: checked=%u errors=%u synced=%d",
-                 (unsigned)s_verify_total_checked,
-                 (unsigned)s_verify_errors,
-                 s_verify_synced ? 1 : 0);
-        since_log = 0;
-    }
+    ESP_LOGI(TAG, "uac_tx_test: stopped, packets=%u err=%u tx_done=%u "
+                  "writes_ok=%u writes_to=%u",
+             (unsigned)s_spk_packets_sent, (unsigned)s_spk_write_errors,
+             (unsigned)s_spk_tx_done_count,
+             (unsigned)s_spk_write_ok_count,
+             (unsigned)s_spk_write_to_count);
+    ESP_LOGI(TAG, "uac_tx_test: write timing max=%u ms; "
+                  "buckets <30ms:%u  30-55ms:%u  55-100ms:%u  >=100ms:%u",
+             (unsigned)s_spk_write_max_ms,
+             (unsigned)s_spk_write_lt_30ms,
+             (unsigned)s_spk_write_30_55ms,
+             (unsigned)s_spk_write_55_100ms,
+             (unsigned)s_spk_write_gt_100ms);
 }
 
 const char* uac_get_status_string(void) {
