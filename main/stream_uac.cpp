@@ -162,6 +162,15 @@ static const uint8_t k_expected_tone[EXPECTED_TONE_BYTES] = {
     /* 31: -1636536 */ 0x48, 0x07, 0xE7,  0x48, 0x07, 0xE7,
 };
 
+// While the speaker pump is running, pause the mic processing loop
+// entirely so the FFT decoder, resampler, and per-block monitor work
+// don't compete for core 0 / IO with the UAC OUT path. The driver ring-
+// buffer for mic IN keeps filling but app stops draining; on TX end we
+// reset the monitor + zero the FT8 buffer + drain the stale ringbuffer
+// so RX restarts clean (otherwise the decoder would see a chunk of
+// stale audio captured during TX).
+static volatile bool s_tx_pause_rx = false;
+
 // Speaker pump health counters. The verifier was bit-exact (591k frames,
 // 0 errors) but visible waterfall artifacts on both the impersonator and
 // real QMX point at PTX FIFO underruns — brief gaps when the driver
@@ -842,7 +851,44 @@ static void stream_uac_task(void* arg) {
     int64_t slot_start_ms = slot_idx * 15000;
     (void)slot_start_ms; // silence unused warning
 
+    static bool s_was_paused = false;
     while (!s_stop_requested && s_mic_handle != NULL) {
+        // RX pause: while uac_tx_test is pumping the speaker we don't
+        // touch the mic side at all. Frees core 0 + IO bandwidth that
+        // the FFT decode + resample + per-block monitor would otherwise
+        // consume during TX.
+        if (s_tx_pause_rx) {
+            s_was_paused = true;
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        // Just resumed from a TX pause: throw away whatever the driver
+        // ringbuffer accumulated during TX (would be ~13 s of stale
+        // audio, capped by the 16 KB ringbuffer's drop-oldest behaviour),
+        // zero the FT8 sample buffer, and reset the monitor so the
+        // decoder doesn't see a glued-together silence-then-real-audio
+        // sequence.
+        if (s_was_paused) {
+            s_was_paused = false;
+            ESP_LOGI(TAG, "RX resume: draining stale + monitor_reset");
+            // Drain whatever the driver has in its ringbuffer right now.
+            uint32_t drained = 0;
+            for (int i = 0; i < 32; ++i) {
+                uint32_t br = 0;
+                esp_err_t r = uac_host_device_read(s_mic_handle, usb_buffer,
+                                                    UAC_READ_BUFFER_SIZE,
+                                                    &br, 0);
+                if (r != ESP_OK || br == 0) break;
+                drained += br;
+            }
+            memset(ft8_buffer, 0, sizeof(float) * mon.block_size);
+            ft8_buffer_idx = 0;
+            slot_blocks = 0;
+            monitor_reset(&mon);
+            ESP_LOGI(TAG, "RX resume: drained=%u bytes", (unsigned)drained);
+        }
+
         // Read USB audio data
         uint32_t bytes_read = 0;
         esp_err_t ret = uac_host_device_read(s_mic_handle, usb_buffer,
@@ -1262,12 +1308,20 @@ bool uac_tx_test_start(void) {
         return false;
     }
 
-    ESP_LOGI(TAG, "uac_tx_test: streaming 1.5 kHz tone at full scale");
+    // Pause the mic processing loop. Driver-side mic still streams, but
+    // the app stops draining and the decoder/FFT stops eating CPU.
+    s_tx_pause_rx = true;
+    ESP_LOGI(TAG, "uac_tx_test: streaming 1.5 kHz tone at full scale (rx paused)");
     return true;
 }
 
 void uac_tx_test_stop(void) {
     if (!s_spk_writer_task && !s_spk_handle) return;
+
+    // Resume mic processing. The mic loop sees the flag flip and runs
+    // its drain-and-reset cleanup on the next iteration before reading
+    // fresh samples.
+    s_tx_pause_rx = false;
 
     s_spk_writer_stop = true;
     for (int i = 0; i < 50 && s_spk_writer_task; ++i) {
