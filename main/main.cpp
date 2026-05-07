@@ -51,6 +51,7 @@ extern "C" {
 #include "esp_sleep.h"
 #include "audio_source.h"
 #include "stream_uac.h"
+#include "dds_q15.h"
 #include "radio_control.h"
 #include "radio_control_backend.h"
 #include "gps.h"
@@ -3568,8 +3569,14 @@ static void tx_tick() {
   // Send current tone
   ESP_LOGD("TXTONE", "%02d %u", g_tx_tone_idx, (unsigned)g_tx_tones[g_tx_tone_idx]);
   fft_waterfall_tx_tone(g_tx_tones[g_tx_tone_idx]);
+  // Drive the UAC OUT NCO directly. Audio path is now the canonical
+  // tone source; the legacy CAT TA tone-set is kept for backends that
+  // still need it (qmx_set_tone_hz is a no-op in the UAC-OUT-experiment
+  // build, so this is a no-op there too — preserved for non-QMX
+  // backends like KH1 if/when we plug them back in).
+  float tone_hz = g_tx_base_hz + 6.25f * g_tx_tones[g_tx_tone_idx];
+  uac_tx_set_tone_hz(tone_hz);
   if (g_tx_cat_ok) {
-    float tone_hz = g_tx_base_hz + 6.25f * g_tx_tones[g_tx_tone_idx];
     tx_send_ta(tone_hz);
   }
 
@@ -5150,6 +5157,10 @@ static void app_task_core0(void* /*param*/) {
 
   ui_init();
   hashtable_init();
+
+  // Q15 NCO LUT for UAC OUT FT8 audio synthesis. One-time table fill,
+  // ~514 B in BSS. Must run before the speaker pump task starts.
+  dds_init();
 
   // Initialize autoseq engine
   autoseq_init();

@@ -9,6 +9,7 @@ idf_component_register(
          "radio_control_qmx.cpp"
          "radio_control_kh1_cat.cpp"
          "stream_uac.cpp"
+         "dds_q15.cpp"
          "resample.cpp"
     INCLUDE_DIRS "."
     REQUIRES ui M5Unified M5GFX M5Cardputer ft8_lib usb_host_uac usb_host_cdc_acm fatfs sdmmc bt nvs_flash efuse json

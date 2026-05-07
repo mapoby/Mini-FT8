@@ -1,5 +1,6 @@
 #include "stream_uac.h"
 #include "resample.h"
+#include "dds_q15.h"
 
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -1152,12 +1153,12 @@ static void spk_event_cb(uac_host_device_handle_t /*dev*/,
 }
 
 static void spk_writer_task(void* /*arg*/) {
-    // Pre-build the entire pump buffer once. SPK_PUMP_BYTES (13824) is an
-    // exact multiple of EXPECTED_TONE_BYTES (192) — 13824 / 192 = 72 —
-    // so successive writes wrap seamlessly on a clean LUT-cycle boundary.
-    // Source the bytes straight from k_expected_tone (already stereo,
-    // bit-exact with the validated reference) — no runtime mono->stereo
-    // expansion, which removes that as a possible bug source.
+    // Pump buffer is rendered fresh each iteration via the Q15 NCO
+    // (dds_q15). Frequency is updated externally by tx_tick on FT8
+    // symbol boundaries via uac_tx_set_tone_hz(); the NCO snapshots
+    // the current increment at the start of each render block so
+    // mid-block frequency changes wait one block (~48 ms < 1 FT8
+    // symbol of 160 ms, so we never miss a symbol).
     uint8_t* pump = (uint8_t*)heap_caps_malloc(SPK_PUMP_BYTES, MALLOC_CAP_DEFAULT);
     if (!pump) {
         ESP_LOGE(TAG, "spk pump alloc failed");
@@ -1165,11 +1166,12 @@ static void spk_writer_task(void* /*arg*/) {
         vTaskDelete(NULL);
         return;
     }
-    for (uint32_t i = 0; i < SPK_PUMP_BYTES; ++i) {
-        pump[i] = k_expected_tone[i % EXPECTED_TONE_BYTES];
-    }
 
+    const uint32_t frames_per_block = SPK_PUMP_BYTES / SPK_FRAME_BYTES;  // 2304
     while (!s_spk_writer_stop) {
+        // Render one block worth of samples from the NCO. tx_tick has
+        // already set the right frequency for the current FT8 symbol.
+        dds_render_24bit_stereo(pump, frames_per_block);
         int64_t t0 = esp_timer_get_time();
         esp_err_t err = uac_host_device_write(s_spk_handle, pump, SPK_PUMP_BYTES,
                                               pdMS_TO_TICKS(SPK_WRITE_TIMEOUT_MS));
@@ -1250,6 +1252,12 @@ bool uac_tx_test_start(void) {
         return false;
     }
 
+    // Start each TX slot from phase 0 with a known-silent frequency.
+    // tx_tick will set the first symbol's frequency right after this
+    // returns. Continuous-phase from there until uac_tx_test_stop().
+    dds_reset_phase();
+    dds_set_freq_hz(0.0);
+
     s_spk_writer_stop = false;
     BaseType_t ok = xTaskCreatePinnedToCore(spk_writer_task, "uac_tx_test",
                                             4096, NULL, 5,
@@ -1293,6 +1301,10 @@ void uac_tx_test_stop(void) {
              (unsigned)s_spk_write_30_55ms,
              (unsigned)s_spk_write_55_100ms,
              (unsigned)s_spk_write_gt_100ms);
+}
+
+void uac_tx_set_tone_hz(float hz) {
+    dds_set_freq_hz(static_cast<double>(hz));
 }
 
 const char* uac_get_status_string(void) {
