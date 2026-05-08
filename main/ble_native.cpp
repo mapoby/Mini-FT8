@@ -19,6 +19,7 @@
 #include "core_api.h"
 #include "core_api_internal.h"
 
+#include <cstdarg>
 #include <cstring>
 #include <cstdio>
 #include <string>
@@ -250,52 +251,101 @@ static const char* radio_name(CoreRadioType r) {
   return (r == CoreRadioType::KH1) ? "KH1" : "QMX";
 }
 
-static std::string json_build_config() {
+// Append a JSON string value to a buffer with proper escaping.
+// Handles ", \, and control chars. Returns chars written (truncated
+// safely if the buffer is exhausted).
+static int json_str_append(char* buf, int cap, int pos, const char* s) {
+  int n = pos;
+  if (n < cap) buf[n++] = '"';
+  if (s) {
+    for (; *s && n < cap - 2; ++s) {
+      char c = *s;
+      if (c == '"' || c == '\\') {
+        buf[n++] = '\\';
+        if (n < cap - 1) buf[n++] = c;
+      } else if ((unsigned char)c < 0x20) {
+        // skip control chars rather than spend bytes on \uXXXX
+      } else {
+        buf[n++] = c;
+      }
+    }
+  }
+  if (n < cap) buf[n++] = '"';
+  return n;
+}
+
+// Build the config JSON straight into the caller's BLE mbuf using a
+// stack buffer — no heap allocs at all. The previous cJSON-based
+// version did ~20 small heap allocs (one per field) plus a std::string
+// copy of the final printed buffer. On the qdx branch the steady-state
+// heap budget is tight (~5 KB free, ~1.6 KB largest contig with
+// NimBLE + pre-allocated UAC), so any of those small allocs could
+// fail and trigger __cxa_allocate_exception → abort under
+// -fno-exceptions. A 1 KB stack buffer covers the worst-case payload
+// (typically <500 B) without touching the heap.
+static int json_build_config_to_mbuf(struct os_mbuf* om) {
   StationConfig cfg;
   core_get_config(cfg);
-  cJSON* root = cJSON_CreateObject();
-  cJSON_AddStringToObject(root, "apiVer",    core_api_version());
-  cJSON_AddStringToObject(root, "bleVer",    BLE_NATIVE_VERSION);
-  cJSON_AddStringToObject(root, "call",      cfg.call.c_str());
-  cJSON_AddStringToObject(root, "grid",      cfg.grid.c_str());
-  cJSON_AddStringToObject(root, "comment",   cfg.comment.c_str());
-  cJSON_AddStringToObject(root, "radio",     radio_name(cfg.radio));
-  cJSON* bands = cJSON_CreateArray();
+
+  char buf[1024];
+  int n = 0;
+  const int cap = sizeof(buf);
+  auto append = [&](const char* fmt, ...) {
+    if (n >= cap) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int w = vsnprintf(buf + n, cap - n, fmt, ap);
+    va_end(ap);
+    if (w > 0) n = (n + w < cap) ? n + w : cap;
+  };
+  auto append_kv_str = [&](const char* key, const char* value) {
+    append(",\"%s\":", key);
+    n = json_str_append(buf, cap, n, value);
+  };
+
+  // Open with apiVer (no leading comma); subsequent fields use
+  // append_kv_str which prepends a comma.
+  n += snprintf(buf + n, cap - n, "{\"apiVer\":");
+  n = json_str_append(buf, cap, n, core_api_version());
+  append_kv_str("bleVer",    BLE_NATIVE_VERSION);
+  append_kv_str("call",      cfg.call.c_str());
+  append_kv_str("grid",      cfg.grid.c_str());
+  append_kv_str("comment",   cfg.comment.c_str());
+  append_kv_str("radio",     radio_name(cfg.radio));
+  append(",\"bands\":[");
+  bool first = true;
   for (uint32_t hz : cfg.bands_hz) {
-    cJSON_AddItemToArray(bands, cJSON_CreateNumber((double)hz));
+    append("%s%u", first ? "" : ",", (unsigned)hz);
+    first = false;
   }
-  cJSON_AddItemToObject(root, "bands",     bands);
-  cJSON_AddNumberToObject(root, "bandIdx",   cfg.band_idx);
-  cJSON_AddStringToObject(root, "cqType",    cq_name(cfg.cq_type));
-  cJSON_AddStringToObject(root, "cqFreetext",cfg.cq_freetext.c_str());
-  cJSON_AddStringToObject(root, "beacon",    beacon_name(cfg.beacon));
-  cJSON_AddStringToObject(root, "offsetSrc", offset_name(cfg.offset_src));
-  cJSON_AddNumberToObject(root, "offsetHz",  cfg.offset_hz);
-  cJSON_AddBoolToObject  (root, "skipTx1",   cfg.skip_tx1);
-  cJSON_AddNumberToObject(root, "maxRetry",  cfg.max_retry);
-  cJSON_AddNumberToObject(root, "rtcComp",   cfg.rtc_comp);
-  cJSON_AddStringToObject(root, "date",      cfg.date.c_str());
-  cJSON_AddStringToObject(root, "time",      cfg.time.c_str());
-  cJSON* ig = cJSON_CreateArray();
+  append("]");
+  append(",\"bandIdx\":%d", (int)cfg.band_idx);
+  append_kv_str("cqType",    cq_name(cfg.cq_type));
+  append_kv_str("cqFreetext",cfg.cq_freetext.c_str());
+  append_kv_str("beacon",    beacon_name(cfg.beacon));
+  append_kv_str("offsetSrc", offset_name(cfg.offset_src));
+  append(",\"offsetHz\":%d", (int)cfg.offset_hz);
+  append(",\"skipTx1\":%s", cfg.skip_tx1 ? "true" : "false");
+  append(",\"maxRetry\":%d", (int)cfg.max_retry);
+  append(",\"rtcComp\":%d", (int)cfg.rtc_comp);
+  append_kv_str("date",      cfg.date.c_str());
+  append_kv_str("time",      cfg.time.c_str());
+  append(",\"ignorePrefixes\":[");
+  first = true;
   for (const auto& p : cfg.ignore_prefixes) {
-    cJSON_AddItemToArray(ig, cJSON_CreateString(p.c_str()));
+    if (!first) append(",");
+    n = json_str_append(buf, cap, n, p.c_str());
+    first = false;
   }
-  cJSON_AddItemToObject(root, "ignorePrefixes", ig);
-  char* s = cJSON_PrintUnformatted(root);
-  std::string out = s ? s : "{}";
-  if (s) free(s);
-  cJSON_Delete(root);
-  return out;
+  append("]}");
+
+  if (n > cap) n = cap;
+  return os_mbuf_append(om, buf, n) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
 }
 
 // ---------------------------------------------------------------------------
 // GATT access callbacks (invoked by NimBLE on read/write)
 // ---------------------------------------------------------------------------
-
-static int access_read_str(struct ble_gatt_access_ctxt* ctxt, const std::string& body) {
-  return os_mbuf_append(ctxt->om, body.data(), body.size()) == 0
-             ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
-}
 
 static int chr_rx_list_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt* ctxt, void*) {
   if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_UNLIKELY;
@@ -426,7 +476,7 @@ static int chr_qso_queue_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt* ctx
 }
 static int chr_config_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt* ctxt, void*) {
   if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_UNLIKELY;
-  return access_read_str(ctxt, json_build_config());
+  return json_build_config_to_mbuf(ctxt->om);
 }
 
 static int chr_rpc_req_cb(uint16_t, uint16_t, struct ble_gatt_access_ctxt* ctxt, void*) {
