@@ -3083,6 +3083,21 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
       g_decode_applied_slot_idx = g_decode_slot_idx;
     }
     g_decode_in_progress = false;
+    // No decodes this slot, but beacon mode still needs to enqueue a
+    // CQ on every parity-matched slot — otherwise on a quiet band
+    // beacon never fires (the rich-decode path below is what normally
+    // reaches enqueue_beacon_cq, and we just took the early return).
+    if (!g_was_txing && g_beacon != BeaconMode::OFF) {
+      AutoseqTxEntry pending;
+      if (!autoseq_fetch_pending_tx(pending)) {
+        enqueue_beacon_cq();
+        if (autoseq_fetch_pending_tx(pending)) {
+          arm_pending_tx(pending);
+          ESP_LOGI(TAG, "Beacon CQ ready (silent slot): %s parity=%d",
+                   pending.text.c_str(), g_target_slot_parity);
+        }
+      }
+    }
     return;
   }
 
