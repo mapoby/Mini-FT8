@@ -105,12 +105,13 @@ static inline int16_t sin_q15_from_phase(uint64_t phase) {
     return static_cast<int16_t>(y);
 }
 
-// Pack one Q15 sample into a stereo 24-bit frame at -6 dB. Mono
-// duplicated to L+R. Handles -6 dB via arithmetic right shift on Q15
-// before promoting to 24-bit (Q15 >> 1, then << 8 to land in Q1.23
-// range). Result range: ±4194176, well under ±full-scale.
+// Pack one Q15 sample into a stereo 24-bit frame at full scale.
+// Q15 << 8 lands in Q1.23 range. Mono duplicated to L+R.
+// QDX/QMX manual specifies full-scale audio input; the -6 dB
+// convention from mcu-ft8 was a two-tone-summing headroom hack
+// that doesn't apply to single-tone CPFSK.
 static inline void emit_stereo_frame(uint8_t* out, int16_t s_q15) {
-    int32_t v24 = (static_cast<int32_t>(s_q15) >> 1) << 8;
+    int32_t v24 = static_cast<int32_t>(s_q15) << 8;
     uint8_t b0 = static_cast<uint8_t>(v24 & 0xFF);
     uint8_t b1 = static_cast<uint8_t>((v24 >> 8) & 0xFF);
     uint8_t b2 = static_cast<uint8_t>((v24 >> 16) & 0xFF);

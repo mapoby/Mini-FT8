@@ -65,9 +65,8 @@ void dds_ft8_end(void);
 // Render `frames` stereo frames as 24-bit packed little-endian samples
 // (3 bytes per channel × 2 channels = 6 bytes per frame). `out` must
 // point to at least frames*6 bytes. Mono synthesis is duplicated to
-// L and R. -6 dB gain is applied to leave headroom (matches the
-// working mcu-ft8 setup; QMX prefers the audio not to be at full
-// scale). Integer math in the hot loop.
+// L and R. Full-scale Q15 -> Q1.23 (peaks at ±8388352, ~0.003% under
+// ±full-scale, negligible). Integer math in the hot loop.
 void dds_render_24bit_stereo(uint8_t* out, unsigned frames);
 
 #ifdef __cplusplus
