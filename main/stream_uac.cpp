@@ -1135,10 +1135,14 @@ static const uint32_t SPK_PACKET_BYTES = 288;          // 48 stereo frames * 6 B
 static const uint32_t SPK_PUMP_PACKETS = 48;           // 48 packets per write
 static const uint32_t SPK_PUMP_BYTES   = SPK_PACKET_BYTES * SPK_PUMP_PACKETS;  // 13824
 static const uint32_t SPK_FRAME_BYTES  = 6;            // L+R, 24-bit each
-static const uint32_t SPK_BUFFER_SIZE  = 49152;        // 48 KB driver ringbuffer
-                                                       //   = ~170 ms of audio at 288 B/ms
-                                                       //   absorbs scheduling jitter at any layer
-static const uint32_t SPK_BUFFER_THRESHOLD = 8192;     // 8 KB threshold ~ 28 ms ahead
+// Match the validated uac_host loopback_validator reference values.
+// Earlier 48 KB bumps were chasing waterfall scatter that turned out
+// to be the local fft_waterfall_tx_tone visualizer (cosmetic, not
+// audio-path); reverting to 16 KB so the alloc fits Cardputer's
+// post-FFT-init contiguous-heap budget (largest free block on
+// Cardputer was ~47 KB after FFT/BLE/FATFS init — 49 KB tipped over).
+static const uint32_t SPK_BUFFER_SIZE  = 16000;        // driver ringbuffer
+static const uint32_t SPK_BUFFER_THRESHOLD = 1000;     // ~3.5 ms at 48k/24/stereo
 static const uint32_t SPK_WRITE_TIMEOUT_MS = 200;
 
 static void spk_event_cb(uac_host_device_handle_t /*dev*/,
