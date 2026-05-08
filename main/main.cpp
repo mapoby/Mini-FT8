@@ -2875,6 +2875,14 @@ static void fft_waterfall_tx_tone(uint8_t tone) {
   if (pos >= (int)row.size()) pos = (int)row.size() - 1;
   row[pos] = 200;
   ui_push_waterfall_row(row.data(), (int)row.size());
+
+  // Mirror the same TX-tone spike out to BLE clients via the FFT-bin
+  // waterfall callback. uac_tx_echo_fire_waterfall owns its own
+  // bin-shaped buffer and matches mon.wf.num_bins / mon.min_bin so
+  // the bins line up with the regular RX-side waterfall on the
+  // client. sym = g_tx_tone_idx so the client sees the symbol index
+  // advancing through the TX cycle.
+  uac_tx_echo_fire_waterfall(hz, g_tx_tone_idx);
 }
 
 [[maybe_unused]] static bool is_grid4(const std::string& s) {

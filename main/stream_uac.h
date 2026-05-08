@@ -100,6 +100,15 @@ void uac_tx_set_tone_hz(float hz);
 void uac_tx_begin_ft8(float base_hz, const uint8_t* symbols);
 void uac_tx_end_ft8(void);
 
+// Synthesize a single-tone "TX echo" waterfall row in FFT-bin space and
+// fire it on core_fire_waterfall_row so BLE clients see the same TX
+// progress visualization the on-device waterfall does. Owns a static
+// bin buffer (sized to mon.wf.num_bins) — caller should keep calling
+// at FT8 symbol cadence (one call per symbol). The on-device 240-px
+// waterfall has its own dedicated path via ui_push_waterfall_row in
+// fft_waterfall_tx_tone; this is a parallel feeder for the BLE side.
+void uac_tx_echo_fire_waterfall(float tone_hz, int sym);
+
 #ifdef __cplusplus
 }
 #endif

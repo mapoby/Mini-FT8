@@ -121,6 +121,15 @@ static uint8_t* s_spk_pump_buf = nullptr;
 static uint32_t s_spk_packets_sent = 0;
 static uint32_t s_spk_write_errors = 0;
 
+// FFT waterfall geometry, populated when the audio task calls
+// monitor_init. Read by uac_tx_echo_fire_waterfall (off-task) to size
+// + position the synthetic TX-echo bin row. Both writes and reads
+// are int / pointer aligned so a torn read at startup is harmless
+// (TX can't fire before the audio task initializes anyway).
+static int s_wf_num_bins = 0;
+static int s_wf_min_bin  = 0;
+static uint8_t* s_wf_tx_echo_bins = nullptr;
+
 // Speaker pump health counters. The verifier was bit-exact (591k frames,
 // 0 errors) but visible waterfall artifacts on both the impersonator and
 // real QMX point at PTX FIFO underruns — brief gaps when the driver
@@ -284,6 +293,39 @@ static void push_waterfall_latest(const monitor_t& mon) {
         ESP_LOGI(TAG, "push_waterfall_latest: block=%d num_bins=%d", block, num_bins);
     }
     core_fire_waterfall_row(block, row_bins, num_bins,
+                            /*swr=*/1.5f, /*pwr=*/2.0f, /*ptt=*/false);
+}
+
+void uac_tx_echo_fire_waterfall(float tone_hz, int sym) {
+    // Off-audio-task path. The on-device waterfall has its own dedicated
+    // 240-px feed via fft_waterfall_tx_tone -> ui_push_waterfall_row;
+    // this synthesizes the SAME spike in FFT-bin space so BLE clients,
+    // which receive mon.wf.mag bins zero-copy, also see the TX visual.
+    if (s_wf_num_bins <= 0) return;  // audio task hasn't initialized yet
+    if (!s_wf_tx_echo_bins) {
+        // Allocate once, lazily. Must be heap (not stack) — the BLE
+        // callback stashes the pointer and the BLE TX task reads it
+        // later from a different stack.
+        s_wf_tx_echo_bins = (uint8_t*)heap_caps_calloc(
+            s_wf_num_bins, sizeof(uint8_t), MALLOC_CAP_DEFAULT);
+        if (!s_wf_tx_echo_bins) return;  // OOM, skip silently
+    }
+    // Symbol period for FT8 = 0.16 s, so bin width = 1 / 0.16 = 6.25 Hz.
+    // bin_idx = round(hz / 6.25) - min_bin.
+    int bin = (int)((tone_hz * 0.160f) + 0.5f) - s_wf_min_bin;
+    if (bin < 0) bin = 0;
+    if (bin >= s_wf_num_bins) bin = s_wf_num_bins - 1;
+
+    // Clear the previously-set bin so the spike doesn't smear across
+    // the row. Only one bin per call is bright; the rest are zero.
+    static int s_last_bin = -1;
+    if (s_last_bin >= 0 && s_last_bin < s_wf_num_bins) {
+        s_wf_tx_echo_bins[s_last_bin] = 0;
+    }
+    s_wf_tx_echo_bins[bin] = 200;
+    s_last_bin = bin;
+
+    core_fire_waterfall_row(sym, s_wf_tx_echo_bins, s_wf_num_bins,
                             /*swr=*/1.5f, /*pwr=*/2.0f, /*ptt=*/false);
 }
 
@@ -857,6 +899,14 @@ static void stream_uac_task(void* arg) {
     monitor_t mon;
     monitor_init(&mon, &mon_cfg);
     monitor_reset(&mon);
+
+    // Stash the FFT waterfall geometry to file-scope statics so the
+    // off-task TX echo path (uac_tx_echo_fire_waterfall, called from
+    // tx_tick on app_task_core0) can synthesize a same-shaped bin
+    // array and fire it down the BLE callback chain without needing
+    // access to this task's `mon` instance.
+    s_wf_num_bins = mon.wf.num_bins;
+    s_wf_min_bin  = mon.min_bin;
 
     // USB buffer lives in DMA-capable BSS (s_usb_buffer above). Only the
     // float working buffers are heap-allocated; they don't need DMA capability.
