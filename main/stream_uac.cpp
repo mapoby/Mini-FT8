@@ -1277,6 +1277,11 @@ bool uac_tx_test_start(void) {
 void uac_tx_test_stop(void) {
     if (!s_spk_writer_task && !s_spk_handle) return;
 
+    // Drop the FT8 schedule so the next TX starts from a clean state
+    // (otherwise s_ft8_active stays true and the next pump open would
+    // immediately resume mid-message).
+    dds_ft8_end();
+
     s_spk_writer_stop = true;
     for (int i = 0; i < 50 && s_spk_writer_task; ++i) {
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -1305,6 +1310,14 @@ void uac_tx_test_stop(void) {
 
 void uac_tx_set_tone_hz(float hz) {
     dds_set_freq_hz(static_cast<double>(hz));
+}
+
+void uac_tx_begin_ft8(float base_hz, const uint8_t* symbols) {
+    dds_ft8_begin(static_cast<double>(base_hz), symbols);
+}
+
+void uac_tx_end_ft8(void) {
+    dds_ft8_end();
 }
 
 const char* uac_get_status_string(void) {

@@ -3506,6 +3506,16 @@ static void tx_start(int skip_tones) {
     }
   }
 
+  // Hand the full 79-symbol schedule to the UAC OUT NCO. After this,
+  // the speaker writer renders sample-precise CPFSK with continuous
+  // phase; tx_tick no longer needs to update the NCO frequency per
+  // symbol (the wall-clock-based per-symbol updates added jitter
+  // because of audio buffering, ~30% symbol-duration variance
+  // per measurement). fft_waterfall_tx_tone in tx_tick still drives
+  // the local screen visualizer at wall-clock cadence — slight skew
+  // there is purely cosmetic.
+  uac_tx_begin_ft8(static_cast<float>(g_tx_base_hz), g_tx_tones);
+
   if (skip_tones > 0) {
     ESP_LOGI("TXTONE", "Skipping first %d tones due to late start", skip_tones);
   }
@@ -3566,17 +3576,15 @@ static void tx_tick() {
     return;
   }
 
-  // Send current tone
+  // Send current tone — local visualizer + (legacy) CAT TA. The NCO
+  // is driven by the symbol schedule pre-loaded in tx_start, so we no
+  // longer need to set its frequency per symbol here (and shouldn't —
+  // wall-clock-based per-symbol updates jittered by ~30% because of
+  // audio buffering between the writer task and the wire).
   ESP_LOGD("TXTONE", "%02d %u", g_tx_tone_idx, (unsigned)g_tx_tones[g_tx_tone_idx]);
   fft_waterfall_tx_tone(g_tx_tones[g_tx_tone_idx]);
-  // Drive the UAC OUT NCO directly. Audio path is now the canonical
-  // tone source; the legacy CAT TA tone-set is kept for backends that
-  // still need it (qmx_set_tone_hz is a no-op in the UAC-OUT-experiment
-  // build, so this is a no-op there too — preserved for non-QMX
-  // backends like KH1 if/when we plug them back in).
-  float tone_hz = g_tx_base_hz + 6.25f * g_tx_tones[g_tx_tone_idx];
-  uac_tx_set_tone_hz(tone_hz);
   if (g_tx_cat_ok) {
+    float tone_hz = g_tx_base_hz + 6.25f * g_tx_tones[g_tx_tone_idx];
     tx_send_ta(tone_hz);
   }
 

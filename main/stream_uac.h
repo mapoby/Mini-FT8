@@ -82,10 +82,19 @@ esp_err_t cat_cdc_send(const uint8_t* data, size_t len, uint32_t timeout_ms);
 bool uac_tx_test_start(void);
 void uac_tx_test_stop(void);
 
-// Update the NCO output frequency for the current FT8 symbol. Phase is
-// preserved (continuous-phase FSK). Safe to call from any task —
-// updates are atomic and applied at the next render-block boundary.
+// Update the NCO output frequency for single-tone test mode. Phase is
+// preserved (continuous-phase). Safe to call from any task. Note:
+// during an active uac_tx_begin_ft8 session the schedule overrides
+// any frequency set here.
 void uac_tx_set_tone_hz(float hz);
+
+// Begin an FT8 8-CPFSK transmission. Once called, the speaker writer's
+// NCO walks the message at sample-precise symbol boundaries with
+// continuous phase and -6 dB amplitude. After the 79 symbols
+// (~12.64 s) the writer outputs silence until uac_tx_end_ft8() or the
+// pump is stopped via uac_tx_test_stop().
+void uac_tx_begin_ft8(float base_hz, const uint8_t* symbols);
+void uac_tx_end_ft8(void);
 
 #ifdef __cplusplus
 }
