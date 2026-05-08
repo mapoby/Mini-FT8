@@ -182,6 +182,27 @@ static void stream_uac_task(void* arg);
 static void cdc_close(void);
 static void cdc_try_open(void);
 static void cdc_event_cb(const cdc_acm_host_dev_event_data_t* event, void* user_ctx);
+
+// Speaker constants and event callback forward declaration. The
+// constants are referenced from uac_lib_task's TX_CONNECTED handler
+// (which now pre-opens the speaker on enum) as well as from the
+// pump task itself further down in the file.
+// Speaker ringbuffer must hold one full pump write atomically (push
+// is all-or-none in xRingbuffer). 8 KB ringbuffer + ~6.9 KB pump
+// (24 packets × 288 B) leaves a margin and matches the 8 KB mic
+// ringbuffer for symmetric heap usage. Halved from the validated
+// 16 KB so two ringbuffers fit alongside everything else after
+// NimBLE + FFT + waterfall are accounted for.
+static const uint32_t SPK_BUFFER_SIZE      = 8000;      // driver ringbuffer
+static const uint32_t SPK_BUFFER_THRESHOLD = 1000;      // ~3.5 ms at 48k/24/stereo
+static const uint32_t SPK_WRITE_TIMEOUT_MS = 200;
+static const uint32_t SPK_PACKET_BYTES     = 288;       // 48 stereo frames × 6 B
+static const uint32_t SPK_PUMP_PACKETS     = 24;        // 24 packets per write = 6912 B
+static const uint32_t SPK_PUMP_BYTES       = SPK_PACKET_BYTES * SPK_PUMP_PACKETS;  // 6912
+static const uint32_t SPK_FRAME_BYTES      = 6;         // L+R, 24-bit each
+static void spk_event_cb(uac_host_device_handle_t dev,
+                         const uac_host_device_event_t event,
+                         void* arg);
 static void cdc_new_dev_cb(usb_device_handle_t usb_dev);
 
 static const char* profile_name(uac_stream_profile_t profile) {
@@ -691,6 +712,32 @@ static void uac_lib_task(void* arg) {
                     s_spk_known = true;
                     ESP_LOGI(TAG, "Speaker captured: addr=%u iface=%u",
                              (unsigned)s_spk_addr, (unsigned)s_spk_iface);
+                    // Open the speaker NOW (16 KB ringbuffer alloc, DMA-
+                    // capable). Heap is healthy at enum time (~31 KB
+                    // largest contiguous block); after the FFT static
+                    // alloc + BLE notification fragmentation, the largest
+                    // contiguous drops to ~1.6 KB and 16 KB allocations
+                    // intermittently fail. Hold the handle across all
+                    // TX cycles — uac_tx_test_start/stop only flip stream
+                    // state (alt-iface set/unset), no realloc per TX.
+                    if (!s_spk_handle) {
+                        uac_host_device_config_t cfg = {};
+                        cfg.addr = s_spk_addr;
+                        cfg.iface_num = s_spk_iface;
+                        cfg.buffer_size = SPK_BUFFER_SIZE;
+                        cfg.buffer_threshold = SPK_BUFFER_THRESHOLD;
+                        cfg.callback = spk_event_cb;
+                        cfg.callback_arg = nullptr;
+                        esp_err_t oerr = uac_host_device_open(&cfg, &s_spk_handle);
+                        if (oerr != ESP_OK) {
+                            ESP_LOGE(TAG, "spk pre-open failed at enum: %s",
+                                     esp_err_to_name(oerr));
+                            s_spk_handle = NULL;
+                        } else {
+                            ESP_LOGI(TAG, "Speaker pre-opened (handle=%p, ringbuf=%u B)",
+                                     s_spk_handle, (unsigned)SPK_BUFFER_SIZE);
+                        }
+                    }
                 }
             }
         }
@@ -1057,23 +1104,8 @@ void uac_stop(void) {
 // normal Mini-FT8 TX slot drives the test (~13 s of continuous OUT
 // streaming). Logs packet count and write-error count when stopped.
 
-// Match the validated ~/esp/uac_host loopback_validator reference exactly:
-// large driver-side ringbuffer, large pre-built pump buffer, big write
-// chunks with generous timeout. Anything smaller starves the driver
-// between writes and produces dropouts / scrambled samples on the wire.
-static const uint32_t SPK_PACKET_BYTES = 288;          // 48 stereo frames * 6 B
-static const uint32_t SPK_PUMP_PACKETS = 48;           // 48 packets per write
-static const uint32_t SPK_PUMP_BYTES   = SPK_PACKET_BYTES * SPK_PUMP_PACKETS;  // 13824
-static const uint32_t SPK_FRAME_BYTES  = 6;            // L+R, 24-bit each
-// Match the validated uac_host loopback_validator reference values.
-// Earlier 48 KB bumps were chasing waterfall scatter that turned out
-// to be the local fft_waterfall_tx_tone visualizer (cosmetic, not
-// audio-path); reverting to 16 KB so the alloc fits Cardputer's
-// post-FFT-init contiguous-heap budget (largest free block on
-// Cardputer was ~47 KB after FFT/BLE/FATFS init — 49 KB tipped over).
-static const uint32_t SPK_BUFFER_SIZE  = 16000;        // driver ringbuffer
-static const uint32_t SPK_BUFFER_THRESHOLD = 1000;     // ~3.5 ms at 48k/24/stereo
-static const uint32_t SPK_WRITE_TIMEOUT_MS = 200;
+// SPK_* constants and spk_event_cb forward declaration are at the top
+// of the file (above the uac_lib_task that now pre-opens the speaker).
 
 static void spk_event_cb(uac_host_device_handle_t /*dev*/,
                          const uac_host_device_event_t event,
@@ -1159,17 +1191,10 @@ bool uac_tx_test_start(void) {
     s_spk_write_55_100ms = 0;
     s_spk_write_gt_100ms = 0;
 
-    uac_host_device_config_t cfg = {};
-    cfg.addr = s_spk_addr;
-    cfg.iface_num = s_spk_iface;
-    cfg.buffer_size = SPK_BUFFER_SIZE;          // 16000 (matches reference)
-    cfg.buffer_threshold = SPK_BUFFER_THRESHOLD; // 1000  (matches reference)
-    cfg.callback = spk_event_cb;
-    cfg.callback_arg = nullptr;
-    esp_err_t err = uac_host_device_open(&cfg, &s_spk_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "uac_tx_test: open spk: %s", esp_err_to_name(err));
-        s_spk_handle = NULL;
+    // Speaker handle was opened at TX_CONNECTED enumeration time. Just
+    // verify it's still valid here.
+    if (!s_spk_handle) {
+        ESP_LOGE(TAG, "uac_tx_test: speaker not pre-opened (enum failed?)");
         return false;
     }
 
@@ -1178,11 +1203,9 @@ bool uac_tx_test_start(void) {
     stream_cfg.bit_resolution = 24;
     stream_cfg.sample_freq = 48000;
     stream_cfg.flags = 0;
-    err = uac_host_device_start(s_spk_handle, &stream_cfg);
+    esp_err_t err = uac_host_device_start(s_spk_handle, &stream_cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "uac_tx_test: start spk: %s", esp_err_to_name(err));
-        uac_host_device_close(s_spk_handle);
-        s_spk_handle = NULL;
         return false;
     }
 
@@ -1199,8 +1222,6 @@ bool uac_tx_test_start(void) {
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "uac_tx_test: writer task create failed");
         uac_host_device_stop(s_spk_handle);
-        uac_host_device_close(s_spk_handle);
-        s_spk_handle = NULL;
         return false;
     }
 
@@ -1209,7 +1230,10 @@ bool uac_tx_test_start(void) {
 }
 
 void uac_tx_test_stop(void) {
-    if (!s_spk_writer_task && !s_spk_handle) return;
+    // No-op if no TX session is in flight. The speaker handle is now
+    // held permanently after enum-time pre-open, so checking it isn't
+    // a useful indicator — gate on the writer task instead.
+    if (!s_spk_writer_task) return;
 
     // Drop the FT8 schedule so the next TX starts from a clean state
     // (otherwise s_ft8_active stays true and the next pump open would
@@ -1221,10 +1245,13 @@ void uac_tx_test_stop(void) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 
+    // Stop the stream but KEEP the device handle open. The 16 KB
+    // ringbuffer alloc is the expensive part — re-allocating it at the
+    // next TX would intermittently fail because the heap fragments to
+    // <16 KB largest contiguous after FFT/BLE notifications. Handle is
+    // released only on speaker disconnect or USB host teardown.
     if (s_spk_handle) {
         uac_host_device_stop(s_spk_handle);
-        uac_host_device_close(s_spk_handle);
-        s_spk_handle = NULL;
     }
 
     ESP_LOGI(TAG, "uac_tx_test: stopped, packets=%u err=%u tx_done=%u "

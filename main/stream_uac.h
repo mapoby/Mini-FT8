@@ -14,7 +14,12 @@ extern "C" {
 #define UAC_CHANNELS        2
 
 // UAC buffer configuration
-#define UAC_BUFFER_SIZE     16000   // Ringbuffer size in bytes
+// Mic driver ringbuffer. 8 KB = ~28 ms of audio at 48k/24/stereo
+// (288 B/ms). Halved from the validated 16 KB to leave heap room for
+// the speaker pump's separate 8 KB ringbuffer (we now pre-allocate
+// both at enum time to avoid intermittent ENOMEM at TX-trigger time
+// when the heap has fragmented to <16 KB largest contiguous).
+#define UAC_BUFFER_SIZE     8000    // Ringbuffer size in bytes
 #define UAC_BUFFER_THRESHOLD 1000   // ~3.5ms at 48kHz stereo 24-bit
 
 // UAC streaming state
