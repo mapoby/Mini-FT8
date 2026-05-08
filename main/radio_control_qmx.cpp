@@ -60,9 +60,11 @@ static esp_err_t qmx_begin_tx(int freq_hz, int tx_base_hz) {
 }
 
 static esp_err_t qmx_set_tone_hz(float tone_hz) {
-    // EXPERIMENTAL: tone is generated from a fixed 1.5 kHz LUT pumped
-    // through UAC OUT — TA-based tone scheduling is bypassed for the
-    // duration of the test bench.
+    // No-op on QMX/QDX. Audio synthesis is done by the on-board NCO and
+    // streamed via UAC OUT; TA CAT commands would conflict with the
+    // audio stream (QMX in DATA-A picks up tone freq from zero-crossings
+    // of the UAC samples). Kept as a backend hook for future radios
+    // that drive their tone via CAT instead of UAC.
     (void)tone_hz;
     return ESP_OK;
 }

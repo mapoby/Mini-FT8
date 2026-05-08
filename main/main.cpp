@@ -1252,8 +1252,6 @@ static uint8_t g_tx_tones[79];             // Encoded tones
 static int g_tx_base_hz = 0;               // Base frequency for TA commands
 static int64_t g_tx_slot_idx = 0;          // Slot index for autoseq_mark_sent
 static bool g_tx_cat_ok = false;           // CAT available for this TX
-static int g_tx_last_ta_int = -1;          // For TA command deduplication
-static int g_tx_last_ta_frac = -1;
 
 static SemaphoreHandle_t log_mutex = NULL;                       // Protects log_rxtx_line file access
 static int menu_page = 0;
@@ -3085,22 +3083,6 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
       g_decode_applied_slot_idx = g_decode_slot_idx;
     }
     g_decode_in_progress = false;
-    // TEST BENCH: still need to enqueue beacon CQ on no-decode slots so
-    // the test rig (impersonator carries no FT8 traffic, so every slot
-    // is "no candidates") can fire a beacon TX. This branch normally
-    // returns early before the beacon path further down — short-circuit
-    // here.
-    if (!g_was_txing && g_beacon != BeaconMode::OFF) {
-      AutoseqTxEntry pending;
-      if (!autoseq_fetch_pending_tx(pending)) {
-        enqueue_beacon_cq();
-        if (autoseq_fetch_pending_tx(pending)) {
-          arm_pending_tx(pending);
-          ESP_LOGI(TAG, "TEST BENCH beacon CQ ready: %s parity=%d",
-                   pending.text.c_str(), g_target_slot_parity);
-        }
-      }
-    }
     return;
   }
 
@@ -3432,18 +3414,6 @@ static bool schedule_manual_pending_tx(const AutoseqTxEntry& pending) {
   // g_qso_xmit and check_slot_boundary triggering TX at slot start.
 }
 
-// Helper to send TA command (deduplicated)
-static void tx_send_ta(float tone_hz) {
-  int ta_int = (int)lrintf(tone_hz);
-  float frac = tone_hz - (float)ta_int;
-  int ta_frac = (int)lrintf(frac * 100.0f);
-  if (ta_int == g_tx_last_ta_int && ta_frac == g_tx_last_ta_frac) return;
-  if (radio_control_set_tone_hz(tone_hz) == ESP_OK) {
-    g_tx_last_ta_int = ta_int;
-    g_tx_last_ta_frac = ta_frac;
-  }
-}
-
 // Start TX (single-threaded state machine initialization)
 // Called from check_slot_boundary at the right time
 // Uses g_pending_tx which was prepared by check_slot_boundary with correct offset
@@ -3490,8 +3460,6 @@ static void tx_start(int skip_tones) {
   // Next tone time = slot_start + tone_idx * 160ms
   // This aligns all tones to the slot boundary, not to when TX started
   g_tx_next_tone_time = g_tx_slot_start_ms + g_tx_tone_idx * 160;
-  g_tx_last_ta_int = -1;
-  g_tx_last_ta_frac = -1;
 
   ESP_LOGI(TAG, "TX base_hz=%d (from pre-computed offset, text=%s)", g_tx_base_hz, g_pending_tx.text.c_str());
 
@@ -3520,11 +3488,9 @@ static void tx_start(int skip_tones) {
     ESP_LOGI("TXTONE", "Skipping first %d tones due to late start", skip_tones);
   }
 
-  // Send first tone TA if CAT is ready
-  if (g_tx_cat_ok && g_tx_tone_idx < 79) {
-    float tone_hz = g_tx_base_hz + 6.25f * g_tx_tones[g_tx_tone_idx];
-    tx_send_ta(tone_hz);
-  }
+  // (Was: send first-tone TA via CAT. Now redundant — UAC OUT NCO is
+  // the canonical tone source, fed by the symbol schedule pre-loaded
+  // above. TA would conflict with the audio stream on QMX/QDX.)
 
   // Mark TX as active
   g_tx_active = true;
@@ -3576,17 +3542,11 @@ static void tx_tick() {
     return;
   }
 
-  // Send current tone — local visualizer + (legacy) CAT TA. The NCO
-  // is driven by the symbol schedule pre-loaded in tx_start, so we no
-  // longer need to set its frequency per symbol here (and shouldn't —
-  // wall-clock-based per-symbol updates jittered by ~30% because of
-  // audio buffering between the writer task and the wire).
+  // Send current tone — local visualizer only. NCO frequency is
+  // driven by the sample-precise schedule pre-loaded in tx_start, so
+  // there's nothing to do per-symbol on the audio side here.
   ESP_LOGD("TXTONE", "%02d %u", g_tx_tone_idx, (unsigned)g_tx_tones[g_tx_tone_idx]);
   fft_waterfall_tx_tone(g_tx_tones[g_tx_tone_idx]);
-  if (g_tx_cat_ok) {
-    float tone_hz = g_tx_base_hz + 6.25f * g_tx_tones[g_tx_tone_idx];
-    tx_send_ta(tone_hz);
-  }
 
   // Advance to next tone
   g_tx_tone_idx++;
@@ -4671,13 +4631,7 @@ static void load_station_data() {
   }
   rebuild_active_bands();
   rebuild_ignore_prefixes();
-  // TEST BENCH: hardcode beacon EVEN. With RTC starting near 0 and
-  // mic streaming kicking off after the first 15s slot wait, the first
-  // decode happens in odd slot 117696521 (~t=15-30s). Beacon CQ is
-  // enqueued at decode end and arms for the NEXT parity-0 slot, which
-  // is slot 117696522 (~t=30s). EVEN gets us the first TX about 15s
-  // sooner than ODD.
-  g_beacon = BeaconMode::EVEN;
+  g_beacon = BeaconMode::OFF; // force off on load
   apply_ble_enabled_policy(false);
 }
 

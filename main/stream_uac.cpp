@@ -119,50 +119,6 @@ static volatile bool s_spk_writer_stop = false;
 static uint32_t s_spk_packets_sent = 0;
 static uint32_t s_spk_write_errors = 0;
 
-// Pre-computed 1.5 kHz sine wave, 24-bit stereo little-endian, full-scale.
-// Mono duplicated to L/R. 32 samples per cycle (48 kHz / 1.5 kHz = 32).
-// Source: ~/esp/uac_host loopback_validator (bit-exact verified against the
-// STM32 loopback). Used both as the speaker pump source and as the
-// verification reference for the mic loopback path.
-#define EXPECTED_TONE_FRAMES 32
-#define EXPECTED_TONE_FRAME_BYTES 6  // 3 bytes * 2 channels
-#define EXPECTED_TONE_BYTES \
-    (EXPECTED_TONE_FRAMES * EXPECTED_TONE_FRAME_BYTES)  // 192
-static const uint8_t k_expected_tone[EXPECTED_TONE_BYTES] = {
-    /*  0:        0 */ 0x00, 0x00, 0x00,  0x00, 0x00, 0x00,
-    /*  1: +1636536 */ 0xB8, 0xF8, 0x18,  0xB8, 0xF8, 0x18,
-    /*  2: +3210181 */ 0xC5, 0xFB, 0x30,  0xC5, 0xFB, 0x30,
-    /*  3: +4660460 */ 0xEC, 0x1C, 0x47,  0xEC, 0x1C, 0x47,
-    /*  4: +5931641 */ 0x79, 0x82, 0x5A,  0x79, 0x82, 0x5A,
-    /*  5: +6974872 */ 0x98, 0x6D, 0x6A,  0x98, 0x6D, 0x6A,
-    /*  6: +7750062 */ 0xAE, 0x41, 0x76,  0xAE, 0x41, 0x76,
-    /*  7: +8227422 */ 0x5E, 0x8A, 0x7D,  0x5E, 0x8A, 0x7D,
-    /*  8: +8388607 */ 0xFF, 0xFF, 0x7F,  0xFF, 0xFF, 0x7F,
-    /*  9: +8227422 */ 0x5E, 0x8A, 0x7D,  0x5E, 0x8A, 0x7D,
-    /* 10: +7750062 */ 0xAE, 0x41, 0x76,  0xAE, 0x41, 0x76,
-    /* 11: +6974872 */ 0x98, 0x6D, 0x6A,  0x98, 0x6D, 0x6A,
-    /* 12: +5931641 */ 0x79, 0x82, 0x5A,  0x79, 0x82, 0x5A,
-    /* 13: +4660460 */ 0xEC, 0x1C, 0x47,  0xEC, 0x1C, 0x47,
-    /* 14: +3210181 */ 0xC5, 0xFB, 0x30,  0xC5, 0xFB, 0x30,
-    /* 15: +1636536 */ 0xB8, 0xF8, 0x18,  0xB8, 0xF8, 0x18,
-    /* 16:        0 */ 0x00, 0x00, 0x00,  0x00, 0x00, 0x00,
-    /* 17: -1636536 */ 0x48, 0x07, 0xE7,  0x48, 0x07, 0xE7,
-    /* 18: -3210181 */ 0x3B, 0x04, 0xCF,  0x3B, 0x04, 0xCF,
-    /* 19: -4660460 */ 0x14, 0xE3, 0xB8,  0x14, 0xE3, 0xB8,
-    /* 20: -5931641 */ 0x87, 0x7D, 0xA5,  0x87, 0x7D, 0xA5,
-    /* 21: -6974872 */ 0x68, 0x92, 0x95,  0x68, 0x92, 0x95,
-    /* 22: -7750062 */ 0x52, 0xBE, 0x89,  0x52, 0xBE, 0x89,
-    /* 23: -8227422 */ 0xA2, 0x75, 0x82,  0xA2, 0x75, 0x82,
-    /* 24: -8388607 */ 0x01, 0x00, 0x80,  0x01, 0x00, 0x80,
-    /* 25: -8227422 */ 0xA2, 0x75, 0x82,  0xA2, 0x75, 0x82,
-    /* 26: -7750062 */ 0x52, 0xBE, 0x89,  0x52, 0xBE, 0x89,
-    /* 27: -6974872 */ 0x68, 0x92, 0x95,  0x68, 0x92, 0x95,
-    /* 28: -5931641 */ 0x87, 0x7D, 0xA5,  0x87, 0x7D, 0xA5,
-    /* 29: -4660460 */ 0x14, 0xE3, 0xB8,  0x14, 0xE3, 0xB8,
-    /* 30: -3210181 */ 0x3B, 0x04, 0xCF,  0x3B, 0x04, 0xCF,
-    /* 31: -1636536 */ 0x48, 0x07, 0xE7,  0x48, 0x07, 0xE7,
-};
-
 // Speaker pump health counters. The verifier was bit-exact (591k frames,
 // 0 errors) but visible waterfall artifacts on both the impersonator and
 // real QMX point at PTX FIFO underruns — brief gaps when the driver
@@ -203,7 +159,6 @@ static uac_active_format_t s_format = {
     .channels = UAC_CHANNELS,
 };
 static bool s_cdc_installed = false;
-static bool s_cdc_install_pending = false;
 static int s_cdc_iface = -1;
 static int s_cdc_iface_hint = -1;
 static int64_t s_cdc_last_attempt_ms = 0;
@@ -530,15 +485,13 @@ static void usb_lib_task(void* arg) {
         .xCoreID = 0,
         .new_dev_cb = cdc_new_dev_cb,
     };
-    // TEST BENCH: defer CDC-ACM install until AFTER UAC mic stream is up.
-    // With both class drivers running concurrently during enumeration the
-    // QMX impersonator's UAC SET_INTERFACE control transfer times out at
-    // 5s — looks like a class-driver race on composite devices. Install
-    // path moved to a flag-driven late install in uac_lib_task.
-    (void)cdc_cfg;
-    s_cdc_installed = false;
-    s_cdc_install_pending = true;
-    ESP_LOGI(TAG, "CDC-ACM install deferred (pending mic stream)");
+    err = cdc_acm_host_install(&cdc_cfg);
+    if (err == ESP_OK) {
+        s_cdc_installed = true;
+        ESP_LOGI(TAG, "CDC-ACM driver installed");
+    } else {
+        ESP_LOGW(TAG, "CDC-ACM driver install failed: %s", esp_err_to_name(err));
+    }
 
     xTaskNotifyGive((TaskHandle_t)arg);
 
@@ -685,29 +638,6 @@ static void uac_lib_task(void* arg) {
                             started = true;
                             ESP_LOGI(TAG, "Selected stream format: %dHz, %d-bit, %dch",
                                      s_format.sample_freq, s_format.bit_resolution, s_format.channels);
-                            // TEST BENCH: install CDC-ACM driver now that
-                            // UAC mic SET_INTERFACE has completed. With
-                            // both drivers active during the initial
-                            // enumeration of the QMX impersonator, a class-
-                            // driver race timed out the UAC SET_INTERFACE
-                            // at 5s. Late install side-steps it.
-                            if (s_cdc_install_pending) {
-                                const cdc_acm_host_driver_config_t late_cfg = {
-                                    .driver_task_stack_size = 3072,
-                                    .driver_task_priority = 4,
-                                    .xCoreID = 0,
-                                    .new_dev_cb = cdc_new_dev_cb,
-                                };
-                                esp_err_t cerr = cdc_acm_host_install(&late_cfg);
-                                if (cerr == ESP_OK) {
-                                    s_cdc_installed = true;
-                                    ESP_LOGI(TAG, "CDC-ACM driver installed (late)");
-                                } else {
-                                    ESP_LOGW(TAG, "CDC-ACM late install failed: %s",
-                                             esp_err_to_name(cerr));
-                                }
-                                s_cdc_install_pending = false;
-                            }
                             break;
                         }
                         ESP_LOGW(TAG, "Stream candidate failed: %s", esp_err_to_name(err));
