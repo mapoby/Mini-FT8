@@ -17,6 +17,9 @@ struct TestConfig {
     std::string cq_type;       // "CQ", "FD", "SOTA", etc.
     std::string free_text;     // FD exchange or freetext (e.g. "1A SCV")
     int         max_retry = 5; // autoseq_set_max_retry (default 5)
+    bool        adif_fail_once = false;
+    int         expect_adif_count = -1;
+    int         expect_cabrillo_count = -1;
 };
 
 struct BeaconChange {

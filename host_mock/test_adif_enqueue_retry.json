@@ -1,0 +1,51 @@
+{
+  "config": {
+    "MY_CALLSIGN": "AG6AQ",
+    "MY_GRID": "CM97",
+    "DX_CALLSIGN": "N6HAN",
+    "DX_GRID": "CM87",
+    "TX_ON_EVEN": true,
+    "MAX_RETRY": 2,
+    "ADIF_FAIL_ONCE": true,
+    "EXPECT_ADIF_COUNT": 1
+  },
+  "periods": [
+    {
+      "comment": "Period 0: idle",
+      "messages": []
+    },
+    {
+      "comment": "Period 1: DX answers our prior CQ with grid; we send TX2",
+      "messages": [
+        {
+          "call_to": "${MY_CALLSIGN}",
+          "call_from": "${DX_CALLSIGN}",
+          "locator": "${DX_GRID}",
+          "snr": -5,
+          "slot": 1,
+          "freq_hz": 1200
+        }
+      ]
+    },
+    {
+      "comment": "Period 2: TX2 retry if needed",
+      "messages": []
+    },
+    {
+      "comment": "Period 3: DX sends TX3, arming TX4; first ADIF enqueue fails",
+      "messages": [
+        {
+          "call_to": "${MY_CALLSIGN}",
+          "call_from": "${DX_CALLSIGN}",
+          "locator": "R-08",
+          "snr": -8,
+          "slot": 1
+        }
+      ]
+    },
+    {
+      "comment": "Period 4: TX4 retry attempts ADIF again and succeeds once",
+      "messages": []
+    }
+  ]
+}

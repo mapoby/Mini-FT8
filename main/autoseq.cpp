@@ -763,18 +763,29 @@ static TxMsgType parse_rcvd_msg(QsoContext* ctx, const UiRxLine& msg) {
 }
 
 static void log_qso_if_needed(QsoContext* ctx) {
-    if (!ctx || ctx->logged) return;
+    if (!ctx) return;
 
-    // Cabrillo Field Day log (optional, independent of ADIF)
-    if (ctx->is_fd && s_cabrillo_fd_callback &&
+    // Cabrillo Field Day log is tracked separately so an ADIF retry does not
+    // enqueue duplicate Cabrillo entries.
+    if (ctx->is_fd && !ctx->cabrillo_logged && s_cabrillo_fd_callback &&
         !ctx->dxcall.empty() && !ctx->fd_rx_exchange.empty()) {
-        s_cabrillo_fd_callback(ctx->dxcall, ctx->fd_rx_exchange);
+        if (!s_cabrillo_fd_callback(ctx->dxcall, ctx->fd_rx_exchange)) {
+            ESP_LOGW(TAG, "Cabrillo log enqueue failed for %s; will retry",
+                     ctx->dxcall.c_str());
+            return;
+        }
+        ctx->cabrillo_logged = true;
     }
 
+    if (ctx->logged) return;
     if (!s_adif_callback) return;
 
+    if (!s_adif_callback(ctx->dxcall, ctx->dxgrid, ctx->snr_tx, ctx->snr_rx)) {
+        ESP_LOGW(TAG, "ADIF log enqueue failed for %s; will retry",
+                 ctx->dxcall.c_str());
+        return;
+    }
     ctx->logged = true;
-    s_adif_callback(ctx->dxcall, ctx->dxgrid, ctx->snr_tx, ctx->snr_rx);
 
     ESP_LOGI(TAG, "Logged QSO: %s grid=%s rst_sent=%d rst_rcvd=%d",
              ctx->dxcall.c_str(), ctx->dxgrid.c_str(), ctx->snr_tx, ctx->snr_rx);

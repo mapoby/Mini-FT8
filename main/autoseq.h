@@ -64,6 +64,7 @@ struct QsoContext {
     int retry_counter = 0;
     int retry_limit = AUTOSEQ_MAX_RETRY;
     bool logged = false;    // Prevents duplicate ADIF logging
+    bool cabrillo_logged = false; // Prevents duplicate Field Day Cabrillo logging
     bool is_fd = false;
     std::string fd_rx_exchange; // Last received FD exchange (for Cabrillo logging)
     // SIGNOFF handling:
@@ -99,7 +100,7 @@ struct AutoseqTxEntry {
 };
 
 // ADIF logging callback type
-using AdifLogCallback = std::function<void(const std::string& dxcall,
+using AdifLogCallback = std::function<bool(const std::string& dxcall,
                                             const std::string& dxgrid,
                                             int rst_sent, int rst_rcvd)>;
 
@@ -169,7 +170,7 @@ int autoseq_queue_size();
 void autoseq_set_adif_callback(AdifLogCallback cb);
 
 // Cabrillo Field Day callback type (for ARRL-FD logging)
-using CabrilloFdLogCallback = void (*)(const std::string& dxcall, const std::string& their_fd_exchange);
+using CabrilloFdLogCallback = std::function<bool(const std::string& dxcall, const std::string& their_fd_exchange)>;
 void autoseq_set_cabrillo_fd_callback(CabrilloFdLogCallback cb);
 
 // Configuration setters (called when station data changes)

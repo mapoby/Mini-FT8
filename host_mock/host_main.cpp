@@ -21,18 +21,32 @@ enum class BeaconMode { OFF = 0, EVEN, ODD };
 
 // ---------- Globals (subset of main.cpp) ----------
 static BeaconMode g_beacon = BeaconMode::OFF;
+static bool g_adif_fail_once = false;
+static bool g_adif_failed_once = false;
+static int g_adif_log_count = 0;
+static int g_cabrillo_log_count = 0;
 
 // ---------- ADIF callback ----------
-static void adif_callback(const std::string& dxcall, const std::string& dxgrid,
+static bool adif_callback(const std::string& dxcall, const std::string& dxgrid,
                            int rst_sent, int rst_rcvd) {
+    if (g_adif_fail_once && !g_adif_failed_once) {
+        g_adif_failed_once = true;
+        printf(">>> ADIF enqueue failed once: %s %s rst_sent=%+d rst_rcvd=%+d\n",
+               dxcall.c_str(), dxgrid.c_str(), rst_sent, rst_rcvd);
+        return false;
+    }
+    g_adif_log_count++;
     printf(">>> ADIF log: %s %s rst_sent=%+d rst_rcvd=%+d\n",
            dxcall.c_str(), dxgrid.c_str(), rst_sent, rst_rcvd);
+    return true;
 }
 
 // ---------- Cabrillo FD callback ----------
-static void cabrillo_fd_callback(const std::string& dxcall, const std::string& their_exchange) {
+static bool cabrillo_fd_callback(const std::string& dxcall, const std::string& their_exchange) {
+    g_cabrillo_log_count++;
     printf(">>> Cabrillo FD log: %s exchange=%s\n",
            dxcall.c_str(), their_exchange.c_str());
+    return true;
 }
 
 // ---------- Helpers ----------
@@ -62,6 +76,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Initialise autoseq
+    g_adif_fail_once = td.config.adif_fail_once;
     autoseq_init();
     autoseq_set_station(td.config.my_callsign, td.config.my_grid);
     autoseq_set_adif_callback(adif_callback);
@@ -216,5 +231,17 @@ int main(int argc, char* argv[]) {
     }
 
     printf("\n========== Test complete ==========\n");
+    if (td.config.expect_adif_count >= 0 &&
+        g_adif_log_count != td.config.expect_adif_count) {
+        fprintf(stderr, "Expected %d ADIF logs, got %d\n",
+                td.config.expect_adif_count, g_adif_log_count);
+        return 2;
+    }
+    if (td.config.expect_cabrillo_count >= 0 &&
+        g_cabrillo_log_count != td.config.expect_cabrillo_count) {
+        fprintf(stderr, "Expected %d Cabrillo logs, got %d\n",
+                td.config.expect_cabrillo_count, g_cabrillo_log_count);
+        return 2;
+    }
     return 0;
 }

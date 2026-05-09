@@ -48,6 +48,9 @@ bool load_test_data(const std::string& filename, TestData& out) {
         out.config.cq_type    = c.value("CQ_TYPE", "");
         out.config.free_text  = c.value("FREE_TEXT", "");
         out.config.max_retry  = c.value("MAX_RETRY", 5);
+        out.config.adif_fail_once = c.value("ADIF_FAIL_ONCE", false);
+        out.config.expect_adif_count = c.value("EXPECT_ADIF_COUNT", -1);
+        out.config.expect_cabrillo_count = c.value("EXPECT_CABRILLO_COUNT", -1);
     }
 
     // --- periods ---
