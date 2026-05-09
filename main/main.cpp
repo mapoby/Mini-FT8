@@ -456,9 +456,8 @@ struct CopyLogsResult {
   int missed_count = 0;
 };
 static esp_err_t copy_file_overwrite(const char* src_path, const char* dst_path);
+static StaticSemaphore_t spiffs_mutex_buf;
 static SemaphoreHandle_t spiffs_mutex = nullptr;
-static QueueHandle_t spiffs_log_queue = nullptr;
-static uint32_t g_rxtx_log_dropped = 0;
 
 static void debug_log_line(const std::string& msg);
 //exported symbol (linkable from other .cpp)
@@ -542,8 +541,15 @@ static bool spiffs_path_is_spiffs(const char* path) {
          (path[7] == '\0' || path[7] == '/');
 }
 
+static void spiffs_mutex_init() {
+  if (!spiffs_mutex) {
+    spiffs_mutex = xSemaphoreCreateRecursiveMutexStatic(&spiffs_mutex_buf);
+    ESP_ERROR_CHECK(spiffs_mutex ? ESP_OK : ESP_ERR_NO_MEM);
+  }
+}
+
 static bool spiffs_lock_take(TickType_t timeout_ticks = portMAX_DELAY) {
-  if (!spiffs_mutex) return true;
+  if (!spiffs_mutex) return false;
   return xSemaphoreTakeRecursive(spiffs_mutex, timeout_ticks) == pdTRUE;
 }
 
@@ -596,7 +602,9 @@ static esp_err_t spiffs_write_file_atomic(const char* final_path, const std::str
   if (!guard.held()) return ESP_FAIL;
   spiffs_warn_if_low_space_locked(final_path);
 
-  std::string tmp_path = std::string(final_path) + ".tmp";
+  std::string tmp_path = (std::strcmp(final_path, STATION_FILE) == 0)
+      ? std::string("/spiffs/Station.tmp")
+      : std::string(final_path) + ".tmp";
   FILE* f = fopen(tmp_path.c_str(), "wb");
   if (!f) return ESP_FAIL;
 
@@ -864,7 +872,7 @@ static CopyLogsResult copy_logs_spiffs_to_sd_overwrite() {
   return result;
 }
 
-#define CALLSIGN_HASHTABLE_SIZE 256
+#define CALLSIGN_HASHTABLE_SIZE 128
 
 static struct
 {
@@ -1242,6 +1250,7 @@ struct QsoLogEntry {
 static QPageView g_q_page_view = QPageView::Default;
 static std::vector<QsoLogEntry> g_q_entries;
 static bool g_q_show_entries = false;
+static bool g_q_entries_have_next_page = false;
 static int q_page = 0;
 static std::string g_q_current_file;
 static std::vector<std::string> g_d_lines;
@@ -1400,36 +1409,37 @@ static void qso_draw_page();
 static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text, int repeat_counter = -1);
 static bool log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd);
 
-enum class SpiffsLogJobKind : uint8_t {
-  AppendText,
-  CabrilloFd,
-};
-
-struct SpiffsLogJob {
-  SpiffsLogJobKind kind = SpiffsLogJobKind::AppendText;
-  std::string path;
-  std::string header_if_new;
-  std::string line;
-  std::string cabrillo_mycall;
-  std::string cabrillo_location;
-  std::string cabrillo_qso_line;
-  bool must_write = false;
-};
-
-static bool spiffs_append_text_job(const std::string& path,
-                                   const std::string& line,
-                                   const std::string& header_if_new,
-                                   bool must_write);
-static bool spiffs_enqueue_cabrillo_job(const std::string& mycall,
-                                        const std::string& location,
-                                        const std::string& qso_line);
-static void spiffs_log_writer_task(void* arg);
+static bool spiffs_append_text_locked_path(const std::string& path,
+                                           const std::string& line,
+                                           const std::string& header_if_new,
+                                           bool sync_to_flash);
+static bool spiffs_write_cabrillo_fd_entry(const std::string& mycall,
+                                           const std::string& location,
+                                           const std::string& qso_line);
 #if !MIC_PROBE_APP
 void log_heap(const char* tag) {
   size_t free_sz = heap_caps_get_free_size(MALLOC_CAP_8BIT);
   size_t min_free = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
   size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
   ESP_LOGI(tag, "HEAP: free=%u min=%u largest=%u", (unsigned)free_sz, (unsigned)min_free, (unsigned)largest);
+}
+static void log_mem_caps(const char* tag) {
+  size_t free_8bit = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  size_t largest_8bit = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  size_t free_dma = heap_caps_get_free_size(MALLOC_CAP_DMA);
+  size_t largest_dma = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+  size_t min_8bit = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+  ESP_LOGI(tag,
+           "MEM: 8bit_free=%u 8bit_largest=%u internal_free=%u internal_largest=%u dma_free=%u dma_largest=%u 8bit_min=%u",
+           (unsigned)free_8bit,
+           (unsigned)largest_8bit,
+           (unsigned)free_internal,
+           (unsigned)largest_internal,
+           (unsigned)free_dma,
+           (unsigned)largest_dma,
+           (unsigned)min_8bit);
 }
 static std::string fd_trim(const std::string& s) {
   size_t a = 0, b = s.size();
@@ -1588,141 +1598,69 @@ static bool log_cabrillo_fd_entry(const std::string& dxcall, const std::string& 
            dxcall.c_str(),
            their_fd.c_str());
 
-  return spiffs_enqueue_cabrillo_job(g_call, location, qso_line);
+  return spiffs_write_cabrillo_fd_entry(g_call, location, qso_line);
 }
 
 #else
 static inline void log_heap(const char*) {}
+static inline void log_mem_caps(const char*) {}
 static bool log_cabrillo_fd_entry(const std::string&, const std::string&) { return true; }
 #endif
 
-static esp_err_t spiffs_append_text_locked(const SpiffsLogJob& job) {
-  spiffs_warn_if_low_space_locked(job.path.c_str());
+static bool spiffs_append_text_locked_path(const std::string& path,
+                                           const std::string& line,
+                                           const std::string& header_if_new,
+                                           bool sync_to_flash) {
+  SpiffsLockGuard guard;
+  if (!guard.held()) return false;
+
+  spiffs_warn_if_low_space_locked(path.c_str());
 
   bool need_header = false;
-  if (!job.header_if_new.empty()) {
+  if (!header_if_new.empty()) {
     struct stat st;
-    need_header = (stat(job.path.c_str(), &st) != 0 || st.st_size == 0);
+    need_header = (stat(path.c_str(), &st) != 0 || st.st_size == 0);
   }
 
-  FILE* f = fopen(job.path.c_str(), "a");
-  if (!f) return ESP_FAIL;
+  FILE* f = fopen(path.c_str(), "a");
+  if (!f) return false;
 
   bool ok = true;
   if (need_header) {
-    ok = fwrite(job.header_if_new.data(), 1, job.header_if_new.size(), f) == job.header_if_new.size();
+    ok = fwrite(header_if_new.data(), 1, header_if_new.size(), f) == header_if_new.size();
   }
-  if (ok && !job.line.empty()) {
-    ok = fwrite(job.line.data(), 1, job.line.size(), f) == job.line.size();
+  if (ok && !line.empty()) {
+    ok = fwrite(line.data(), 1, line.size(), f) == line.size();
   }
-  if (ok && job.must_write) {
+  if (ok && sync_to_flash) {
     ok = (fflush(f) == 0 && fsync(fileno(f)) == 0);
   }
   if (fclose(f) != 0) ok = false;
-  return ok ? ESP_OK : ESP_FAIL;
+  return ok;
 }
 
-static esp_err_t spiffs_write_cabrillo_locked(const SpiffsLogJob& job) {
+static bool spiffs_write_cabrillo_fd_entry(const std::string& mycall,
+                                           const std::string& location,
+                                           const std::string& qso_line) {
 #if !MIC_PROBE_APP
   const char* path = "/spiffs/fieldday.txt";
+  SpiffsLockGuard guard;
+  if (!guard.held()) return false;
+
   spiffs_warn_if_low_space_locked(path);
-  esp_err_t err = cabrillo_fd_ensure_header_locked(path, job.cabrillo_mycall, job.cabrillo_location);
-  if (err != ESP_OK) return err;
-  return cabrillo_fd_append_qso_with_end_locked(path, job.cabrillo_qso_line);
+  esp_err_t err = cabrillo_fd_ensure_header_locked(path, mycall, location);
+  if (err != ESP_OK) return false;
+  return cabrillo_fd_append_qso_with_end_locked(path, qso_line) == ESP_OK;
 #else
-  (void)job;
-  return ESP_OK;
+  (void)mycall;
+  (void)location;
+  (void)qso_line;
+  return true;
 #endif
-}
-
-static esp_err_t spiffs_write_log_job_once(SpiffsLogJob& job) {
-  SpiffsLockGuard guard(pdMS_TO_TICKS(250));
-  if (!guard.held()) return ESP_ERR_TIMEOUT;
-
-  switch (job.kind) {
-    case SpiffsLogJobKind::AppendText:
-      return spiffs_append_text_locked(job);
-    case SpiffsLogJobKind::CabrilloFd:
-      return spiffs_write_cabrillo_locked(job);
-  }
-  return ESP_FAIL;
-}
-
-static bool spiffs_enqueue_log_job(SpiffsLogJob* job, TickType_t timeout_ticks) {
-  if (!job) return false;
-  if (!spiffs_log_queue) {
-    delete job;
-    return false;
-  }
-  SpiffsLogJob* queued = job;
-  if (xQueueSend(spiffs_log_queue, &queued, timeout_ticks) == pdTRUE) {
-    return true;
-  }
-  if (!job->must_write) {
-    g_rxtx_log_dropped++;
-  }
-  delete job;
-  return false;
-}
-
-static bool spiffs_append_text_job(const std::string& path,
-                                   const std::string& line,
-                                   const std::string& header_if_new,
-                                   bool must_write) {
-  SpiffsLogJob* job = new (std::nothrow) SpiffsLogJob();
-  if (!job) return false;
-  job->kind = SpiffsLogJobKind::AppendText;
-  job->path = path;
-  job->line = line;
-  job->header_if_new = header_if_new;
-  job->must_write = must_write;
-  return spiffs_enqueue_log_job(job, must_write ? pdMS_TO_TICKS(250) : 0);
-}
-
-static bool spiffs_enqueue_cabrillo_job(const std::string& mycall,
-                                        const std::string& location,
-                                        const std::string& qso_line) {
-  SpiffsLogJob* job = new (std::nothrow) SpiffsLogJob();
-  if (!job) return false;
-  job->kind = SpiffsLogJobKind::CabrilloFd;
-  job->cabrillo_mycall = mycall;
-  job->cabrillo_location = location;
-  job->cabrillo_qso_line = qso_line;
-  job->must_write = true;
-  return spiffs_enqueue_log_job(job, pdMS_TO_TICKS(250));
-}
-
-static void spiffs_log_writer_task(void* /*arg*/) {
-  while (true) {
-    SpiffsLogJob* job = nullptr;
-    if (xQueueReceive(spiffs_log_queue, &job, portMAX_DELAY) != pdTRUE || !job) {
-      continue;
-    }
-
-    int retry_delay_ms = 80;
-    while (true) {
-      esp_err_t err = spiffs_write_log_job_once(*job);
-      if (err == ESP_OK) break;
-
-      if (!job->must_write) {
-        ESP_LOGW(TAG, "Dropped RT log write: %s", job->path.c_str());
-        break;
-      }
-
-      ESP_LOGW(TAG, "SPIFFS log write failed (%s), retrying: %s",
-               esp_err_to_name(err),
-               job->kind == SpiffsLogJobKind::AppendText ? job->path.c_str() : "/spiffs/fieldday.txt");
-      vTaskDelay(pdMS_TO_TICKS(retry_delay_ms));
-      retry_delay_ms = std::min(retry_delay_ms * 2, 2000);
-    }
-
-    delete job;
-  }
 }
 
 static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text, int repeat_counter) {
   if (!g_rxtx_log) return;
-  if (!spiffs_log_queue) return;
 
   time_t now = (time_t)(rtc_now_ms() / 1000);
   struct tm t;
@@ -1745,12 +1683,11 @@ static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& t
              dir, ts, freq_mhz, text.c_str(), snr, offset_hz);
   }
   (void)repeat_counter;
-  spiffs_append_text_job(log_path, line, "", false);
+  (void)spiffs_append_text_locked_path(log_path, line, "", false);
 }
 
 static bool log_gps_grid_line(const std::string& grid8) {
   if (!g_rxtx_log) return false;
-  if (!spiffs_log_queue) return false;
   if (grid8.size() != 8) return false;
 
   // GPS grid breadcrumbs use RT files but not log_rxtx_line(), which appends
@@ -1769,8 +1706,8 @@ static bool log_gps_grid_line(const std::string& grid8) {
 
   char line[128];
   snprintf(line, sizeof(line), "G [%s][%.3f] %s\n", ts, freq_mhz, grid8.c_str());
-  bool ok = spiffs_append_text_job(log_path, line, "", false);
-  if (ok) ESP_LOGI(TAG, "GPS grid queued: %s", grid8.c_str());
+  bool ok = spiffs_append_text_locked_path(log_path, line, "", false);
+  if (ok) ESP_LOGI(TAG, "GPS grid logged: %s", grid8.c_str());
   return ok;
 }
 
@@ -1787,6 +1724,7 @@ static void qso_load_file_list() {
   g_q_files.clear();
   g_q_entries.clear();
   g_q_lines.clear();
+  g_q_entries_have_next_page = false;
   SpiffsLockGuard guard;
   if (!guard.held()) {
     g_q_lines.push_back("No QSO logs");
@@ -1852,6 +1790,7 @@ static void qso_load_fetch_file_list() {
   g_q_files.clear();
   g_q_entries.clear();
   g_q_lines.clear();
+  g_q_entries_have_next_page = false;
   load_spiffs_regular_files(g_q_files);
   if (g_q_files.empty()) {
     g_q_lines.push_back("No SPIFFS files");
@@ -1920,67 +1859,83 @@ static void qso_rebuild_entry_lines() {
 static void qso_load_entries(const std::string& path) {
   g_q_entries.clear();
   g_q_lines.clear();
+  g_q_entries_have_next_page = false;
   std::string full = std::string("/spiffs/") + path;
-  SpiffsLockGuard guard;
-  if (!guard.held()) {
-    g_q_lines.push_back("Open fail");
-    return;
-  }
-  FILE* f = fopen(full.c_str(), "r");
-  if (!f) {
-    g_q_lines.push_back("Open fail");
-    return;
-  }
-  char line[512];
-  while (fgets(line, sizeof(line), f)) {
-    std::string s(line);
-    std::string s_lower = s;
-    std::transform(s_lower.begin(), s_lower.end(), s_lower.begin(),
-                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    if (s_lower.find("<call:") == std::string::npos) continue;
-    auto get_field = [&](const std::string& tag)->std::string {
-      size_t p = s_lower.find("<" + tag);
-      if (p == std::string::npos) return "";
-      size_t gt = s.find('>', p);
-      if (gt == std::string::npos) return "";
-      size_t end_space = s.find(' ', gt + 1);
-      size_t end_tag = s.find('<', gt + 1);
-      size_t end = s.size();
-      if (end_space != std::string::npos && end_space < end) end = end_space;
-      if (end_tag != std::string::npos && end_tag < end) end = end_tag;
-      return s.substr(gt + 1, end - gt - 1);
-    };
-    std::string call = get_field("call:");
-    std::string time_on = get_field("time_on:");
-    std::string freq = get_field("freq:");
-    std::string rst_rcvd_raw = get_field("rst_rcvd:");
-    std::string rst_sent_raw = get_field("rst_sent:");
-    std::string band = freq;
-    if (!freq.empty()) {
-      // crude map: take MHz and map to band name from our band list
-      double mhz = atof(freq.c_str());
-      for (const auto& b : g_bands) {
-        double bm = b.freq * 0.001;
-        if (fabs(bm - mhz) < 0.1) { band = b.name; break; }
-      }
-    }
-    if (time_on.size() >= 4) {
-      time_on = time_on.substr(0,4);
-      time_on.insert(2, ":");
-    }
-    if (time_on.size() != 5) time_on = "??:??";
-    if (call.empty()) call = "?";
-    if (band.empty()) band = freq.empty() ? "?" : freq;
 
-    QsoLogEntry e;
-    e.time_on = time_on;
-    e.band = band;
-    e.call = call;
-    e.has_rst_rcvd = qso_parse_rst(rst_rcvd_raw, e.rst_rcvd);
-    e.has_rst_sent = qso_parse_rst(rst_sent_raw, e.rst_sent);
-    g_q_entries.push_back(e);
+  {
+    SpiffsLockGuard guard;
+    if (!guard.held()) {
+      g_q_lines.push_back("Open fail");
+      return;
+    }
+    FILE* f = fopen(full.c_str(), "r");
+    if (!f) {
+      g_q_lines.push_back("Open fail");
+      return;
+    }
+
+    const int first_qso = std::max(0, q_page) * 6;
+    int qso_index = 0;
+    int page_count = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+      std::string s(line);
+      std::string s_lower = s;
+      std::transform(s_lower.begin(), s_lower.end(), s_lower.begin(),
+                     [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+      if (s_lower.find("<call:") == std::string::npos) continue;
+      if (qso_index++ < first_qso) continue;
+      if (page_count >= 6) {
+        g_q_entries_have_next_page = true;
+        break;
+      }
+
+      auto get_field = [&](const std::string& tag)->std::string {
+        size_t p = s_lower.find("<" + tag);
+        if (p == std::string::npos) return "";
+        size_t gt = s.find('>', p);
+        if (gt == std::string::npos) return "";
+        size_t end_space = s.find(' ', gt + 1);
+        size_t end_tag = s.find('<', gt + 1);
+        size_t end = s.size();
+        if (end_space != std::string::npos && end_space < end) end = end_space;
+        if (end_tag != std::string::npos && end_tag < end) end = end_tag;
+        return s.substr(gt + 1, end - gt - 1);
+      };
+      std::string call = get_field("call:");
+      std::string time_on = get_field("time_on:");
+      std::string freq = get_field("freq:");
+      std::string rst_rcvd_raw = get_field("rst_rcvd:");
+      std::string rst_sent_raw = get_field("rst_sent:");
+      std::string band = freq;
+      if (!freq.empty()) {
+        // crude map: take MHz and map to band name from our band list
+        double mhz = atof(freq.c_str());
+        for (const auto& b : g_bands) {
+          double bm = b.freq * 0.001;
+          if (fabs(bm - mhz) < 0.1) { band = b.name; break; }
+        }
+      }
+      if (time_on.size() >= 4) {
+        time_on = time_on.substr(0,4);
+        time_on.insert(2, ":");
+      }
+      if (time_on.size() != 5) time_on = "??:??";
+      if (call.empty()) call = "?";
+      if (band.empty()) band = freq.empty() ? "?" : freq;
+
+      QsoLogEntry e;
+      e.time_on = time_on;
+      e.band = band;
+      e.call = call;
+      e.has_rst_rcvd = qso_parse_rst(rst_rcvd_raw, e.rst_rcvd);
+      e.has_rst_sent = qso_parse_rst(rst_sent_raw, e.rst_sent);
+      g_q_entries.push_back(e);
+      page_count++;
+    }
+    fclose(f);
   }
-  fclose(f);
+
   qso_rebuild_entry_lines();
 }
 
@@ -1995,8 +1950,6 @@ static void qso_draw_page() {
 }
 
 static bool log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd) {
-  if (!spiffs_log_queue) return false;
-
   time_t now = (time_t)(rtc_now_ms() / 1000);
   struct tm t;
   localtime_r(&now, &t);
@@ -2053,10 +2006,10 @@ static bool log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
            rst_sent_buf, rst_rcvd_buf,
            comment_expanded.size(), comment_expanded.c_str());
 
-  return spiffs_append_text_job(path,
-                                std::string(line_buf.data(), (size_t)n),
-                                "ADIF EXPORT\n<eoh>\n",
-                                true);
+  return spiffs_append_text_locked_path(path,
+                                        std::string(line_buf.data(), (size_t)n),
+                                        "ADIF EXPORT\n<eoh>\n",
+                                        true);
 }
 
 
@@ -2176,8 +2129,12 @@ struct WAVHeader {
   mon_cfg.freq_osr = g_freq_osr;
   mon_cfg.protocol = FTX_PROTOCOL_FT8;
 
-  monitor_t mon;
-  monitor_init(&mon, &mon_cfg);
+  monitor_t mon = {};
+  if (!monitor_init(&mon, &mon_cfg)) {
+    ESP_LOGE(TAG, "Monitor init failed");
+    fclose(f);
+    return ESP_ERR_NO_MEM;
+  }
   monitor_reset(&mon);
 
   float* chunk = (float*)malloc(sizeof(float) * mon.block_size);
@@ -2459,7 +2416,14 @@ static bool start_rx_audio_for_current_radio(const char* reason, bool notify_cat
   debug_log_line(std::string("Audio start ") + mode);
   debug_log_line(std::string("Audio bind ") + backend);
 
-  if (!audio_source_start()) {
+  const bool is_uac_backend =
+      std::strcmp(backend, "qmx_uac") == 0 ||
+      std::strcmp(backend, "usb_uac_generic") == 0;
+  if (is_uac_backend) log_mem_caps("UAC_BEFORE_START");
+  bool audio_started = audio_source_start();
+  if (is_uac_backend) log_mem_caps("UAC_AFTER_START");
+
+  if (!audio_started) {
     ESP_LOGW(TAG, "RX audio start failed radio=%s backend=%s reason=%s",
              mode,
              backend,
@@ -4464,7 +4428,11 @@ static void ble_page_meta(int& cur, int& total) {
       cur = d_page + 1;
       break;
     case UIMode::QSO:
-      total = page_count((int)g_q_lines.size(), 6);
+      if (g_q_show_entries) {
+        total = q_page + (g_q_entries_have_next_page ? 2 : 1);
+      } else {
+        total = page_count((int)g_q_lines.size(), 6);
+      }
       cur = q_page + 1;
       break;
     default:
@@ -5093,7 +5061,7 @@ static void host_handle_line(const std::string& line_in) {
       send("ERROR: active log protected");
     } else {
       std::string path = std::string("/spiffs/") + fname;
-      if (!spiffs_lock_take(pdMS_TO_TICKS(500))) {
+      if (!spiffs_lock_take()) {
         send("ERROR: spiffs busy");
       } else {
         FILE* f = fopen(path.c_str(), "wb");
@@ -5759,13 +5727,8 @@ static void app_task_core0(void* /*param*/) {
   }
   ESP_ERROR_CHECK(spiffs_ret);
 
-  spiffs_mutex = xSemaphoreCreateRecursiveMutex();
-  ESP_ERROR_CHECK(spiffs_mutex ? ESP_OK : ESP_ERR_NO_MEM);
-  spiffs_log_queue = xQueueCreate(32, sizeof(SpiffsLogJob*));
-  ESP_ERROR_CHECK(spiffs_log_queue ? ESP_OK : ESP_ERR_NO_MEM);
-  BaseType_t log_task_ok = xTaskCreatePinnedToCore(spiffs_log_writer_task, "spiffs_log",
-                                                   6144, nullptr, 3, nullptr, 0);
-  ESP_ERROR_CHECK(log_task_ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+  spiffs_mutex_init();
+  log_mem_caps("SPIFFS_MUTEX_INIT");
 
   sync_station_txt_from_sd_to_spiffs();
   board_power_init();
@@ -6476,9 +6439,9 @@ static void app_task_core0(void* /*param*/) {
                   g_q_page_view = QPageView::Default;
                 }
                 g_q_current_file = selected_file;
-                qso_load_entries(g_q_current_file);
                 g_q_show_entries = true;
                 q_page = 0;
+                qso_load_entries(g_q_current_file);
                 qso_draw_page();
               }
             }
@@ -6496,9 +6459,17 @@ static void app_task_core0(void* /*param*/) {
                 qso_draw_page();
               }
             } else if (c == ';') {
-              if (q_page > 0) { q_page--; qso_draw_page(); }
+              if (q_page > 0) {
+                q_page--;
+                qso_load_entries(g_q_current_file);
+                qso_draw_page();
+              }
             } else if (c == '.') {
-              if ((q_page + 1) * 6 < (int)g_q_lines.size()) { q_page++; qso_draw_page(); }
+              if (g_q_entries_have_next_page) {
+                q_page++;
+                qso_load_entries(g_q_current_file);
+                qso_draw_page();
+              }
             } else if (c == '`') {
               // back to file list
               g_q_show_entries = false;

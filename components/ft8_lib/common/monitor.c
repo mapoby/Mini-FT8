@@ -70,8 +70,15 @@ static void waterfall_free(ftx_waterfall_t* me)
     }
 }
 
-void monitor_init(monitor_t* me, const monitor_config_t* cfg)
+bool monitor_init(monitor_t* me, const monitor_config_t* cfg)
 {
+    if (me == NULL || cfg == NULL || cfg->time_osr <= 0 || cfg->freq_osr <= 0)
+    {
+        return false;
+    }
+
+    memset(me, 0, sizeof(*me));
+
     float slot_time = (cfg->protocol == FTX_PROTOCOL_FT4) ? FT4_SLOT_TIME : FT8_SLOT_TIME;
     float symbol_period = (cfg->protocol == FTX_PROTOCOL_FT4) ? FT4_SYMBOL_PERIOD : FT8_SYMBOL_PERIOD;
     // Compute DSP parameters that depend on the sample rate
@@ -97,8 +104,9 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
     fft_work_buf = (uint8_t*)malloc(fft_needed);
     if (fft_work_buf == NULL || fft_plan_init_with_buffer(&me->fft_plan, me->nfft, fft_work_buf, fft_needed) != 0)
     {
-        LOG(LOG_ERROR, "FFT plan init failed\n");
-        return;
+        LOG(LOG_ERROR, "FFT plan init failed (need %zu bytes)\n", fft_needed);
+        monitor_free(me);
+        return false;
     }
 
     // Allocate waterfall next — use static buffer to avoid heap fragmentation
@@ -118,7 +126,7 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
         {
             LOG(LOG_ERROR, "Waterfall alloc failed (%zu bytes)\n", wf_bytes);
             monitor_free(me);
-            return;
+            return false;
         }
     }
 
@@ -133,7 +141,7 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
     {
         LOG(LOG_ERROR, "Monitor nfft %d exceeds static buffer %d\n", me->nfft, MONITOR_NFFT_MAX);
         monitor_free(me);
-        return;
+        return false;
     }
     window_buf = window_static;
     last_frame_buf = last_frame_static;
@@ -163,20 +171,28 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
     me->symbol_period = symbol_period;
 
     me->max_mag = -120.0f;
+    return true;
 }
 
 void monitor_free(monitor_t* me)
 {
+    if (me == NULL)
+        return;
+
     waterfall_free(&me->wf);
     fft_plan_free(&me->fft_plan);
     // window_buf and last_frame_buf are static arrays — just NULL the pointers
     window_buf = NULL;
     last_frame_buf = NULL;
     if (fft_work_buf) { free(fft_work_buf); fft_work_buf = NULL; }
+    memset(me, 0, sizeof(*me));
 }
 
 void monitor_reset(monitor_t* me)
 {
+    if (me == NULL)
+        return;
+
     me->wf.num_blocks = 0;
     me->max_mag = -120.0f;
 }
@@ -184,6 +200,10 @@ void monitor_reset(monitor_t* me)
 // Compute FFT magnitudes (log wf) for a frame in the signal and update waterfall data
 void monitor_process(monitor_t* me, const float* frame)
 {
+    if (me == NULL || frame == NULL || me->fft_plan.cfg == NULL || me->wf.mag == NULL ||
+        me->window == NULL || me->last_frame == NULL)
+        return;
+
     // Check if we can still store more waterfall data
     if (me->wf.num_blocks >= me->wf.max_blocks)
         return;

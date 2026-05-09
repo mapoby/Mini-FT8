@@ -7,6 +7,7 @@ extern "C"
 #endif
 
 #include <stddef.h>
+#include <stdbool.h>
 
 // Use relative paths so it works in Arduino sketch without extra include path
 #include "../ft8/decode.h"
@@ -48,7 +49,7 @@ typedef struct
 #endif
 } monitor_t;
 
-void monitor_init(monitor_t* me, const monitor_config_t* cfg);
+bool monitor_init(monitor_t* me, const monitor_config_t* cfg);
 void monitor_reset(monitor_t* me);
 void monitor_process(monitor_t* me, const float* frame);
 void monitor_free(monitor_t* me);

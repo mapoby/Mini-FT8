@@ -98,13 +98,6 @@ void ft8_audio_pipeline_run(const ft8_audio_pipeline_config_t* cfg)
     if (!cfg || !cfg->read || !cfg->should_stop) return;
     const char* tag = cfg->tag ? cfg->tag : "FT8_AUDIO";
 
-    int64_t now_ms = rtc_now_ms();
-    int64_t rem = now_ms % 15000;
-    int64_t wait_ms = (rem < 100) ? 0 : (15000 - rem);
-    if (wait_ms > 0) {
-        vTaskDelay(pdMS_TO_TICKS((uint32_t)wait_ms));
-    }
-
     monitor_config_t mon_cfg = {
         .f_min = 200.0f,
         .f_max = 2900.0f,
@@ -115,11 +108,13 @@ void ft8_audio_pipeline_run(const ft8_audio_pipeline_config_t* cfg)
     };
 
     log_heap("AUDIO_PIPE_BEFORE_MONITOR_INIT");
-    monitor_t mon;
-    monitor_init(&mon, &mon_cfg);
+    monitor_t mon = {};
+    if (!monitor_init(&mon, &mon_cfg)) {
+        log_heap("AUDIO_PIPE_MONITOR_INIT_FAIL");
+        ESP_LOGE(tag, "monitor init failed");
+        return;
+    }
     log_heap("AUDIO_PIPE_AFTER_MONITOR_INIT");
-
-    monitor_reset(&mon);
 
     float* ft8_buffer = (float*)heap_caps_malloc(sizeof(float) * mon.block_size, MALLOC_CAP_DEFAULT);
     float* temp_dec = (float*)heap_caps_malloc(sizeof(float) * 512, MALLOC_CAP_DEFAULT);
@@ -132,6 +127,15 @@ void ft8_audio_pipeline_run(const ft8_audio_pipeline_config_t* cfg)
         monitor_free(&mon);
         return;
     }
+
+    int64_t now_ms = rtc_now_ms();
+    int64_t rem = now_ms % 15000;
+    int64_t wait_ms = (rem < 100) ? 0 : (15000 - rem);
+    if (wait_ms > 0) {
+        vTaskDelay(pdMS_TO_TICKS((uint32_t)wait_ms));
+    }
+
+    monitor_reset(&mon);
 
     const int target_blocks = 80;
     int ft8_buffer_idx = 0;
