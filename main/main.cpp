@@ -44,6 +44,7 @@ extern "C" {
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_system.h"
+#include "esp_freertos_hooks.h"
 #include "esp_random.h"
 #include <cctype>
 #include <cstdlib>
@@ -1084,7 +1085,7 @@ static bool rewrite_dxpedition_for_mycall(const std::string& raw_text,
 }
 
 static const char* TAG = "FT8";
-enum class UIMode { RX, TX, BAND, MENU, CONTROL, DEBUG, STATUS, QSO, GPS };
+enum class UIMode { RX, TX, BAND, MENU, CONTROL, DEBUG, STATUS, QSO, GPS, PERF };
 static UIMode ui_mode = UIMode::RX;
 static int tx_page = 0;
 // NOTE: previous `std::vector<UiRxLine> g_rx_lines` was removed to eliminate
@@ -1154,6 +1155,12 @@ static constexpr uint32_t APP_CORE0_STACK_BYTES = 12288; // Tune to 16384/18432 
 static TickType_t g_app_core0_stack_last_sample_tick = 0;
 static uint32_t g_app_core0_stack_cur_free_bytes = 0;
 static uint32_t g_app_core0_stack_min_free_bytes = 0;
+static volatile uint32_t g_perf_idle_count[2] = {0, 0};
+static uint32_t g_perf_prev_idle_count[2] = {0, 0};
+static TickType_t g_perf_prev_sample_tick = 0;
+static uint8_t g_perf_cpu_busy_pct[2] = {0, 0};
+static bool g_perf_cpu_hook_ok[2] = {false, false};
+static bool g_perf_cpu_sample_valid = false;
 static bool g_ble_qso_pick_mode = false;
 static bool g_ble_dump_in_progress = false;
 static UIMode g_ble_qso_return_mode = UIMode::RX;
@@ -1206,7 +1213,7 @@ static std::vector<std::string> g_startup_lines = {
     "** Mini-FT8 V2.0.4 *",
     " S/R/T: Operate",
     " M/N/O: Menu",
-    " Q/F/D: File",
+    " Q/F/D/P: Tool",
     "      * * * * *     ",
     "  By N6HAN & AG6AQ "
 };
@@ -1222,6 +1229,7 @@ static bool is_startup_direct_mode_key(char c) {
     case 'T':
     case 'G':
     case 'Q':
+    case 'P':
     case 'M':
     case 'N':
     case 'O':
@@ -4114,6 +4122,155 @@ static void draw_status_view() {
   }
 }
 
+static bool perf_idle_hook_cpu0() {
+  g_perf_idle_count[0] = g_perf_idle_count[0] + 1u;
+  return true;
+}
+
+static bool perf_idle_hook_cpu1() {
+  g_perf_idle_count[1] = g_perf_idle_count[1] + 1u;
+  return true;
+}
+
+static uint8_t perf_busy_percent(uint32_t idle_delta, TickType_t tick_delta) {
+  if (tick_delta == 0) return 0;
+  uint32_t idle_pct = ((idle_delta * 100u) + ((uint32_t)tick_delta / 2u)) / (uint32_t)tick_delta;
+  if (idle_pct > 100u) idle_pct = 100u;
+  return (uint8_t)(100u - idle_pct);
+}
+
+static void perf_monitor_sample(TickType_t now_ticks) {
+  if (g_perf_prev_sample_tick == 0) {
+    g_perf_prev_sample_tick = now_ticks;
+    g_perf_prev_idle_count[0] = g_perf_idle_count[0];
+    g_perf_prev_idle_count[1] = g_perf_idle_count[1];
+    return;
+  }
+
+  TickType_t tick_delta = now_ticks - g_perf_prev_sample_tick;
+  if (tick_delta == 0) return;
+
+  for (int core = 0; core < 2; ++core) {
+    uint32_t idle_now = g_perf_idle_count[core];
+    uint32_t idle_delta = idle_now - g_perf_prev_idle_count[core];
+    g_perf_prev_idle_count[core] = idle_now;
+    if (g_perf_cpu_hook_ok[core]) {
+      g_perf_cpu_busy_pct[core] = perf_busy_percent(idle_delta, tick_delta);
+    }
+  }
+
+  g_perf_prev_sample_tick = now_ticks;
+  g_perf_cpu_sample_valid = g_perf_cpu_hook_ok[0] || g_perf_cpu_hook_ok[1];
+}
+
+static void perf_monitor_init() {
+  static bool initialized = false;
+  if (initialized) return;
+
+  esp_err_t err0 = esp_register_freertos_idle_hook_for_cpu(perf_idle_hook_cpu0, 0);
+  if (err0 == ESP_OK) {
+    g_perf_cpu_hook_ok[0] = true;
+  } else {
+    ESP_LOGW(TAG, "CPU0 perf idle hook failed: %s", esp_err_to_name(err0));
+  }
+
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+  esp_err_t err1 = esp_register_freertos_idle_hook_for_cpu(perf_idle_hook_cpu1, 1);
+  if (err1 == ESP_OK) {
+    g_perf_cpu_hook_ok[1] = true;
+  } else {
+    ESP_LOGW(TAG, "CPU1 perf idle hook failed: %s", esp_err_to_name(err1));
+  }
+#endif
+
+  g_perf_prev_sample_tick = xTaskGetTickCount();
+  g_perf_prev_idle_count[0] = g_perf_idle_count[0];
+  g_perf_prev_idle_count[1] = g_perf_idle_count[1];
+  initialized = true;
+}
+
+static uint16_t perf_color_for_pct(uint8_t pct) {
+  if (pct >= 85) return TFT_RED;
+  if (pct >= 65) return TFT_YELLOW;
+  return TFT_GREEN;
+}
+
+static unsigned perf_kib_rounded(size_t bytes) {
+  return (unsigned)((bytes + 512u) / 1024u);
+}
+
+static uint8_t perf_heap_used_pct(uint32_t caps, size_t free_bytes) {
+  size_t total = heap_caps_get_total_size(caps);
+  if (total == 0 || free_bytes >= total) return 0;
+  return (uint8_t)(((total - free_bytes) * 100u + (total / 2u)) / total);
+}
+
+static void perf_make_cpu_line(char* out, size_t out_len, int core) {
+  char bar[9];
+  uint8_t pct = g_perf_cpu_busy_pct[core];
+  int filled = g_perf_cpu_sample_valid && g_perf_cpu_hook_ok[core] ? (pct * 8 + 50) / 100 : 0;
+  if (filled < 0) filled = 0;
+  if (filled > 8) filled = 8;
+  for (int i = 0; i < 8; ++i) bar[i] = (i < filled) ? '#' : '-';
+  bar[8] = '\0';
+
+  if (g_perf_cpu_sample_valid && g_perf_cpu_hook_ok[core]) {
+    snprintf(out, out_len, "C%d %3u%% [%s]", core, (unsigned)pct, bar);
+  } else {
+    snprintf(out, out_len, "C%d --%% [%s]", core, bar);
+  }
+}
+
+static void perf_make_heap_line(char* out, size_t out_len, const char* label, uint32_t caps) {
+  size_t free_bytes = heap_caps_get_free_size(caps);
+  size_t largest = heap_caps_get_largest_free_block(caps);
+  uint8_t used_pct = perf_heap_used_pct(caps, free_bytes);
+  snprintf(out, out_len, "%s %3u%% F%uK L%uK",
+           label,
+           (unsigned)used_pct,
+           perf_kib_rounded(free_bytes),
+           perf_kib_rounded(largest));
+}
+
+static void draw_perf_view(bool force_redraw) {
+  static char last_lines[6][32] = {{0}};
+  char lines[6][32];
+  uint16_t colors[6] = {
+      perf_color_for_pct(g_perf_cpu_busy_pct[0]),
+      perf_color_for_pct(g_perf_cpu_busy_pct[1]),
+      TFT_WHITE,
+      TFT_WHITE,
+      TFT_WHITE,
+      TFT_WHITE,
+  };
+
+  perf_make_cpu_line(lines[0], sizeof(lines[0]), 0);
+  perf_make_cpu_line(lines[1], sizeof(lines[1]), 1);
+  perf_make_heap_line(lines[2], sizeof(lines[2]), "8B", MALLOC_CAP_8BIT);
+  perf_make_heap_line(lines[3], sizeof(lines[3]), "IN", MALLOC_CAP_INTERNAL);
+  perf_make_heap_line(lines[4], sizeof(lines[4]), "DM", MALLOC_CAP_DMA);
+  snprintf(lines[5], sizeof(lines[5]), "ST C%uK M%uK",
+           perf_kib_rounded(g_app_core0_stack_cur_free_bytes),
+           perf_kib_rounded(g_app_core0_stack_min_free_bytes));
+
+  const int line_h = 19;
+  const int start_y = 18 + 3 + 3;
+  M5.Display.startWrite();
+  M5.Display.setTextSize(2);
+  for (int i = 0; i < 6; ++i) {
+    ui_set_visible_text_line(i, lines[i]);
+    if (force_redraw || strcmp(last_lines[i], lines[i]) != 0) {
+      snprintf(last_lines[i], sizeof(last_lines[i]), "%s", lines[i]);
+      int y = start_y + i * line_h;
+      M5.Display.fillRect(0, y, 240, line_h, TFT_BLACK);
+      M5.Display.setTextColor(colors[i], TFT_BLACK);
+      M5.Display.setCursor(0, y);
+      M5.Display.printf("%s", lines[i]);
+    }
+  }
+  M5.Display.endWrite();
+}
+
 static void debug_ensure_hud_lines() {
   while (g_debug_lines.size() < DEBUG_HUD_LINES) {
     g_debug_lines.emplace_back();
@@ -4400,6 +4557,7 @@ static const char* ble_page_label(UIMode mode) {
     case UIMode::STATUS: return "STATUS";
     case UIMode::QSO: return "QSO";
     case UIMode::GPS: return "GPS";
+    case UIMode::PERF: return "PERF";
   }
   return "PAGE";
 }
@@ -5545,6 +5703,9 @@ static void enter_mode(UIMode new_mode) {
     case UIMode::GPS:
       draw_gps_view(true);
       break;
+    case UIMode::PERF:
+      draw_perf_view(true);
+      break;
   }
 }
 
@@ -5783,6 +5944,7 @@ static void app_task_core0(void* /*param*/) {
     g_app_core0_stack_min_free_bytes = free_bytes;
     debug_update_app_core0_stack_hud(false);
   }
+  perf_monitor_init();
 
   // Key injection queue for console UART RX (G15)
   s_key_inject_queue = xQueueCreate(32, sizeof(char));
@@ -5864,6 +6026,10 @@ static void app_task_core0(void* /*param*/) {
         g_app_core0_stack_min_free_bytes = free_bytes;
       }
       debug_update_app_core0_stack_hud(true);
+      perf_monitor_sample(now_ticks);
+      if (ui_mode == UIMode::PERF) {
+        draw_perf_view(false);
+      }
     }
     // Startup screen overlay on RX page: show until any key press, and only once
     if (g_startup_active) {
@@ -5937,6 +6103,9 @@ static void app_task_core0(void* /*param*/) {
           break;
         case 'S':
           enter_mode(UIMode::STATUS);
+          break;
+        case 'P':
+          enter_mode(UIMode::PERF);
           break;
         case 'M':
           enter_mode(UIMode::MENU);
@@ -6150,11 +6319,13 @@ static void app_task_core0(void* /*param*/) {
       else if (c == 'd' || c == 'D') { cancel_status_edit(); enter_mode(ui_mode == UIMode::DEBUG ? UIMode::RX : UIMode::DEBUG); switched = true; }
       else if (c == 's' || c == 'S') { cancel_status_edit(); enter_mode(ui_mode == UIMode::STATUS ? UIMode::RX : UIMode::STATUS); switched = true; }
       else if (c == 'g' || c == 'G') { cancel_status_edit(); enter_mode(ui_mode == UIMode::GPS ? UIMode::RX : UIMode::GPS); switched = true; }
+      else if (!c_from_ble && (c == 'p' || c == 'P')) { cancel_status_edit(); enter_mode(ui_mode == UIMode::PERF ? UIMode::RX : UIMode::PERF); switched = true; }
     }
 
   if (!switched && c) {
     // Mode-specific handling
     switch (ui_mode) {
+      case UIMode::PERF: break;
       case UIMode::GPS: break;
       case UIMode::RX: {
         int sel = ui_handle_rx_key(c);
