@@ -5900,7 +5900,7 @@ static void app_task_core0(void* /*param*/) {
     .base_path = "/spiffs",
     .partition_label = NULL,
     .max_files = 8,
-    .format_if_mount_failed = false
+    .format_if_mount_failed = true
   };
   esp_err_t spiffs_ret = esp_vfs_spiffs_register(&conf);
   if (spiffs_ret != ESP_OK) {
