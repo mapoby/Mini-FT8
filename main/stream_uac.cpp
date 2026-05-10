@@ -2,6 +2,8 @@
 #include "ft8_audio_pipeline.h"
 #include "resample.h"
 #include "dds_q15.h"
+#include "feature_flags.h"
+#include "protocol.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -31,18 +33,22 @@ int64_t rtc_now_ms();
 // Task priorities and stack sizes
 #define USB_HOST_TASK_PRIORITY  5
 #define UAC_TASK_PRIORITY       5
+// Below the USB host task (5) so CDC-ACM CAT TX to the QMX is never
+// preempted by audio-pipeline work.
 #define UAC_STREAM_TASK_PRIORITY 4
 #define TASK_STACK_SIZE         4096
 #define STREAM_TASK_STACK_SIZE  8192
 
-// UAC read buffer size (bytes) - must be multiple of 288 (USB transfer size at 48kHz/24bit/stereo)
-// 288 bytes = 48 stereo samples per 1ms USB transfer, 2304 = 288 * 8
+// UAC read buffer size (bytes) - must be multiple of 288 (USB transfer size at 48kHz/24bit/stereo).
+// 288 bytes = 48 stereo samples per 1 ms USB transfer; 2304 = 8 transfers = 8 ms of audio.
+// Kept at 8 transfers: the DMA buffer lives in BSS (DMA_ATTR), so larger
+// values directly increase static internal DRAM use.
 #define UAC_READ_BUFFER_SIZE    2304
 
-// USB host DMAs into this buffer. Placed in DMA-capable BSS via DMA_ATTR so
-// task start-up doesn't depend on finding a large DMA-capable heap block —
-// previously heap_caps_malloc(MALLOC_CAP_DMA) failed under fragmentation
-// even when raw free bytes looked sufficient (alignment eats into runs).
+// USB host DMA buffer — placed in DMA-capable BSS via DMA_ATTR so task
+// startup doesn't depend on finding a large DMA-aligned heap block under
+// fragmentation (heap_caps_malloc(MALLOC_CAP_DMA) can fail even when raw
+// free bytes look sufficient because alignment requirements eat contiguous runs).
 static DMA_ATTR uint8_t s_usb_buffer[UAC_READ_BUFFER_SIZE];
 
 typedef struct {
@@ -550,11 +556,27 @@ static void uac_lib_task(void* arg) {
                     // Try to open companion CDC-ACM interface (CAT)
                     cdc_try_open();
 
-                    // Start the audio processing task using a STATIC stack
-                    // (BSS) so task creation doesn't depend on finding a
-                    // contiguous 8 KB block in a fragmented heap.
+                    // Start the audio processing task.
+                    //
+                    // FT4's decoder needs a larger stack than FT8. Keep the
+                    // FT8 stack static and allocate the FT4 stack on demand.
                     if (s_stream_task_handle == NULL) {
-                        static StackType_t  s_stream_task_stack[STREAM_TASK_STACK_SIZE / sizeof(StackType_t)];
+#if ENABLE_FT4
+                        if (g_protocol == &kProtocolFT4) {
+                            BaseType_t cr = xTaskCreatePinnedToCore(
+                                stream_uac_task, "stream_uac",
+                                16384, NULL,
+                                UAC_STREAM_TASK_PRIORITY,
+                                &s_stream_task_handle, 1);
+                            if (cr != pdPASS) {
+                                ESP_LOGE(TAG, "stream_uac_task create FAILED (dynamic FT4) free=%u",
+                                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
+                                s_stream_task_handle = NULL;
+                            }
+                        } else {
+#endif
+                        // FT8 uses the existing static 8 KB stack.
+                        static StackType_t  s_stream_task_stack[8192 / sizeof(StackType_t)];
                         static StaticTask_t s_stream_task_tcb;
                         size_t free_before = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
                         size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
@@ -562,14 +584,17 @@ static void uac_lib_task(void* arg) {
                                  (unsigned)free_before, (unsigned)largest);
                         s_stream_task_handle = xTaskCreateStaticPinnedToCore(
                             stream_uac_task, "stream_uac",
-                            STREAM_TASK_STACK_SIZE / sizeof(StackType_t), NULL,
+                            8192 / sizeof(StackType_t), NULL,
                             UAC_STREAM_TASK_PRIORITY,
                             s_stream_task_stack, &s_stream_task_tcb, 1);
                         if (!s_stream_task_handle) {
                             ESP_LOGE(TAG, "stream_uac_task create FAILED "
-                                     "(static) free=%u largest=%u",
+                                     "(static FT8) free=%u largest=%u",
                                      (unsigned)free_before, (unsigned)largest);
                         }
+#if ENABLE_FT4
+                        }
+#endif
                     }
 
                 } else if (evt.driver.event == UAC_HOST_DRIVER_EVENT_TX_CONNECTED) {

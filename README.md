@@ -4,7 +4,7 @@ Also see [PaperFT8](https://github.com/wcheng95/PaperFT8)
 ![First POTA Activation](IMG_6087.jpeg)
 
 ## Mini-FT8 Release Notice
-Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure between Zhenxing (N6HAN) and Wei (AG6AQ), with inspiration from DXFT8 by Barb (WB2CBA) and Charley (W5BAA). It has been a great learning platform for me, and I hope you find it just as fun to use. It supports QMX, QDX, and KH1.
+Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure between Zhenxing (N6HAN) and Wei (AG6AQ), with inspiration from DXFT8 by Barb (WB2CBA) and Charley (W5BAA). It has been a great learning platform for me, and I hope you find it just as fun to use. It supports FT8 and FT4 with QMX and QDX, plus FT8 with KH1.
 
 ### Thanks
 
@@ -80,7 +80,7 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 |  | `3` | Select radio (`QMX` / `QDX` / `KH1`). |
 |  | `4` | Edit ignore list (Long Edit). Prefixes are separated by spaces; maximum 64 characters. |
 |  | `5` | Edit comment (Long Edit). Used for ADIF logging. Supports `/Radio` and `/Grid` macro expansion. |
-|  | `6` | Reserved. |
+|  | `6` | Select FT8 / FT4 protocol. Reboot to apply the change. |
 | `O` (MENU P3) | `1` | Turn RxTx log on/off. Note: RxTxLog has been renamed to `RT[YYMMDD].txt`. |
 |  | `2` | Turn SkipTX1 on/off. Skips `dxcall mycall mygrid` and replies with the SNR report. |
 |  | `3` | Edit active bands (Long Edit). Used by STATUS -> Band. |
