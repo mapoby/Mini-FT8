@@ -30,6 +30,7 @@ extern "C" {
 #include <string>
 #include <cstdint>
 #include <vector>
+#include <array>
 #include <cstring>
 #include <unordered_map>
 #include <algorithm>
@@ -3232,13 +3233,35 @@ static void advance_active_band(int delta) {
   g_band_sel = g_active_band_indices[pos];
 }
 
-static void fft_waterfall_tx_tone(uint8_t tone) {
-  // Map tone 0-7 to screen width and push a bright bin
+static int tx_waterfall_hz_to_x(float tone_hz) {
+  constexpr int kScreenW = 240;
+  constexpr float kMinHz = 200.0f;
+  constexpr float kMaxHz = 3000.0f;
+  int x = (int)lrintf((tone_hz - kMinHz) * (float)(kScreenW - 1) / (kMaxHz - kMinHz));
+  if (x < 0) x = 0;
+  if (x >= kScreenW) x = kScreenW - 1;
+  return x;
+}
+
+static void tx_waterfall_set_max(std::array<uint8_t, 240>& row, int x, uint8_t value) {
+  if (x < 0 || x >= (int)row.size()) return;
+  if (row[(size_t)x] < value) row[(size_t)x] = value;
+}
+
+static void fft_waterfall_tx_tone(float tone_hz) {
   std::array<uint8_t, 240> row{};
-  int pos = (int)((tone * row.size()) / 8);
-  if (pos < 0) pos = 0;
-  if (pos >= (int)row.size()) pos = (int)row.size() - 1;
-  row[pos] = 200;
+  static uint8_t noise_phase = 0;
+  for (size_t i = 0; i < row.size(); ++i) {
+    row[i] = (uint8_t)(2 + ((i * 17 + noise_phase) & 0x03));
+  }
+  noise_phase += 29;
+
+  const int pos = tx_waterfall_hz_to_x(tone_hz);
+  tx_waterfall_set_max(row, pos - 2, 50);
+  tx_waterfall_set_max(row, pos - 1, 120);
+  tx_waterfall_set_max(row, pos, 230);
+  tx_waterfall_set_max(row, pos + 1, 120);
+  tx_waterfall_set_max(row, pos + 2, 50);
   ui_push_waterfall_row(row.data(), (int)row.size());
 }
 
@@ -3930,9 +3953,9 @@ static void tx_tick() {
 
   // Send current tone
   ESP_LOGD("TXTONE", "%02d %u", g_tx_tone_idx, (unsigned)g_tx_tones[g_tx_tone_idx]);
-  fft_waterfall_tx_tone(g_tx_tones[g_tx_tone_idx]);
+  float tone_hz = g_tx_base_hz + 6.25f * g_tx_tones[g_tx_tone_idx];
+  fft_waterfall_tx_tone(tone_hz);
   if (g_tx_cat_ok) {
-    float tone_hz = g_tx_base_hz + 6.25f * g_tx_tones[g_tx_tone_idx];
     tx_send_ta(tone_hz);
   }
 
