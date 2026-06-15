@@ -1,3 +1,5 @@
+Subscribe to [https://freelists.org/list/qrp-portable](https://freelists.org/list/qrp-portable) for announcements, discussions, and updates about my Mini-series apps for the Cardputer ADV.
+
 Also see [PaperFT8](https://github.com/wcheng95/PaperFT8)
 
 # First POTA activation (v1.0 2025-12-31)
