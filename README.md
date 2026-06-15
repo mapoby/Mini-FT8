@@ -96,10 +96,15 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 
 ## Download Logs
 
-- This release requires flashing the full merged image so the 3 MB FATFS
-  partition table is installed. The first boot formats fresh internal storage;
-  export any files needed from older releases before upgrading. M5Launcher
-  installs that retain an older partition table are not supported.
+- A standalone first install requires the full merged image so the 3 MB
+  `fatfs` partition table is installed. The merged image contains no FATFS
+  payload, so normal reflashing does not overwrite stored files.
+- Mini-FT8 and Mini-CW share the `fatfs` partition. Their files can coexist,
+  and current M5Launcher installs/reinstalls can switch between the applications
+  while preserving an existing compatible FATFS partition. Both applications
+  use 512-byte FATFS and wear-levelling sectors.
+- A fresh or invalid FATFS is formatted automatically. `erase_flash`, a
+  full-chip erase, or an incompatible partition-table change destroys its files.
 
 - Use SD
   - Insert a FAT/FAT32-formatted SD card.
