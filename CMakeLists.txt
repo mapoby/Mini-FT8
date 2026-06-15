@@ -24,9 +24,8 @@ endif()
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(mini_ft8)
-# Normal idf.py flash preserves the existing storage partition. The merged
-# release image also leaves SPIFFS untouched; first boot after repartition can
-# format SPIFFS if mount fails.
+# This release requires the full merged image because it installs the FATFS-only
+# partition table. First boot formats the new 3 MB FATFS when needed.
 add_custom_command(TARGET app POST_BUILD
     COMMAND ${PYTHON} -m esptool --chip esp32s3 merge_bin -o "MiniFT8_Merged_Auto.bin" @flash_args
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}

@@ -36,9 +36,9 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 | `N` | MENU P2 | Configure radio, input, and comment settings. |
 | `O` | MENU P3 | Configure logging, active bands, RTC, copy-to-SD, and retry settings. |
 | `Q` | QSO | Browse QSO and log files, and view entries. |
-| `D` | Delete Files | Browse and delete files stored in SPIFFS. |
+| `D` | Delete Files | Browse and delete files stored in internal FATFS. |
 | `B` | BAND | Edit per-band frequencies. |
-| `C` | USB Drive | Enter manual USB mass-storage mode when FAT storage is available. |
+| `C` | USB Drive | Toggle internal FATFS ownership between Mini-FT8 and the PC. |
 | `P` | Performance | View A Simple Performance Monitor. (added in V2.0.4)|
 
 ## Global Keys and Navigation
@@ -91,10 +91,15 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 |  | `◀` `▶` | Switch columns (Default view or SNR view). |
 | `D` (Delete Files) | `1..6` | Delete the selected file immediately, without confirmation. |
 | `B` (BAND) | `1..6` | Choose a band slot to edit. |
-| `C` (USB Drive) |  | Stop radio audio and expose FAT log storage to the PC until reboot. Unavailable on launcher installs using SPIFFS. |
+| `C` (USB Drive) |  | Stop radio audio and expose FATFS to the PC. Safely eject it on the PC, then press `C` again to remount storage and return to RX. |
 | `P` (PERFORMANCE) | | A Simple Performance Monitor. (added in V2.0.4) |
 
 ## Download Logs
+
+- This release requires flashing the full merged image so the 3 MB FATFS
+  partition table is installed. The first boot formats fresh internal storage;
+  export any files needed from older releases before upgrading. M5Launcher
+  installs that retain an older partition table are not supported.
 
 - Use SD
   - Insert a FAT/FAT32-formatted SD card.

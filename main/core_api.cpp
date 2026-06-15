@@ -13,6 +13,7 @@
 #include "core_api_internal.h"
 #include "station_types.h"
 #include "autoseq.h"
+#include "storage_service.h"
 
 #include <atomic>
 
@@ -633,9 +634,9 @@ bool core_cmd_save_config() {
 
 namespace {
 struct AdifSession {
-  int     id          = -1;
-  FILE*   fp          = nullptr;
-  long    total       = -1;
+  int            id     = -1;
+  StorageStream* stream = nullptr;
+  long           total  = -1;
 };
 AdifSession g_adif;
 int         g_adif_next_id = 1;
@@ -643,12 +644,12 @@ int         g_adif_next_id = 1;
 
 CoreAdifHandle core_adif_open() {
   CoreAdifHandle h{-1, -1};
-  if (g_adif.fp) return h;  // single-reader invariant
+  if (g_adif.stream) return h;  // single-reader invariant
 
-  // Find most recent .adi file in /storage.
+  // Find most recent .adi file in internal storage.
   // For simplicity, we just try today's filename; step 3 can add the
   // full "pick most recent from listing" logic.
-  // Build "/storage/YYYYMMDD.adi" from g_date.
+  // Build "YYYYMMDD.adi" from g_date.
   char path[64];
   const char* d = g_date.c_str();
   // strip dashes
@@ -657,17 +658,18 @@ CoreAdifHandle core_adif_open() {
   for (int i = 0; d[i] && o < 8; ++i) {
     if (d[i] >= '0' && d[i] <= '9') yyyymmdd[o++] = d[i];
   }
-  snprintf(path, sizeof(path), "/storage/%s.adi", yyyymmdd);
+  snprintf(path, sizeof(path), "%s.adi", yyyymmdd);
 
-  FILE* f = fopen(path, "rb");
-  if (!f) return h;
-
-  fseek(f, 0, SEEK_END);
-  long size = ftell(f);
-  fseek(f, 0, SEEK_SET);
+  StorageStream* stream = storage_stream_open(path, StorageOpenMode::READ);
+  if (!stream) return h;
+  const long size = storage_stream_size(stream);
+  if (size < 0 || !storage_stream_seek(stream, 0, SEEK_SET)) {
+    storage_stream_close(stream);
+    return h;
+  }
 
   g_adif.id    = g_adif_next_id++;
-  g_adif.fp    = f;
+  g_adif.stream = stream;
   g_adif.total = size;
 
   h.id    = g_adif.id;
@@ -677,10 +679,10 @@ CoreAdifHandle core_adif_open() {
 
 bool core_adif_read(int handle, std::vector<uint8_t>& out, size_t max_bytes) {
   out.clear();
-  if (handle != g_adif.id || !g_adif.fp) return false;
+  if (handle != g_adif.id || !g_adif.stream) return false;
   if (max_bytes == 0) max_bytes = 256;
   out.resize(max_bytes);
-  size_t n = fread(out.data(), 1, max_bytes, g_adif.fp);
+  size_t n = storage_stream_read(g_adif.stream, out.data(), max_bytes);
   out.resize(n);
   if (n == 0) {
     // EOF or error — caller should close.
@@ -691,7 +693,10 @@ bool core_adif_read(int handle, std::vector<uint8_t>& out, size_t max_bytes) {
 
 void core_adif_close(int handle) {
   if (handle != g_adif.id) return;
-  if (g_adif.fp) { fclose(g_adif.fp); g_adif.fp = nullptr; }
+  if (g_adif.stream) {
+    storage_stream_close(g_adif.stream);
+    g_adif.stream = nullptr;
+  }
   g_adif.id = -1;
   g_adif.total = -1;
 }
