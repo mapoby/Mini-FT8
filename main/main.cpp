@@ -76,420 +76,9 @@ static bool g_sd_mounted = false;
 
 #include "feature_flags.h"
 
-#if ENABLE_BLE
-#include "nimble/nimble_port.h"
-#include "nimble/nimble_port_freertos.h"
-#include "host/ble_hs.h"
-#include "host/util/util.h"
-#include "services/gap/ble_svc_gap.h"
-#include "services/gatt/ble_svc_gatt.h"
-#include "nvs_flash.h"
-#include "soc/soc_caps.h"
-#include "esp_bt.h"
-#include "esp_mac.h"
-#include "ble_native.h"
-
-#endif
 #ifndef FT8_SAMPLE_RATE
 #define FT8_SAMPLE_RATE 6000
 #endif
-
-#define BLE_UI_SVC_UUID   0xFFE0
-#define BLE_UI_RX_UUID    0xFFE1
-#define BLE_UI_TX_UUID    0xFFE2
-
-#if ENABLE_BLE
-static const ble_uuid16_t ble_ui_svc_uuid = BLE_UUID16_INIT(BLE_UI_SVC_UUID);
-static const ble_uuid16_t ble_ui_rx_uuid = BLE_UUID16_INIT(BLE_UI_RX_UUID);
-static const ble_uuid16_t ble_ui_tx_uuid = BLE_UUID16_INIT(BLE_UI_TX_UUID);
-#endif
-
-static constexpr size_t BLE_UI_INPUT_MAX = 160;
-struct BleUiInput {
-    uint16_t len = 0;
-    char data[BLE_UI_INPUT_MAX] = {};
-};
-
-
-#if ENABLE_BLE
-
-static QueueHandle_t ble_cmd_queue = nullptr;
-static uint16_t gatt_tx_handle = 0;
-static uint16_t g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-static bool g_ble_synced = false;
-static bool g_ble_force_send = false;
-static std::string g_ble_adv_name;
-static std::string g_ble_last_payload;
-static std::string g_ble_last_screen_lines[6];
-static std::string g_ble_last_line7;
-static bool g_ble_last_screen_valid = false;
-static int64_t g_ble_status_clock_slot_sent = -1;
-static int64_t g_ble_gps_slot_sent = -1;
-static int64_t g_ble_last_tick_slot = -1;
-static int g_ble_last_tick_sec = -1;
-static std::string g_ble_waterfall_header = "|                           |";
-static int64_t g_ble_waterfall_slot_idx = -1;
-static bool g_ble_text_mode = false;
-static volatile uint32_t g_ble_decode_event_seq = 0;
-static volatile int g_ble_decode_event_count = 0;
-static uint32_t g_ble_decode_event_seq_seen = 0;
-static void ble_publish_decode_event(int decoded_count) {
-  g_ble_decode_event_count = decoded_count;
-  g_ble_decode_event_seq = g_ble_decode_event_seq + 1;
-}
-static const char* BT_TAG = "BLE_INIT";
-
-enum class BleDumpTxMode : uint8_t {
-    Notify = 0,
-    Indicate = 1,
-};
-
-struct BleDumpTransferState {
-    bool active = false;
-    BleDumpTxMode mode = BleDumpTxMode::Notify;
-    int file_lines = 0;
-    int retries = 0;
-    int failed_lines = 0;
-    int notify_pace_ms = 8;
-    uint16_t mtu = 23;
-};
-
-static BleDumpTransferState g_ble_dump_xfer{};
-static volatile bool g_ble_tx_notify_enabled = false;
-static volatile bool g_ble_tx_indicate_enabled = false;
-static volatile bool g_ble_indicate_waiting = false;
-static volatile int g_ble_indicate_status = 0;
-static volatile uint16_t g_ble_att_mtu = 23;
-
-static constexpr int kBleDumpIndicateAckTimeoutMs = 1500;
-static constexpr int kBleDumpIndicateMaxRetries = 3;
-static constexpr int kBleDumpNotifyMaxRetries = 4;
-static constexpr int kBleDumpNotifyBackoffMs[kBleDumpNotifyMaxRetries] = {5, 10, 20, 40};
-static constexpr int kBleDumpNotifyPaceMinMs = 8;
-static constexpr int kBleDumpNotifyPaceMaxMs = 20;
-
-static int gap_cb(struct ble_gap_event *event, void *arg);
-static void nimble_host_task(void *param);
-static void ble_on_sync(void);
-static void ble_app_advertise(void);
-static void ble_update_name_from_station(bool restart_adv);
-static void ble_countdown_tick();
-static std::string ble_blank_waterfall_header();
-static void ble_update_waterfall_header_if_due(int64_t slot_idx, int sec);
-static int ble_send_payload_raw(const std::string& payload, bool indicate);
-static bool ble_wait_for_indicate_ack(int timeout_ms);
-static void ble_dump_reset_transfer_state(bool use_indicate);
-static bool ble_dump_send_line(const std::string& raw);
-
-static std::string ble_trim_trailing_crlf(const char* data, uint16_t len)
-{
-    if (!data || len == 0) return std::string();
-    size_t used = len;
-    while (used > 0 && (data[used - 1] == '\r' || data[used - 1] == '\n')) used--;
-    return std::string(data, data + used);
-}
-
-static char ble_parse_ui_command(const char* data, uint16_t len)
-{
-    const std::string payload = ble_trim_trailing_crlf(data, len);
-    if (payload.size() != 1) return 0;  // command mode is single-character only
-    char c = payload[0];
-    if (c >= 'a' && c <= 'z') c = static_cast<char>(c - ('a' - 'A'));
-
-    if (c >= '1' && c <= '6') return c;
-    switch (c) {
-      case 'S':
-      case 'R':
-      case 'T':
-      case 'G':
-      case 'M':
-      case 'Q':
-      case 'B':
-      case 'F':
-      case 'D':
-      case 'N':
-      case 'O':
-        return c;
-      case 'U':  // page up
-        return ';';
-      case 'V':  // page down
-        return '.';
-      case 'Z':  // left (Zuo)
-        return ',';
-      case 'X':  // right (You)
-        return '/';
-      case 'E':  // ESC / TX cancel
-        return '`';
-      default:
-        return 0;
-    }
-}
-
-static int ble_ui_rx_cb(uint16_t conn_handle,
-                        uint16_t attr_handle,
-                        struct ble_gatt_access_ctxt *ctxt,
-                        void *arg)
-{
-    (void)conn_handle;
-    (void)attr_handle;
-    (void)arg;
-    if (!ble_cmd_queue || !ctxt || !ctxt->om) return 0;
-    BleUiInput input{};
-    size_t copy_len = ctxt->om->om_len;
-    if (copy_len > BLE_UI_INPUT_MAX) copy_len = BLE_UI_INPUT_MAX;
-    input.len = static_cast<uint16_t>(copy_len);
-    if (copy_len > 0) {
-      std::memcpy(input.data, ctxt->om->om_data, copy_len);
-    }
-    xQueueSend(ble_cmd_queue, &input, 0);
-    return 0;  // ignore unsupported input silently
-}
-
-static int ble_ui_tx_cb(uint16_t conn_handle,
-                        uint16_t attr_handle,
-                        struct ble_gatt_access_ctxt *ctxt,
-                        void *arg)
-{
-    (void)conn_handle;
-    (void)attr_handle;
-    (void)ctxt;
-    (void)arg;
-    return 0;
-}
-
-#include "esp_nimble_hci.h"
-
-// C++-safe static characteristics table (fully initialized for -Werror).
-static const struct ble_gatt_chr_def gatt_uart_chrs[] = {
-    {
-        &ble_ui_rx_uuid.u,                       // uuid
-        ble_ui_rx_cb,                            // access_cb
-        nullptr,                                 // arg
-        nullptr,                                 // descriptors
-        BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP, // flags
-        0,                                       // min_key_size
-        nullptr,                                 // val_handle
-        nullptr,                                 // cpfd
-    },
-    {
-        &ble_ui_tx_uuid.u,                       // uuid
-        ble_ui_tx_cb,                            // access_cb
-        nullptr,                                 // arg
-        nullptr,                                 // descriptors
-        BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_INDICATE, // flags
-        0,                                       // min_key_size
-        &gatt_tx_handle,                         // val_handle
-        nullptr,                                 // cpfd
-    },
-    {
-        nullptr,                                 // uuid terminator
-        nullptr,                                 // access_cb
-        nullptr,                                 // arg
-        nullptr,                                 // descriptors
-        0,                                       // flags
-        0,                                       // min_key_size
-        nullptr,                                 // val_handle
-        nullptr,                                 // cpfd
-    },
-};
-
-// C++-safe service table (fully initialized for -Werror).
-static const struct ble_gatt_svc_def gatt_svcs[] = {
-    {
-        BLE_GATT_SVC_TYPE_PRIMARY,               // type
-        &ble_ui_svc_uuid.u,                      // uuid
-        nullptr,                                 // includes
-        gatt_uart_chrs,                          // characteristics
-    },
-    {
-        0,                                       // type terminator
-        nullptr,                                 // uuid
-        nullptr,                                 // includes
-        nullptr,                                 // characteristics
-    }
-};
-
-
-static void init_bluetooth(void)
-{
-    static bool inited = false;
-    if (inited) return;
-    inited = true;
-    ESP_LOGI(BT_TAG, "init_bluetooth start");
-
-    esp_err_t nvrc = nvs_flash_init();
-    if (nvrc == ESP_ERR_NVS_NO_FREE_PAGES || nvrc == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        nvrc = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(nvrc);
-
-    int rc = nimble_port_init();
-    if (rc != 0) {
-        ESP_LOGE(BT_TAG, "nimble_port_init failed: %d", rc);
-        return;
-    }
-    ESP_LOGI(BT_TAG, "nimble_port_init OK");
-
-    ble_svc_gap_init();
-    ble_svc_gatt_init();
-    ESP_LOGI(BT_TAG, "GAP/GATT init done");
-
-    ble_update_name_from_station(false);
-
-    // Register the native client GATT service (handles its own count_cfg + add_svcs).
-    // The former text-terminal service was removed; the mobile app is the
-    // only BLE client now.
-    if (!ble_native_init()) {
-        ESP_LOGE(BT_TAG, "ble_native_init failed");
-        return;
-    }
-    ESP_LOGI(BT_TAG, "Native BLE service registered");
-
-    ble_hs_cfg.sync_cb = ble_on_sync;
-
-    nimble_port_freertos_init(nimble_host_task);
-    ESP_LOGI(BT_TAG, "Host task started");
-}
-
-static void nimble_teardown(void)
-{
-    ESP_LOGI(BT_TAG, "nimble_teardown start");
-    uint32_t before = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
-
-    if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-        ble_gap_terminate(g_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-    }
-    if (g_ble_synced) {
-        ble_gap_adv_stop();
-        g_ble_synced = false;
-    }
-
-    ble_native_shutdown();
-
-    nimble_port_stop();
-    nimble_port_freertos_deinit();
-    nimble_port_deinit();
-
-    esp_err_t err = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
-    if (err != ESP_OK) {
-        ESP_LOGW(BT_TAG, "esp_bt_controller_mem_release: %s",
-                 esp_err_to_name(err));
-    }
-
-    uint32_t after = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
-    ESP_LOGI(BT_TAG, "nimble_teardown done: heap %u -> %u (+%d)",
-             (unsigned)before, (unsigned)after, (int)(after - before));
-}
-
-static int gap_cb(struct ble_gap_event *event, void *arg)
-{
-    (void)arg;
-    switch (event->type) {
-    case BLE_GAP_EVENT_CONNECT:
-        if (event->connect.status == 0) {
-            g_conn_handle = event->connect.conn_handle;
-            if (!g_ble_enabled) {
-              ble_gap_terminate(g_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-              g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-              return 0;
-            }
-            g_ble_force_send = true;
-            g_ble_last_screen_valid = false;
-            g_ble_status_clock_slot_sent = -1;
-            g_ble_gps_slot_sent = -1;
-            g_ble_last_tick_slot = -1;
-            g_ble_last_tick_sec = -1;
-            g_ble_waterfall_slot_idx = -1;
-            g_ble_waterfall_header = ble_blank_waterfall_header();
-            g_ble_text_mode = false;
-            g_ble_tx_notify_enabled = false;
-            g_ble_tx_indicate_enabled = false;
-            g_ble_indicate_waiting = false;
-            g_ble_indicate_status = 0;
-            g_ble_att_mtu = 23;
-            ble_native_on_connect(g_conn_handle);
-            ESP_LOGI(BT_TAG, "Connected, handle=%u", g_conn_handle);
-        } else {
-            g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-            ESP_LOGW(BT_TAG, "Connect failed; restarting adv");
-            ble_app_advertise();
-        }
-        break;
-
-    case BLE_GAP_EVENT_DISCONNECT:
-        g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-        g_ble_last_payload.clear();
-        g_ble_last_screen_valid = false;
-        g_ble_last_line7.clear();
-        g_ble_status_clock_slot_sent = -1;
-        g_ble_gps_slot_sent = -1;
-        g_ble_last_tick_slot = -1;
-        g_ble_last_tick_sec = -1;
-        g_ble_waterfall_slot_idx = -1;
-        g_ble_waterfall_header = ble_blank_waterfall_header();
-        g_ble_text_mode = false;
-        g_ble_tx_notify_enabled = false;
-        g_ble_tx_indicate_enabled = false;
-        g_ble_indicate_waiting = false;
-        g_ble_indicate_status = 0;
-        g_ble_att_mtu = 23;
-        if (ble_cmd_queue) xQueueReset(ble_cmd_queue);
-        ble_native_on_disconnect();
-        ESP_LOGW(BT_TAG, "Disconnected; restarting adv");
-        ble_app_advertise();
-        break;
-
-    case BLE_GAP_EVENT_SUBSCRIBE:
-        if (event->subscribe.conn_handle == g_conn_handle &&
-            event->subscribe.attr_handle == gatt_tx_handle) {
-            g_ble_tx_notify_enabled = event->subscribe.cur_notify != 0;
-            g_ble_tx_indicate_enabled = event->subscribe.cur_indicate != 0;
-            ESP_LOGI(BT_TAG, "TX subscribe: notify=%d indicate=%d",
-                     g_ble_tx_notify_enabled ? 1 : 0,
-                     g_ble_tx_indicate_enabled ? 1 : 0);
-        }
-        // Forward all subscribe events to the native server — it tracks
-        // its own characteristic handles and ignores unrelated events.
-        ble_native_on_subscribe(event->subscribe.attr_handle,
-                                event->subscribe.cur_notify != 0,
-                                event->subscribe.cur_indicate != 0);
-        break;
-
-    case BLE_GAP_EVENT_NOTIFY_TX:
-        if (event->notify_tx.conn_handle == g_conn_handle &&
-            event->notify_tx.attr_handle == gatt_tx_handle &&
-            event->notify_tx.indication &&
-            g_ble_indicate_waiting) {
-            const int st = event->notify_tx.status;
-            if (st != 0) {
-                g_ble_indicate_status = st;
-                g_ble_indicate_waiting = false;
-            }
-        }
-        break;
-
-    case BLE_GAP_EVENT_MTU:
-        if (event->mtu.conn_handle == g_conn_handle && event->mtu.value > 0) {
-            g_ble_att_mtu = event->mtu.value;
-            ble_native_on_mtu(event->mtu.value);
-            ESP_LOGI(BT_TAG, "ATT MTU=%u", (unsigned)g_ble_att_mtu);
-        }
-        break;
-
-    default:
-        break;
-    }
-    return 0;
-}
-
-
-static bool ble_pop_input(BleUiInput& out) {
-    if (!ble_cmd_queue) return false;
-    return xQueueReceive(ble_cmd_queue, &out, 0) == pdTRUE;
-}
-#endif // ENABLE_BLE
 
 int64_t rtc_now_ms();
 struct CopyLogsResult {
@@ -926,7 +515,7 @@ static CopyLogsResult copy_logs_spiffs_to_sd_overwrite() {
 // well over typical working set (FT8 rarely sees >50 unique hashed
 // callsigns in an active period; the aging + eviction logic keeps it
 // fresh). Reducing by 2 KB gives the USB DMA buffer (4608 bytes) a
-// better chance at finding a contiguous block after BLE+USB host
+// Keep this compact so USB host setup retains contiguous heap.
 // fragmentation.
 #define CALLSIGN_HASHTABLE_SIZE 128
 
@@ -1156,24 +745,18 @@ int64_t g_decode_slot_idx = -1; // set at decode trigger to tag RX lines with sl
 // core 0. Initialized to -1 so the first TX after boot isn't blocked.
 volatile int64_t g_decode_applied_slot_idx = -1;
 
-// Set by stream_uac_task after a successful CDC-ACM open (QMX CAT USB-CDC
-// enumeration). Consumed exactly once by the main loop to auto-sync VFO /
-// mode to the radio — covers the "first connect" case so users don't have
-// to press S->2 manually. QMX only enumerates once per power cycle and
-// mini-ft8 restarts on QMX disconnect, so this flag effectively fires at
-// most once per mini-ft8 lifetime. For KH1 (UART CAT, persistent), the
-// STATUS-exit auto-sync in enter_mode handles the analogous case.
+// Set after CDC-ACM opens during an explicit user connection. The main loop
+// consumes it once to synchronize the selected band and mode.
 volatile bool g_cdc_initial_sync_pending = false;
 
-// Deferred-save flag — see extern declaration above. Storage lives on
-// main.cpp side; ble_native / core_api.cpp's RPC dispatch only flips it.
+// Deferred-save flag. main.cpp owns storage; core_api commands only request
+// a deferred save.
 volatile bool g_config_save_pending = false;
 
 // State machine variables (matching reference project architecture)
 // TX is scheduled by setting these flags; actual TX starts at slot boundary
 // Global TX-arming state: read by tx_tick on the next slot boundary.
-// Non-static so core_api.cpp can arm it from the BLE tap_rx RPC, matching
-// what the Cardputer's RX-key handler does inline.
+// Non-static so core_api.cpp can arm it from any UI consumer.
 volatile bool g_qso_xmit = false;        // TX is pending
 volatile int g_target_slot_parity = 0;   // 0=even, 1=odd - parity of slot to TX on
 static volatile bool g_was_txing = false;       // We were transmitting (for tick timing)
@@ -1228,11 +811,7 @@ static bool storage_mount_was_attempted();
 static bool storage_supports_msc();
 static void unmount_storage();
 
-// Deferred-save flag. core_api.cpp's RPC handlers (running on the
-// shallow ble_native task) flip this to ask the main task to flush
-// station data — the 22-fprintf chain is too deep for that 4 KB
-// stack. The main app_task_core0 has 12 KB and processes the flag
-// once per loop tick (~10 ms latency).
+// Core commands request a save; the main task performs storage I/O.
 extern volatile bool g_config_save_pending;
 // TX entry for display and scheduling (populated by autoseq)
 // Non-static for the same reason as g_qso_xmit / g_target_slot_parity
@@ -1246,26 +825,12 @@ void arm_pending_tx(const AutoseqTxEntry& pending);
 volatile bool g_tx_cancel_requested = false;   // visible to core_api.cpp
 static void host_process_bytes(const uint8_t* buf, size_t len);
 [[maybe_unused]] static void poll_host_uart();
-static bool ble_pop_input(BleUiInput& out);
-static void ble_update_name_from_station(bool restart_adv);
-static void ble_mirror_tick();
-static void ble_countdown_tick();
 static void enter_mode(UIMode new_mode);
-static void apply_ble_enabled_policy(bool runtime_apply);
 static std::string menu_sleep_batt_line();
 static int normalize_gps_baud_value(int value);
 bool rtc_set_from_strings();   // visible to core_api.cpp
 void rtc_sync_to_hw();         // visible to core_api.cpp
 static bool g_rx_dirty = false;
-#if ENABLE_BLE
-static void ble_enter_text_mode();
-static void ble_exit_text_mode();
-static bool ble_text_target_active();
-static void ble_commit_text_input(const BleUiInput& input);
-static void ble_start_qso_pick_mode();
-static void ble_cancel_qso_pick_mode();
-static void ble_try_dump_qso_file_by_key(char key);
-#endif
 
 
 
@@ -1458,14 +1023,10 @@ static void draw_status_line(int idx, const std::string& text, bool highlight);
 void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui);
 static void update_countdown();
 static void consume_cdc_initial_sync();
-// Non-static so core_api.cpp's BLE set_band RPC can push the CAT change
-// immediately, matching what the Cardputer's STATUS-exit path does.
+// Non-static so core_api.cpp can push band changes to the radio immediately.
 bool sync_radio_to_current_band(const char* reason);
 static void menu_flash_tick();
 static void rx_flash_tick();
-#if ENABLE_BLE
-static uint8_t g_own_addr_type;
-#endif
 static bool looks_like_grid(const std::string& s);
 static bool looks_like_report(const std::string& s, int& out);
 static std::string g_last_reply_text;
@@ -3166,8 +2727,8 @@ static void tx_tick();
 // Compute the actual audio offset the next TX will use, given the
 // configured g_offset_src and the autoseq pending entry. Storing the
 // resolved value at scheduling time (rather than at the slot boundary,
-// as the firmware used to do) means BLE clients reading core_get_qso
-// see the same number that will actually go on air — important for the
+// as the firmware used to do) means UI consumers reading core_get_qso see
+// the same number that will actually go on air — important for the
 // waterfall offset marker, especially in RANDOM / beacon-CQ modes where
 // the random was previously rolled inside check_slot_boundary.
 static int resolve_tx_offset(const AutoseqTxEntry& e) {
@@ -3186,7 +2747,7 @@ static int resolve_tx_offset(const AutoseqTxEntry& e) {
 // Single point of truth for arming the next TX. Replaces the 4-line
 // "g_qso_xmit / g_target_slot_parity / g_pending_tx / g_pending_tx_valid"
 // block that used to be repeated at every scheduling site (autoseq tick,
-// beacon-on, freetext queue, BLE tap_rx, …).
+// beacon-on, free-text queue, and RX selection).
 void arm_pending_tx(const AutoseqTxEntry& pending) {
   g_qso_xmit           = true;
   g_target_slot_parity = pending.slot_id & 1;
@@ -3587,7 +3148,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     ESP_LOGW(TAG, "No candidates found");
     ui_set_rx_list_static(nullptr, 0);
     if (update_ui) { ui_draw_rx(); }
-    else core_fire_rx_changed();  // propagates to all registered consumers (Cardputer, future BLE)
+    else core_fire_rx_changed();
     // No candidates means we processed the slot's audio but found nothing —
     // still counts as "applied" for the TX-trigger guard.
     if (g_decode_slot_idx > g_decode_applied_slot_idx) {
@@ -3789,7 +3350,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     snprintf(buf, sizeof(buf), "Heap %u", heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
     debug_log_line(buf);
   } else {
-    core_fire_rx_changed();  // propagates to all registered consumers (Cardputer, future BLE)
+    core_fire_rx_changed();
   }
 
   // ---- heap instrumentation (exit) ----
@@ -4058,7 +3619,7 @@ static void tx_tick() {
     return;
   }
 
-  // Send current tone
+  // Send current tone to the local visualizer and selected radio backend.
   ESP_LOGD("TXTONE", "%02d %u", g_tx_tone_idx, (unsigned)g_tx_tones[g_tx_tone_idx]);
   float tone_hz = g_tx_base_hz + 6.25f * g_tx_tones[g_tx_tone_idx];
   fft_waterfall_tx_tone(tone_hz);
@@ -4211,7 +3772,7 @@ static void draw_gps_view(bool force_redraw) {
   M5.Display.setTextSize(2);
   for (size_t i = 0; i < 6; ++i) {
     std::string text = (i < lines.size()) ? lines[i] : "";
-    // Keep BLE mirror source in sync with GPS mode text regardless of LCD redraw.
+    // Keep the UI text snapshot in sync regardless of LCD redraw.
     ui_set_visible_text_line((int)i, text);
     if (force_redraw || text != s_last_gps_lines[i]) {
       s_last_gps_lines[i] = text;
@@ -4432,775 +3993,6 @@ static void debug_log_line(const std::string& msg) {
   g_debug_lines.push_back(msg);
   debug_page = (int)((g_debug_lines.size() - 1) / 6);
 }
-
-#if ENABLE_BLE
-
-static int page_count(int items, int page_size) {
-  if (page_size <= 0) return 1;
-  if (items <= 0) return 1;
-  return (items + page_size - 1) / page_size;
-}
-
-static int ble_send_payload_raw(const std::string& payload, bool indicate) {
-  if (!g_ble_enabled) return BLE_HS_EINVAL;
-  if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return BLE_HS_ENOTCONN;
-  if (!gatt_tx_handle) return BLE_HS_EINVAL;
-  struct os_mbuf* om = ble_hs_mbuf_from_flat(payload.data(), payload.size());
-  if (!om) return BLE_HS_ENOMEM;
-  int rc = indicate
-             ? ble_gatts_indicate_custom(g_conn_handle, gatt_tx_handle, om)
-             : ble_gatts_notify_custom(g_conn_handle, gatt_tx_handle, om);
-  if (rc != 0) {
-    ESP_LOGD(BT_TAG, "%s failed rc=%d", indicate ? "indicate" : "notify", rc);
-  }
-  return rc;
-}
-
-static void ble_notify_payload(const std::string& payload) {
-  (void)ble_send_payload_raw(payload, false);
-}
-
-static bool ble_wait_for_indicate_ack(int timeout_ms) {
-  const int step_ms = 10;
-  int waited = 0;
-  while (g_ble_indicate_waiting && waited < timeout_ms) {
-    if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
-      g_ble_indicate_status = BLE_HS_ENOTCONN;
-      g_ble_indicate_waiting = false;
-      break;
-    }
-    vTaskDelay(pdMS_TO_TICKS(step_ms));
-    waited += step_ms;
-  }
-  if (g_ble_indicate_waiting) {
-    g_ble_indicate_status = BLE_HS_ETIMEOUT;
-    g_ble_indicate_waiting = false;
-  }
-  return g_ble_indicate_status == BLE_HS_EDONE;
-}
-
-static void ble_dump_reset_transfer_state(bool use_indicate) {
-  g_ble_dump_xfer = BleDumpTransferState{};
-  g_ble_dump_xfer.active = true;
-  g_ble_dump_xfer.mode = use_indicate ? BleDumpTxMode::Indicate : BleDumpTxMode::Notify;
-  g_ble_dump_xfer.notify_pace_ms = kBleDumpNotifyPaceMinMs;
-  g_ble_dump_xfer.mtu = g_ble_att_mtu;
-  g_ble_indicate_waiting = false;
-  g_ble_indicate_status = 0;
-}
-
-static size_t ble_dump_max_chunk_len() {
-  // BLE notification/indication usable payload is ATT_MTU - 3.
-  // Use g_ble_att_mtu if available; otherwise default to 23-byte MTU => 20-byte payload.
-  uint16_t mtu = g_ble_att_mtu;
-  if (mtu < 23) mtu = 23;
-
-  size_t n = (size_t)mtu - 3;
-
-  // Conservative cap. Helps avoid phone-side / NimBLE queue issues.
-  if (n > 180) n = 180;
-  if (n < 20) n = 20;
-
-  return n;
-}
-
-static bool ble_dump_send_chunk(const std::string& chunk) {
-  if (chunk.empty()) {
-    return true;
-  }
-
-  if (g_ble_dump_xfer.mode == BleDumpTxMode::Indicate) {
-    for (int attempt = 0; attempt <= kBleDumpIndicateMaxRetries; ++attempt) {
-      g_ble_indicate_status = 0;
-      g_ble_indicate_waiting = true;
-
-      const int rc = ble_send_payload_raw(chunk, true);
-
-      if (rc == 0) {
-        if (ble_wait_for_indicate_ack(kBleDumpIndicateAckTimeoutMs)) {
-          return true;
-        }
-      } else {
-        g_ble_indicate_waiting = false;
-        g_ble_indicate_status = rc;
-      }
-
-      if (attempt < kBleDumpIndicateMaxRetries) {
-        g_ble_dump_xfer.retries++;
-
-        const int bi = attempt < kBleDumpNotifyMaxRetries
-                         ? attempt
-                         : (kBleDumpNotifyMaxRetries - 1);
-
-        vTaskDelay(pdMS_TO_TICKS(kBleDumpNotifyBackoffMs[bi]));
-      }
-    }
-
-    return false;
-  }
-
-  int attempt = 0;
-
-  for (; attempt <= kBleDumpNotifyMaxRetries; ++attempt) {
-    const int rc = ble_send_payload_raw(chunk, false);
-    if (rc == 0) break;
-
-    if (attempt < kBleDumpNotifyMaxRetries) {
-      g_ble_dump_xfer.retries++;
-      vTaskDelay(pdMS_TO_TICKS(kBleDumpNotifyBackoffMs[attempt]));
-    }
-  }
-
-  if (attempt > kBleDumpNotifyMaxRetries) {
-    return false;
-  }
-
-  if (attempt > 0) {
-    int next_pace = g_ble_dump_xfer.notify_pace_ms + (attempt * 2);
-    if (next_pace > kBleDumpNotifyPaceMaxMs) {
-      next_pace = kBleDumpNotifyPaceMaxMs;
-    }
-    g_ble_dump_xfer.notify_pace_ms = next_pace;
-  } else if (g_ble_dump_xfer.notify_pace_ms > kBleDumpNotifyPaceMinMs) {
-    g_ble_dump_xfer.notify_pace_ms--;
-  }
-
-  vTaskDelay(pdMS_TO_TICKS(g_ble_dump_xfer.notify_pace_ms));
-  return true;
-}
-
-static bool ble_dump_send_line(const std::string& raw) {
-  std::string line = raw;
-
-  while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
-    line.pop_back();
-  }
-
-  std::string payload = line + "\n";
-
-  const size_t max_chunk = ble_dump_max_chunk_len();
-
-  for (size_t pos = 0; pos < payload.size(); pos += max_chunk) {
-    const size_t remain = payload.size() - pos;
-    const size_t n = remain > max_chunk ? max_chunk : remain;
-
-    std::string chunk = payload.substr(pos, n);
-
-    if (!ble_dump_send_chunk(chunk)) {
-      g_ble_dump_xfer.failed_lines++;
-      return false;
-    }
-  }
-
-  return true;
-}
-static void apply_ble_enabled_policy(bool runtime_apply) {
-  g_time_osr = 2;  // 6kHz sample rate enables time_osr=2 even with BLE
-  g_freq_osr = 1;
-  if (!runtime_apply) return;
-
-  if (!g_ble_enabled) {
-    if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-      ble_gap_terminate(g_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-    }
-    if (g_ble_synced) {
-      ble_gap_adv_stop();
-    }
-    g_ble_last_payload.clear();
-    g_ble_last_screen_valid = false;
-    g_ble_last_line7.clear();
-    g_ble_status_clock_slot_sent = -1;
-    g_ble_gps_slot_sent = -1;
-    g_ble_last_tick_slot = -1;
-    g_ble_last_tick_sec = -1;
-    g_ble_waterfall_slot_idx = -1;
-    g_ble_waterfall_header = ble_blank_waterfall_header();
-    g_ble_text_mode = false;
-    g_ble_qso_pick_mode = false;
-    g_ble_dump_in_progress = false;
-    if (ble_cmd_queue) xQueueReset(ble_cmd_queue);
-    return;
-  }
-
-  g_ble_force_send = true;
-  g_ble_last_screen_valid = false;
-  g_ble_status_clock_slot_sent = -1;
-  g_ble_gps_slot_sent = -1;
-  g_ble_last_tick_slot = -1;
-  g_ble_last_tick_sec = -1;
-  g_ble_waterfall_slot_idx = -1;
-  g_ble_waterfall_header = ble_blank_waterfall_header();
-  if (g_ble_synced && g_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
-    ble_app_advertise();
-  }
-}
-
-static std::string ble_mac_suffix() {
-  uint8_t mac[6] = {};
-  if (esp_efuse_mac_get_default(mac) != ESP_OK) {
-    return "0000";
-  }
-  char out[5];
-  std::snprintf(out, sizeof(out), "%02X%02X", mac[4], mac[5]);
-  return std::string(out);
-}
-
-static std::string ble_sanitize_callsign(const std::string& call) {
-  std::string out;
-  out.reserve(call.size());
-  for (unsigned char ch : call) {
-    if (std::isalnum(ch)) {
-      out.push_back(static_cast<char>(std::toupper(ch)));
-    } else if (ch == '/' || ch == '_' || ch == '-') {
-      out.push_back('_');
-    }
-    if (out.size() >= 12) break;
-  }
-  while (!out.empty() && out.back() == '_') out.pop_back();
-  return out;
-}
-
-static void ble_update_name_from_station(bool restart_adv) {
-  std::string suffix = ble_sanitize_callsign(g_call);
-  if (suffix.empty()) suffix = ble_mac_suffix();
-  std::string desired = std::string("Mini-FT8-") + suffix;
-  if (desired.size() > 24) desired.resize(24);
-  if (desired.empty()) desired = "Mini-FT8";
-
-  if (desired == g_ble_adv_name) return;
-  g_ble_adv_name = desired;
-  ble_svc_gap_device_name_set(g_ble_adv_name.c_str());
-
-  if (restart_adv && g_ble_enabled && g_ble_synced && g_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
-    ble_app_advertise();
-  }
-}
-
-static const char* ble_page_label(UIMode mode) {
-  switch (mode) {
-    case UIMode::RX: return "RX";
-    case UIMode::TX: return "TX";
-    case UIMode::BAND: return "BAND";
-    case UIMode::MENU: return "MENU";
-    case UIMode::MSC: return "MSC";
-    case UIMode::DEBUG: return "DELETE";
-    case UIMode::STATUS: return "STATUS";
-    case UIMode::QSO: return "QSO";
-    case UIMode::GPS: return "GPS";
-    case UIMode::PERF: return "PERF";
-  }
-  return "PAGE";
-}
-
-static void ble_page_meta(int& cur, int& total) {
-  cur = 1;
-  total = 1;
-  switch (ui_mode) {
-    case UIMode::RX:
-      ui_get_rx_page_info(cur, total);
-      break;
-    case UIMode::TX:
-      total = page_count(autoseq_queue_size(), 5);
-      cur = tx_page + 1;
-      break;
-    case UIMode::BAND:
-      total = page_count((int)g_bands.size(), 6);
-      cur = band_page + 1;
-      break;
-    case UIMode::MENU:
-      total = 3;
-      cur = menu_page + 1;
-      break;
-    case UIMode::DEBUG:
-      total = page_count((int)g_d_lines.size(), 6);
-      cur = d_page + 1;
-      break;
-    case UIMode::QSO:
-      if (g_q_show_entries) {
-        cur = q_page + 1;
-        total = cur + (g_q_entries_have_next_page ? 1 : 0);
-      } else {
-        total = page_count((int)g_q_lines.size(), 6);
-        cur = q_page + 1;
-      }
-      break;
-    default:
-      break;
-  }
-  if (total < 1) total = 1;
-  if (cur < 1) cur = 1;
-  if (cur > total) cur = total;
-}
-
-static std::string ble_meta_line() {
-  int cur = 1;
-  int total = 1;
-  ble_page_meta(cur, total);
-
-  char meta[96];
-  const char* label = ble_page_label(ui_mode);
-  if (ui_mode == UIMode::QSO && g_ble_qso_pick_mode) {
-    label = "Fetch";
-  }
-  const char up = (cur > 1) ? 'u' : '-';
-  const char down = (cur < total) ? 'v' : '-';
-  std::snprintf(meta, sizeof(meta), "[%s %c%c]", label, up, down);
-  return std::string(meta);
-}
-
-static const char* menu_edit_label(int idx) {
-  switch (idx) {
-    case 3:  return "Call";
-    case 4:  return "Grid";
-    case 7:  return "Cursor";
-    case 9:  return "IgnoreList";
-    case 10: return "Comment";
-    case 15: return "RTC Comp";
-    case 17: return "Max Retry";
-    default: return "Edit";
-  }
-}
-
-static std::string ble_menu_long_edit_label() {
-  switch (menu_long_kind) {
-    case LONG_FT:
-      return "F";
-    case LONG_COMMENT:
-      return "C";
-    case LONG_ACTIVE:
-      return "ActiveBand";
-    case LONG_IGNORE:
-      return "IgnoreList";
-    case LONG_NONE:
-    default:
-      return "Edit";
-  }
-}
-
-static std::string ble_text_mode_line7() {
-  std::string item = "Edit";
-
-  if (menu_long_edit) {
-    item = ble_menu_long_edit_label();
-  } else if (menu_edit_idx >= 0) {
-    item = menu_edit_label(menu_edit_idx);
-  } else if (band_edit_idx >= 0 && band_edit_idx < (int)g_bands.size()) {
-    item = std::string("Band ") + g_bands[band_edit_idx].name;
-  } else if (status_edit_idx == 4) {
-    item = "Date";
-  } else if (status_edit_idx == 5) {
-    item = "Time";
-  }
-
-  return std::string("[Edit ") + item + "]";
-}
-
-static void ble_slot_second_now(int64_t& slot_idx, int& sec, bool& even_slot) {
-  int64_t now_ms = rtc_now_ms();
-  int64_t slot_ms = now_ms % 15000;
-  if (slot_ms < 0) slot_ms += 15000;
-  slot_idx = (now_ms - slot_ms) / 15000;
-  sec = (int)(slot_ms / 1000);
-  if (sec < 0) sec = 0;
-  if (sec > 14) sec = 14;
-  even_slot = ((slot_idx & 1) == 0);
-}
-
-static std::string ble_timing_token(int sec, bool even_slot, bool txing) {
-  if (sec == 0) return "|";
-  if (sec == 4) return "4";
-  if (sec == 8) return "8";
-  if (sec == 12) return "12";
-  if (txing && (sec == 2 || sec == 6 || sec == 10 || sec == 14)) return "o";
-  return even_slot ? ":" : ".";
-}
-
-static std::string ble_blank_waterfall_header() {
-  return "|                           |";
-}
-
-static void ble_update_waterfall_header_if_due(int64_t slot_idx, int sec) {
-  if (sec != 12) return;
-  if (g_ble_waterfall_slot_idx == slot_idx) return;
-  g_ble_waterfall_slot_idx = slot_idx;
-
-  uint8_t row[UAC_WATERFALL_ROW_WIDTH] = {};
-  if (!audio_source_get_latest_waterfall_row(row, sizeof(row))) {
-    g_ble_waterfall_header = ble_blank_waterfall_header();
-    return;
-  }
-
-  constexpr int kBleWfBins = 27;
-  uint8_t bins[kBleWfBins] = {};
-  for (int i = 0; i < kBleWfBins; ++i) {
-    int start = (int)((int64_t)i * UAC_WATERFALL_ROW_WIDTH / kBleWfBins);
-    int end = (int)((int64_t)(i + 1) * UAC_WATERFALL_ROW_WIDTH / kBleWfBins);
-    if (end <= start) end = start + 1;
-    uint8_t vmax = 0;
-    for (int x = start; x < end && x < UAC_WATERFALL_ROW_WIDTH; ++x) {
-      if (row[x] > vmax) vmax = row[x];
-    }
-    bins[i] = vmax;
-  }
-
-  uint8_t min_v = 255;
-  uint8_t max_v = 0;
-  for (int i = 0; i < kBleWfBins; ++i) {
-    if (bins[i] < min_v) min_v = bins[i];
-    if (bins[i] > max_v) max_v = bins[i];
-  }
-
-  static const char kChars[4] = {' ', '.', ':', '!'};
-  char chars[kBleWfBins + 1];
-  chars[kBleWfBins] = '\0';
-  if (max_v <= min_v) {
-    for (int i = 0; i < kBleWfBins; ++i) chars[i] = ' ';
-  } else {
-    const int span = (int)max_v - (int)min_v;
-    for (int i = 0; i < kBleWfBins; ++i) {
-      const int scaled = (int)bins[i] - (int)min_v;
-      int level = (scaled * 3 + (span / 2)) / span;  // 0..3, rounded
-      if (level < 0) level = 0;
-      if (level > 3) level = 3;
-      chars[i] = kChars[level];
-    }
-  }
-
-  g_ble_waterfall_header.clear();
-  g_ble_waterfall_header.reserve(kBleWfBins + 2);
-  g_ble_waterfall_header.push_back('|');
-  g_ble_waterfall_header.append(chars, kBleWfBins);
-  g_ble_waterfall_header.push_back('|');
-}
-
-static void ble_start_qso_pick_mode() {
-  if (g_ble_qso_pick_mode) return;
-  g_ble_qso_return_mode = ui_mode;
-  g_ble_qso_pick_mode = true;
-  g_ble_dump_in_progress = false;
-  g_q_show_entries = false;
-  g_q_page_view = QPageView::Default;
-  q_page = 0;
-  enter_mode(UIMode::QSO);
-  qso_draw_page();
-  g_ble_force_send = true;
-}
-
-static void ble_cancel_qso_pick_mode() {
-  if (!g_ble_qso_pick_mode) return;
-  g_ble_qso_pick_mode = false;
-  g_ble_dump_in_progress = false;
-  if (ble_cmd_queue) xQueueReset(ble_cmd_queue);
-  enter_mode(g_ble_qso_return_mode);
-  g_ble_force_send = true;
-}
-
-static void ble_dump_qso_file(const std::string& file_name) {
-  g_ble_dump_in_progress = true;
-  const bool use_indicate = g_ble_tx_indicate_enabled;
-  ble_dump_reset_transfer_state(use_indicate);
-  std::string full_path = std::string("/storage/") + file_name;
-  if (!use_indicate) {
-    (void)ble_dump_send_line("fallback notify mode (best effort)");
-  }
-  (void)ble_dump_send_line(std::string("\n--- <") + file_name + "> ---");
-
-  {
-    StorageLockGuard guard;
-    if (!guard.held()) {
-      (void)ble_dump_send_line("Storage busy");
-    } else {
-      FILE* f = fopen(full_path.c_str(), "r");
-      if (!f) {
-        (void)ble_dump_send_line("Open fail");
-      } else {
-        char line[512];
-        while (fgets(line, sizeof(line), f)) {
-          g_ble_dump_xfer.file_lines++;
-          (void)ble_dump_send_line(line);
-        }
-        fclose(f);
-      }
-    }
-  }
-  (void)ble_dump_send_line("--- EOF ---");
-  {
-    char summary[160];
-    std::snprintf(summary, sizeof(summary),
-                  "F summary mode=%s mtu=%u lines=%d retries=%d failed=%d",
-                  use_indicate ? "INDICATE" : "NOTIFY",
-                  (unsigned)g_ble_dump_xfer.mtu,
-                  g_ble_dump_xfer.file_lines,
-                  g_ble_dump_xfer.retries,
-                  g_ble_dump_xfer.failed_lines);
-    (void)ble_dump_send_line(summary);
-  }
-
-  g_ble_dump_in_progress = false;
-  g_ble_indicate_waiting = false;
-  g_ble_dump_xfer.active = false;
-  if (ui_mode == UIMode::QSO) {
-    qso_draw_page();
-  }
-  g_ble_force_send = true;
-}
-
-static void ble_try_dump_qso_file_by_key(char key) {
-  if (key < '1' || key > '6') return;
-  int idx = q_page * 6 + (key - '1');
-  if (idx < 0 || idx >= (int)g_q_files.size()) return;
-  if (!g_ble_enabled || g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
-  ble_dump_qso_file(g_q_files[idx]);
-}
-
-static bool ble_status_clock_only_delta(const std::vector<std::string>& lines,
-                                        const std::string& line7) {
-  if (!g_ble_last_screen_valid) return false;
-  if (line7 != g_ble_last_line7) return false;
-  bool changed = false;
-  for (int i = 0; i < 6; ++i) {
-    if (lines[i] == g_ble_last_screen_lines[i]) continue;
-    if (i != 4 && i != 5) return false;  // STATUS line5/6 only (Date/Time)
-    changed = true;
-  }
-  return changed;
-}
-
-static bool ble_gps_clock_only_delta(const std::vector<std::string>& lines,
-                                     const std::string& line7) {
-  if (!g_ble_last_screen_valid) return false;
-  if (line7 != g_ble_last_line7) return false;
-  for (int i = 0; i < 6; ++i) {
-    if (lines[i] != g_ble_last_screen_lines[i]) return true;
-  }
-  return false;
-}
-
-static void ble_mirror_tick() {
-  // Text-terminal screen mirror is removed. The native BLE service
-  // (ble_native.cpp) now pushes state changes via its own EVENTS /
-  // RX_LIST / QSO_QUEUE / RADIO_STREAM characteristics.
-  return;
-  // Dead code below kept temporarily for reference; will be pruned
-  // once step 5 confirms no regressions. Unreachable, zero cost.
-  if (!g_ble_enabled) return;
-  if (g_ble_dump_in_progress) return;
-  if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
-
-  std::vector<std::string> lines;
-  ui_get_visible_text_lines(lines);
-  while ((int)lines.size() < 6) lines.push_back("");
-
-  const std::string line7 = g_ble_text_mode ? ble_text_mode_line7() : ble_meta_line();
-
-  bool snapshot_changed = g_ble_force_send || !g_ble_last_screen_valid || (line7 != g_ble_last_line7);
-  if (!snapshot_changed) {
-    for (int i = 0; i < 6; ++i) {
-      if (lines[i] != g_ble_last_screen_lines[i]) {
-        snapshot_changed = true;
-        break;
-      }
-    }
-  }
-  if (!snapshot_changed) return;
-
-  int64_t status_slot_idx = -1;
-  if (!g_ble_force_send &&
-      ui_mode == UIMode::STATUS &&
-      !g_ble_text_mode &&
-      ble_status_clock_only_delta(lines, line7)) {
-      int sec = 0;
-      bool even_slot = true;
-      ble_slot_second_now(status_slot_idx, sec, even_slot);
-      if (g_ble_status_clock_slot_sent == status_slot_idx) {
-        return;
-      }
-  }
-
-  int64_t gps_slot_idx = -1;
-  if (!g_ble_force_send &&
-      ui_mode == UIMode::GPS &&
-      !g_ble_text_mode &&
-      ble_gps_clock_only_delta(lines, line7)) {
-      int sec = 0;
-      bool even_slot = true;
-      ble_slot_second_now(gps_slot_idx, sec, even_slot);
-      if (g_ble_gps_slot_sent == gps_slot_idx) {
-        return;
-      }
-  }
-
-  std::string screen_key;
-  screen_key.reserve(256);
-  for (int i = 0; i < 6; ++i) {
-    screen_key += lines[i];
-    screen_key.push_back('\n');
-  }
-  screen_key += line7;
-
-  g_ble_force_send = false;
-  g_ble_last_payload = screen_key;
-  for (int i = 0; i < 6; ++i) {
-    g_ble_last_screen_lines[i] = lines[i];
-  }
-  g_ble_last_line7 = line7;
-  g_ble_last_screen_valid = true;
-
-  if (ui_mode == UIMode::STATUS && !g_ble_text_mode) {
-    if (status_slot_idx < 0) {
-      int sec = 0;
-      bool even_slot = true;
-      ble_slot_second_now(status_slot_idx, sec, even_slot);
-    }
-    g_ble_status_clock_slot_sent = status_slot_idx;
-  }
-  if (ui_mode == UIMode::GPS && !g_ble_text_mode) {
-    if (gps_slot_idx < 0) {
-      int sec = 0;
-      bool even_slot = true;
-      ble_slot_second_now(gps_slot_idx, sec, even_slot);
-    }
-    g_ble_gps_slot_sent = gps_slot_idx;
-  }
-
-  if (g_ble_last_tick_slot < 0 || g_ble_last_tick_sec < 0) {
-    int64_t slot_idx = 0;
-    int sec = 0;
-    bool even_slot = true;
-    ble_slot_second_now(slot_idx, sec, even_slot);
-    g_ble_last_tick_slot = slot_idx;
-    g_ble_last_tick_sec = sec;
-  }
-
-  std::string out;
-  out.reserve(screen_key.size() + 120);
-  out += "\n";
-  out += std::string(29, '=');
-  out += "\n";
-  out += g_ble_waterfall_header.empty() ? ble_blank_waterfall_header() : g_ble_waterfall_header;
-  out += "\n";
-  out += "---.----+----.----+----.----+";
-  out += "\n";
-  out += screen_key;
-  ble_notify_payload(out);
-}
-
-static void ble_countdown_tick() {
-  // Terminal-mode countdown token removed; the native app derives the
-  // slot clock from its own RTC synced via set_rtc RPC.
-  return;
-  if (!g_ble_enabled) return;
-  if (g_ble_dump_in_progress) return;
-  if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
-
-  const uint32_t seq = g_ble_decode_event_seq;
-  if (seq != g_ble_decode_event_seq_seen) {
-    g_ble_decode_event_seq_seen = seq;
-    if (!g_ble_text_mode) {
-      char buf[24];
-      std::snprintf(buf, sizeof(buf), "[D:%d]", g_ble_decode_event_count);
-      ble_notify_payload(std::string(buf));
-    }
-  }
-
-  int64_t slot_idx = 0;
-  int sec = 0;
-  bool even_slot = true;
-  ble_slot_second_now(slot_idx, sec, even_slot);
-  ble_update_waterfall_header_if_due(slot_idx, sec);
-
-  if (g_ble_last_tick_slot == slot_idx && g_ble_last_tick_sec == sec) return;
-  if (g_ble_last_tick_slot < 0 || g_ble_last_tick_sec < 0) {
-    g_ble_last_tick_slot = slot_idx;
-    g_ble_last_tick_sec = sec;
-    return;
-  }
-
-  g_ble_last_tick_slot = slot_idx;
-  g_ble_last_tick_sec = sec;
-  ble_notify_payload(ble_timing_token(sec, even_slot, g_tx_active));
-}
-
-static void ble_on_sync(void) {
-  int rc = ble_hs_util_ensure_addr(0);
-  if (rc != 0) {
-    ESP_LOGE(BT_TAG, "ensure addr failed: %d", rc);
-    return;
-  }
-  rc = ble_hs_id_infer_auto(0, &g_own_addr_type);
-  if (rc != 0) {
-    ESP_LOGE(BT_TAG, "infer auto addr failed: %d", rc);
-    return;
-  }
-  g_ble_synced = true;
-  ble_update_name_from_station(false);
-  ble_app_advertise();
-}
-
-static void nimble_host_task(void* param) {
-  (void)param;
-  nimble_port_run();
-  nimble_port_freertos_deinit();
-}
-
-static void ble_app_advertise(void) {
-  if (!g_ble_enabled) return;
-  if (!g_ble_synced) return;
-  if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE) return;
-
-  struct ble_gap_adv_params adv{};
-  adv.conn_mode = BLE_GAP_CONN_MODE_UND;
-  adv.disc_mode = BLE_GAP_DISC_MODE_GEN;
-
-  // Primary AD carries flags + the 128-bit service UUID so iOS can pre-filter
-  // (a custom 128-bit UUID + flags is already 21 of the 31 AD bytes, leaving
-  // no room for the name). The complete name travels in the scan response.
-  static ble_uuid128_t svc_uuid = BLE_UUID128_INIT(BLE_NATIVE_SVC_UUID);
-
-  struct ble_hs_adv_fields fields{};
-  fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-  fields.uuids128 = &svc_uuid;
-  fields.num_uuids128 = 1;
-  fields.uuids128_is_complete = 1;
-
-  const std::string name = g_ble_adv_name.empty() ? std::string("Mini-FT8") : g_ble_adv_name;
-  struct ble_hs_adv_fields rsp_fields{};
-  rsp_fields.name = (uint8_t*)name.c_str();
-  rsp_fields.name_len = name.size();
-  rsp_fields.name_is_complete = 1;
-
-  ble_gap_adv_stop();
-  int rc = ble_gap_adv_set_fields(&fields);
-  if (rc != 0) {
-    ESP_LOGE(BT_TAG, "adv_set_fields failed: %d", rc);
-    return;
-  }
-  rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
-  if (rc != 0) {
-    ESP_LOGE(BT_TAG, "adv_rsp_set_fields failed: %d", rc);
-    return;
-  }
-  rc = ble_gap_adv_start(g_own_addr_type, nullptr, BLE_HS_FOREVER, &adv, gap_cb, nullptr);
-  if (rc != 0) {
-    ESP_LOGE(BT_TAG, "adv_start failed: %d", rc);
-  } else {
-    ESP_LOGI(BT_TAG, "Advertising as %s", name.c_str());
-  }
-}
-
-#else  // ENABLE_BLE
-static bool ble_pop_input(BleUiInput& out) { (void)out; return false; }
-static void ble_update_name_from_station(bool restart_adv) { (void)restart_adv; }
-static void apply_ble_enabled_policy(bool runtime_apply) {
-  (void)runtime_apply;
-  g_time_osr = 2;  // 6kHz sample rate enables time_osr=2 always
-  g_freq_osr = 1;
-}
-static void ble_mirror_tick() {}
-static void ble_countdown_tick() {}
-static void init_bluetooth(void) {}
-static void nimble_teardown(void) {}
-#endif // ENABLE_BLE
 
 static std::string trim_copy(const std::string& s) {
   size_t b = 0, e = s.size();
@@ -5851,168 +4643,6 @@ static void enter_mode(UIMode new_mode) {
   }
 }
 
-#if ENABLE_BLE
-static void ble_enter_text_mode() {
-  g_ble_text_mode = true;
-}
-
-static void ble_exit_text_mode() {
-  g_ble_text_mode = false;
-}
-
-static bool ble_text_target_active() {
-  return menu_long_edit ||
-         menu_edit_idx >= 0 ||
-         band_edit_idx >= 0 ||
-         status_edit_idx == 4 ||
-         status_edit_idx == 5;
-}
-
-static void ble_commit_text_input(const BleUiInput& input) {
-  std::string value = ble_trim_trailing_crlf(input.data, input.len);
-
-  if (menu_long_edit) {
-    if (menu_long_kind != LONG_COMMENT) {
-      ascii_upper_inplace(value);
-    }
-    if (menu_long_kind == LONG_IGNORE && value.size() > kIgnorePrefixTextMaxLen) {
-      value.resize(kIgnorePrefixTextMaxLen);
-    }
-    menu_long_buf = value;
-    if (menu_long_kind == LONG_FT) {
-      g_free_text = menu_long_buf;
-      if (g_cq_type == CqType::CQFREETEXT) g_cq_freetext = g_free_text;
-      update_autoseq_cq_type();
-    } else if (menu_long_kind == LONG_COMMENT) {
-      g_comment1 = menu_long_buf;
-    } else if (menu_long_kind == LONG_ACTIVE) {
-      g_active_band_text = menu_long_buf;
-      rebuild_active_bands();
-    } else if (menu_long_kind == LONG_IGNORE) {
-      g_ignore_prefix_text = clamp_ignore_prefix_text(menu_long_buf);
-      rebuild_ignore_prefixes();
-    }
-    save_station_data();
-    menu_long_edit = false;
-    menu_long_kind = LONG_NONE;
-    menu_long_buf.clear();
-    menu_long_backup.clear();
-    draw_menu_view();
-    ble_exit_text_mode();
-    return;
-  }
-
-  if (menu_edit_idx >= 0) {
-    if (menu_edit_idx != 10) {
-      ascii_upper_inplace(value);
-    }
-    if (menu_edit_idx == 7 && value.size() > 10) value.resize(10);
-    if (menu_edit_idx == 15 && value.size() > 11) value.resize(11);
-    if (menu_edit_idx == 17 && value.size() > 10) value.resize(10);
-    menu_edit_buf = value;
-    bool should_save = true;
-
-    // Absolute indices across pages
-    if (menu_edit_idx == 3) { g_call = menu_edit_buf; autoseq_set_station(g_call, grid_ft8_4(g_grid)); }
-    else if (menu_edit_idx == 4) {
-      const std::string norm_grid = normalize_grid_maidenhead(menu_edit_buf);
-      if (!norm_grid.empty()) {
-        g_grid = norm_grid;
-        g_grid_saved_manual = g_grid;
-        g_grid_from_gps = false;
-        autoseq_set_station(g_call, grid_ft8_4(g_grid));
-      } else {
-        should_save = false;
-        ble_notify_payload("ERROR: use GRID AA00/AA00aa/AA00aa00");
-      }
-    }
-    else if (menu_edit_idx == 7) { g_offset_hz = atoi(menu_edit_buf.c_str()); redraw_countdown_now(); }
-    else if (menu_edit_idx == 10) { g_comment1 = menu_edit_buf; }
-    else if (menu_edit_idx == 15) {
-      char* end = nullptr;
-      long v = std::strtol(menu_edit_buf.c_str(), &end, 10);
-      if (end != menu_edit_buf.c_str() && end && *end == '\0') {
-        g_rtc_comp = clamp_rtc_comp_value((int)v);
-      }
-    } else if (menu_edit_idx == 17) {
-      char* end = nullptr;
-      long v = std::strtol(menu_edit_buf.c_str(), &end, 10);
-      if (end != menu_edit_buf.c_str() && end && *end == '\0') {
-        if (v < 0) v = 0;
-        g_autoseq_max_retry = (int)v;
-        autoseq_set_max_retry(g_autoseq_max_retry);
-      }
-    }
-    if (menu_edit_idx == 3) {
-      ble_update_name_from_station(true);
-    }
-    if (should_save) {
-      save_station_data();
-    }
-    menu_edit_idx = -1;
-    menu_edit_buf.clear();
-    draw_menu_view();
-    ble_exit_text_mode();
-    return;
-  }
-
-  if (band_edit_idx >= 0) {
-    if (value.size() > 10) value.resize(10);
-    band_edit_buffer = value;
-    if (!band_edit_buffer.empty()) {
-      char* end = nullptr;
-      long v = std::strtol(band_edit_buffer.c_str(), &end, 10);
-      if (end != band_edit_buffer.c_str() && *end == '\0') {
-        g_bands[band_edit_idx].freq = (int)v;
-        save_station_data();
-      }
-    }
-    band_edit_idx = -1;
-    band_edit_buffer.clear();
-    draw_band_view();
-    ble_exit_text_mode();
-    return;
-  }
-
-  if (status_edit_idx == 4 || status_edit_idx == 5) {
-    const size_t max_len = status_edit_buffer.size();
-    if (value.size() > max_len) value.resize(max_len);
-    status_edit_buffer = value;
-    if (status_edit_idx == 4) {
-      const std::string old_date = g_date;
-      const std::string normalized = normalize_date_ymd(status_edit_buffer);
-      if (!normalized.empty()) {
-        g_date = normalized;
-        if (rtc_set_from_strings()) {
-          g_time_synced_from_gps = false;
-          rtc_sync_to_hw();  // Persist to hardware RTC
-          save_station_data();
-        } else {
-          g_date = old_date;
-          ble_notify_payload("ERROR: use DATE YYYY-MM-DD");
-        }
-      } else {
-        g_date = old_date;
-        ble_notify_payload("ERROR: use DATE YYYY-MM-DD");
-      }
-    } else {
-      g_time = normalize_time_hms(status_edit_buffer);
-      g_time_synced_from_gps = false;
-      save_station_data();
-      rtc_set_from_strings();
-      rtc_sync_to_hw();  // Persist to hardware RTC
-    }
-    status_edit_idx = -1;
-    status_cursor_pos = -1;
-    status_edit_buffer.clear();
-    draw_status_view();
-    ble_exit_text_mode();
-    return;
-  }
-
-  ble_exit_text_mode();
-}
-#endif
 
 // Switch to MSC (USB Mass Storage) mode. This is a one-way transition:
 // USB-OTG is re-claimed as a device port until reboot.
@@ -6275,13 +4905,12 @@ static void app_task_core0(void* /*param*/) {
   ui_init(radio_type_uses_display_only(g_radio));
   hashtable_init();
 
-
   // Initialize autoseq engine
   autoseq_init();
 
   // Initialize the functional-core API (creates internal sync primitives).
-  // After this, core_api.h consumers (Cardputer UI, future BLE server) can
-  // safely call core_get_*, core_cmd_*, and register callbacks.
+  // After this, UI consumers can call core_get_*, core_cmd_*, and register
+  // callbacks.
   core_init();
 
   // Register the Cardputer UI as a core_api consumer. The callbacks just set
@@ -6368,7 +4997,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     M5Cardputer.Keyboard.updateKeysState();
     auto &state = M5Cardputer.Keyboard.keysState();
     char c = 0;
-    bool c_from_ble = false;
     if (!state.word.empty()) {
       c = state.word.back();
       state.word.clear();  // consume key
@@ -6472,7 +5100,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     }
 
     if (ui_mode == UIMode::MSC) {
-      if (c != 0 && c != last_key && !c_from_ble) {
+      if (c != 0 && c != last_key) {
         ESP_LOGI(TAG, "Keypress in MSC mode -> reboot");
         vTaskDelay(pdMS_TO_TICKS(100));
         esp_restart();
@@ -6486,7 +5114,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     if (c == '`' &&
         (ui_mode == UIMode::RX || ui_mode == UIMode::TX || ui_mode == UIMode::STATUS) &&
         status_edit_idx == -1) {
-      core_cmd_cancel_tx();  // routes through core_api — same effect, plus BLE notify
+      core_cmd_cancel_tx();
       debug_log_line("TX cancel requested");
       last_key = c;
       vTaskDelay(pdMS_TO_TICKS(10));
@@ -6641,12 +5269,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       }
       else if (c == 'q' || c == 'Q') { cancel_status_edit(); enter_mode(ui_mode == UIMode::QSO ? UIMode::RX : UIMode::QSO); switched = true; }
       else if (c == 'c' || c == 'C') {
-#if ENABLE_BLE
-        if (c_from_ble) {
-          // BLE 'C' is intentionally ignored.
-          switched = true;
-        } else
-#endif
         {
           cancel_status_edit();
           if (ui_mode != UIMode::MSC) {
@@ -6658,7 +5280,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       else if (c == 'd' || c == 'D') { cancel_status_edit(); enter_mode(ui_mode == UIMode::DEBUG ? UIMode::RX : UIMode::DEBUG); switched = true; }
       else if (c == 's' || c == 'S') { cancel_status_edit(); enter_mode(ui_mode == UIMode::STATUS ? UIMode::RX : UIMode::STATUS); switched = true; }
       else if (c == 'g' || c == 'G') { cancel_status_edit(); enter_mode(ui_mode == UIMode::GPS ? UIMode::RX : UIMode::GPS); switched = true; }
-      else if (!c_from_ble && (c == 'p' || c == 'P')) { cancel_status_edit(); enter_mode(ui_mode == UIMode::PERF ? UIMode::RX : UIMode::PERF); switched = true; }
+      else if (c == 'p' || c == 'P') { cancel_status_edit(); enter_mode(ui_mode == UIMode::PERF ? UIMode::RX : UIMode::PERF); switched = true; }
     }
 
   if (!switched && c) {
@@ -6669,8 +5291,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       case UIMode::RX: {
         int sel = ui_handle_rx_key(c);
         if (sel >= 0 && core_cmd_tap_rx(sel)) {
-          // TX-state arming now lives inside core_cmd_tap_rx so both the
-          // Cardputer key path and the BLE tap_rx RPC arm immediately.
+          // TX-state arming lives inside core_cmd_tap_rx for every UI path.
           rx_flash_idx = sel;
           rx_flash_deadline = rtc_now_ms() + 500;
           ui_draw_rx(rx_flash_idx);
@@ -6738,9 +5359,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 band_edit_idx = idx;
                 band_edit_buffer = std::to_string(g_bands[idx].freq);
                 draw_band_view();
-#if ENABLE_BLE
-                if (c_from_ble) ble_enter_text_mode();
-#endif
               }
             }
           }
@@ -6784,15 +5402,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
               }
               else if (c == '5') {
                 status_edit_idx = 4; status_edit_buffer = g_date; status_cursor_pos = 0; while (status_cursor_pos < (int)status_edit_buffer.size() && (status_edit_buffer[status_cursor_pos] == '-')) status_cursor_pos++; draw_status_view();
-#if ENABLE_BLE
-                if (c_from_ble) ble_enter_text_mode();
-#endif
               }
               else if (c == '6') {
                 status_edit_idx = 5; status_edit_buffer = g_time; status_cursor_pos = 0; while (status_cursor_pos < (int)status_edit_buffer.size() && (status_edit_buffer[status_cursor_pos] == ':')) status_cursor_pos++; draw_status_view();
-#if ENABLE_BLE
-                if (c_from_ble) ble_enter_text_mode();
-#endif
               }
             } else {
               if (status_edit_idx == 1) {
@@ -6877,20 +5489,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
           break;
         }
         case UIMode::QSO: {
-#if ENABLE_BLE
-          if (g_ble_qso_pick_mode) {
-            if (c == ';') {
-              if (q_page > 0) { q_page--; qso_draw_page(); }
-            } else if (c == '.') {
-              if ((q_page + 1) * 6 < (int)g_q_lines.size()) { q_page++; qso_draw_page(); }
-            } else if (c >= '1' && c <= '6') {
-              ble_try_dump_qso_file_by_key(c);
-            } else if (c == '`') {
-              ble_cancel_qso_pick_mode();
-            }
-            break;
-          }
-#endif
           if (!g_q_show_entries) {
             if (c == ';') {
               if (q_page > 0) { q_page--; qso_draw_page(); }
@@ -7125,23 +5723,14 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 menu_long_buf = g_free_text;
                 menu_long_backup = g_free_text;
                 draw_menu_view();
-#if ENABLE_BLE
-                if (c_from_ble) ble_enter_text_mode();
-#endif
               } else if (c == '4') {
                 menu_edit_idx = 3; // Call (line index 3)
                 menu_edit_buf = g_call;
                 draw_menu_view();
-#if ENABLE_BLE
-                if (c_from_ble) ble_enter_text_mode();
-#endif
               } else if (c == '5') {
                 menu_edit_idx = 4; // Grid (line index 4)
                 menu_edit_buf = g_grid;
                 draw_menu_view();
-#if ENABLE_BLE
-                if (c_from_ble) ble_enter_text_mode();
-#endif
               } else if (c == '6') {
                 ESP_LOGI(TAG, "Entering deep sleep (GPIO0 wake)");
                 // Save current accurate time for compensation after wake-up
@@ -7169,16 +5758,13 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   menu_cursor_edit_original = g_offset_hz;
                   menu_edit_buf = std::to_string(g_offset_hz);
                   draw_menu_view();
-#if ENABLE_BLE
-                  if (c_from_ble) ble_enter_text_mode();
-#endif
                 } else if (c == '3') {
                   RadioType old_radio = canonical_radio_type(g_radio);
                   audio_source_backend_t old_audio = get_radio_profile_binding(old_radio).audio_backend;
-                  bool was_streaming = audio_source_is_streaming();
-                  switch (canonical_radio_type(g_radio)) {
-                    case RadioType::QMX:
-                      g_radio = RadioType::KH1_USBC;
+                    bool was_streaming = audio_source_is_streaming();
+                    switch (canonical_radio_type(g_radio)) {
+                      case RadioType::QMX:
+                        g_radio = RadioType::KH1_USBC;
                       break;
                     case RadioType::KH1_USBC:
                       g_radio = RadioType::KH1_MIC;
@@ -7208,18 +5794,12 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   menu_long_buf = g_ignore_prefix_text;
                   menu_long_backup = g_ignore_prefix_text;
                   draw_menu_view();
-#if ENABLE_BLE
-                  if (c_from_ble) ble_enter_text_mode();
-#endif
                 } else if (c == '5') {
                   menu_long_edit = true;
                   menu_long_kind = LONG_COMMENT;
                   menu_long_buf = g_comment1;
                   menu_long_backup = g_comment1;
                   draw_menu_view();
-#if ENABLE_BLE
-                  if (c_from_ble) ble_enter_text_mode();
-#endif
                 }
             } else if (menu_page == 2) {
               if (c == '1') {
@@ -7237,16 +5817,10 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 menu_long_buf = g_active_band_text;
                 menu_long_backup = g_active_band_text;
                 draw_menu_view();
-#if ENABLE_BLE
-                if (c_from_ble) ble_enter_text_mode();
-#endif
               } else if (c == '4') {
                 menu_edit_idx = 15; // RTC Comp line
                 menu_edit_buf = std::to_string(g_rtc_comp);
                 draw_menu_view();
-#if ENABLE_BLE
-                if (c_from_ble) ble_enter_text_mode();
-#endif
               } else if (c == '5') {
                 CopyLogsResult copy_res = copy_logs_spiffs_to_sd_overwrite();
                 menu_flash_idx = 16; // abs index of page 2 line 5
@@ -7276,9 +5850,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 menu_edit_idx = 17; // Max Retry line
                 menu_edit_buf = std::to_string(g_autoseq_max_retry);
                 draw_menu_view();
-#if ENABLE_BLE
-                if (c_from_ble) ble_enter_text_mode();
-#endif
               }
             }
           }
@@ -7287,11 +5858,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       }
     }
 
-#if ENABLE_BLE
-    if (g_ble_text_mode && !ble_text_target_active()) {
-      ble_exit_text_mode();
-    }
-#endif
 
     vTaskDelay(pdMS_TO_TICKS(10));
   }

@@ -56,7 +56,7 @@ static void waterfall_init(ftx_waterfall_t* me, int max_blocks, int num_bins, in
     me->mag = waterfall_mag_buf;
 }
 
-// Static waterfall buffer — avoids heap fragmentation on ESP32 with BLE.
+// Static waterfall buffer avoids heap fragmentation during USB and DSP work.
 // Sized for FT8 at 6kHz: max_blocks=93, time_osr=2, freq_osr=1, num_bins=433
 #define WF_STATIC_SIZE  (93 * 2 * 1 * 433)  // 80,538 bytes
 static WF_ELEM_T waterfall_static_buf[WF_STATIC_SIZE];
@@ -94,8 +94,8 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
 
     // FFT work buffer — use a static buffer in BSS to avoid heap
     // fragmentation. For nfft=960 (6 kHz, freq_osr=1), kiss_fftr needs
-    // ~10 KB contiguous; the heap often can't provide that once NimBLE
-    // and USB-host have done their setup. A static 12 KB arena is
+    // ~10 KB contiguous; the heap may not provide that after USB-host and
+    // audio-pipeline setup. A static 12 KB arena is
     // plenty and adds 12 KB to BSS (was coming out of heap anyway).
     static uint8_t fft_work_static[12288];
     size_t fft_needed = 0;
