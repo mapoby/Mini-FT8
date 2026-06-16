@@ -6,7 +6,7 @@ Also see [PaperFT8](https://github.com/wcheng95/PaperFT8)
 ![First POTA Activation](IMG_6087.jpeg)
 
 ## Mini-FT8 Release Notice
-Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure between Zhenxing (N6HAN) and Wei (AG6AQ), with inspiration from DXFT8 by Barb (WB2CBA) and Charley (W5BAA). It has been a great learning platform for me, and I hope you find it just as fun to use. It supports FT8 and FT4 with QMX and QDX, plus FT8 with KH1.
+Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure between Zhenxing (N6HAN) and Wei (AG6AQ), with inspiration from DXFT8 by Barb (WB2CBA) and Charley (W5BAA). It has been a great learning platform for me, and I hope you find it just as fun to use. It supports FT8 and FT4 with QMX, QDX, and KH1.
 
 ### Thanks
 
@@ -168,7 +168,7 @@ updates write the DS3231 when it is present; FT8 decode fine corrections do not.
                                      │ SW: NA                     │
                                      └────────────────────────────┘
 ```
-- TX + RX (FT8 QSO) (V2.0.2 Supports Cardputer direct microphone in, so the **USB-C adapter becomes optional, choose KH1-Mic**)
+- TX + RX (FT8/FT4 QSO) (V2.0.2 Supports Cardputer direct microphone in, so the **USB-C adapter becomes optional, choose KH1-Mic**)
   - Use a USB-C audio/mic adapter for RX. Tested adapter: Amazon `B0FWC9ZFC4`. Other adapters may also work, but this one is confirmed.
   - Supply 5 V to PORTA; otherwise, the USB-C OTG port will not be powered. **Make sure the micro swithch is on the right**
 ```text

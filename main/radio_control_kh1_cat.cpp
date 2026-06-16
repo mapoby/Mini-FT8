@@ -8,6 +8,7 @@
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "kh1_tone_map.h"
 
 static const char* TAG = "RADIO_KH1";
 
@@ -25,7 +26,6 @@ static int s_tx_base_hz = 1500;
 static int s_current_fa10 = -1;
 static bool s_tx_active = false;
 
-static constexpr int k_fo_map[8] = {0, 6, 13, 19, 25, 31, 38, 44};
 static constexpr int k_diag_key_ms = 750;
 static constexpr int k_diag_tone_ms = 160;
 
@@ -140,11 +140,7 @@ static esp_err_t kh1_begin_tx(int freq_hz, int tx_base_hz) {
 static esp_err_t kh1_set_tone_hz(float tone_hz) {
     if (!s_tx_active) return ESP_ERR_INVALID_STATE;
 
-    int tone_idx = (int)lrintf((tone_hz - (float)s_tx_base_hz) / 6.25f);
-    if (tone_idx < 0) tone_idx = 0;
-    if (tone_idx > 7) tone_idx = 7;
-
-    int fo = k_fo_map[tone_idx];
+    int fo = kh1_fo_from_tone_hz(tone_hz, (float)s_tx_base_hz);
     char cmd[16];
     snprintf(cmd, sizeof(cmd), "FO%02d;", fo);
     return kh1_send_cmd(cmd, 10);
@@ -203,7 +199,7 @@ static esp_err_t kh1_diag_send_fo_index(int tone_idx, uint32_t timeout_ms) {
     if (tone_idx < 0) tone_idx = 0;
     if (tone_idx > 7) tone_idx = 7;
     char cmd[16];
-    snprintf(cmd, sizeof(cmd), "FO%02d;", k_fo_map[tone_idx]);
+    snprintf(cmd, sizeof(cmd), "FO%02d;", kh1_fo_from_delta_hz(6.25f * (float)tone_idx));
     return kh1_send_cmd(cmd, timeout_ms);
 }
 
