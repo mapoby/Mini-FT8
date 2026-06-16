@@ -54,6 +54,7 @@ extern "C" {
 #include "radio_control.h"
 #include "radio_control_backend.h"
 #include "gps.h"
+#include "external_rtc.h"
 
 #include "storage_service.h"
 
@@ -340,6 +341,13 @@ static bool rewrite_dxpedition_for_mycall(const std::string& raw_text,
 
 static const char* TAG = "FT8";
 enum class UIMode { RX, TX, BAND, MENU, MSC, DEBUG, STATUS, QSO, GPS, PERF };
+enum class RtcTimeSource : uint8_t {
+  SAVED = 0,
+  ESP_RTC,
+  DS3231,
+  GPS,
+  MANUAL,
+};
 static UIMode ui_mode = UIMode::RX;
 static int tx_page = 0;
 // NOTE: previous `std::vector<UiRxLine> g_rx_lines` was removed to eliminate
@@ -435,8 +443,12 @@ static void host_process_bytes(const uint8_t* buf, size_t len);
 static void enter_mode(UIMode new_mode);
 static std::string menu_sleep_batt_line();
 static int normalize_gps_baud_value(int value);
-bool rtc_set_from_strings();   // visible to core_api.cpp
-void rtc_sync_to_hw();         // visible to core_api.cpp
+static bool rtc_set_from_strings_source(RtcTimeSource source);
+static esp_err_t rtc_write_external_from_soft(const char* reason);
+static const char* rtc_time_source_suffix();
+bool rtc_set_from_strings();
+bool rtc_apply_manual_time_from_strings();   // visible to core_api.cpp
+void rtc_sync_to_esp_rtc();                  // visible to core_api.cpp
 static bool g_rx_dirty = false;
 
 
@@ -532,6 +544,7 @@ static time_t rtc_epoch_base = 0;
 static int64_t rtc_ms_start = 0;
 static int64_t rtc_last_update = 0;
 static bool rtc_valid = false;
+static RtcTimeSource g_rtc_time_source = RtcTimeSource::SAVED;
 
 // RTC deep sleep compensation
 // rtc_sleep_epoch: epoch time when entering deep sleep (for calculating elapsed time)
@@ -1764,8 +1777,9 @@ static void gps_runtime_tick() {
       const std::string old_time = g_time;
       g_date = st.date_utc;
       g_time = st.time_utc;
-      if (rtc_set_from_strings()) {
-        rtc_sync_to_hw();
+      if (rtc_set_from_strings_source(RtcTimeSource::GPS)) {
+        rtc_sync_to_esp_rtc();
+        (void)rtc_write_external_from_soft("GPS");
         s_time_synced_once = true;
         g_time_synced_from_gps = true;
         if (hour_key >= 0) s_last_time_sync_hour_key = hour_key;
@@ -1993,7 +2007,79 @@ static std::string highlight_pos(const std::string& s, int pos) {
 
 static void draw_status_view();
 
-bool rtc_set_from_strings() {
+static const char* rtc_time_source_suffix() {
+  switch (g_rtc_time_source) {
+    case RtcTimeSource::DS3231: return " R";
+    case RtcTimeSource::GPS: return " G";
+    case RtcTimeSource::SAVED:
+    case RtcTimeSource::ESP_RTC:
+    case RtcTimeSource::MANUAL:
+    default:
+      return "";
+  }
+}
+
+static void rtc_update_strings_from_epoch(time_t now) {
+  struct tm t;
+  localtime_r(&now, &t);
+  char buf_date[32];
+  snprintf(buf_date, sizeof(buf_date), "%04d-%02d-%02d",
+           t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
+  g_date = buf_date;
+  char buf_time[16];
+  snprintf(buf_time, sizeof(buf_time), "%02d:%02d:%02d",
+           t.tm_hour, t.tm_min, t.tm_sec);
+  g_time = buf_time;
+}
+
+static time_t rtc_current_epoch_seconds() {
+  if (!rtc_valid) {
+    return (time_t)(esp_timer_get_time() / 1000000);
+  }
+  return rtc_epoch_base + (esp_timer_get_time() / 1000 - rtc_ms_start) / 1000;
+}
+
+static void rtc_seed_epoch(time_t epoch, int64_t ms_start, RtcTimeSource source) {
+  rtc_epoch_base = epoch;
+  rtc_ms_start = ms_start;
+  rtc_last_update = ms_start;
+  rtc_valid = true;
+  g_rtc_time_source = source;
+  rtc_update_strings_from_epoch(epoch);
+}
+
+static bool rtc_set_external_datetime_strings(const external_rtc_datetime_t& datetime) {
+  char buf_date[32];
+  char buf_time[16];
+  snprintf(buf_date, sizeof(buf_date), "%04u-%02u-%02u",
+           (unsigned)datetime.year,
+           (unsigned)datetime.month,
+           (unsigned)datetime.day);
+  snprintf(buf_time, sizeof(buf_time), "%02u:%02u:%02u",
+           (unsigned)datetime.hour,
+           (unsigned)datetime.minute,
+           (unsigned)datetime.second);
+  g_date = buf_date;
+  g_time = buf_time;
+  return true;
+}
+
+static external_rtc_datetime_t rtc_external_datetime_from_soft() {
+  time_t now = rtc_current_epoch_seconds();
+  struct tm t;
+  localtime_r(&now, &t);
+
+  external_rtc_datetime_t datetime = {};
+  datetime.year = (uint16_t)(t.tm_year + 1900);
+  datetime.month = (uint8_t)(t.tm_mon + 1);
+  datetime.day = (uint8_t)t.tm_mday;
+  datetime.hour = (uint8_t)t.tm_hour;
+  datetime.minute = (uint8_t)t.tm_min;
+  datetime.second = (uint8_t)t.tm_sec;
+  return datetime;
+}
+
+static bool rtc_set_from_strings_source(RtcTimeSource source) {
   int y, M, d, h, m, s;
   if (sscanf(g_date.c_str(), "%d-%d-%d", &y, &M, &d) != 3) return false;
   if (sscanf(g_time.c_str(), "%d:%d:%d", &h, &m, &s) != 3) return false;
@@ -2006,20 +2092,103 @@ bool rtc_set_from_strings() {
   t.tm_sec = s;
   time_t epoch = mktime(&t);
   if (epoch == (time_t)-1) return false;
-  rtc_epoch_base = epoch;
-  rtc_ms_start = esp_timer_get_time() / 1000;
-  rtc_last_update = rtc_ms_start;
-  rtc_valid = true;
+  rtc_seed_epoch(epoch, esp_timer_get_time() / 1000, source);
   return true;
 }
 
-// Initialize soft RTC from hardware RTC (persists through deep sleep)
+bool rtc_set_from_strings() {
+  return rtc_set_from_strings_source(RtcTimeSource::SAVED);
+}
+
+void rtc_sync_to_esp_rtc() {
+  if (!rtc_valid) return;
+
+  time_t now = rtc_current_epoch_seconds();
+  struct timeval tv = { .tv_sec = now, .tv_usec = 0 };
+  settimeofday(&tv, NULL);
+  ESP_LOGI(TAG, "ESP RTC synced from soft RTC");
+}
+
+static esp_err_t rtc_write_external_from_soft(const char* reason) {
+  if (!rtc_valid || !external_rtc_available()) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  external_rtc_datetime_t datetime = rtc_external_datetime_from_soft();
+  esp_err_t err = external_rtc_write_datetime(&datetime);
+  if (err == ESP_OK) {
+    ESP_LOGI(TAG,
+             "DS3231 time updated from %s: %04u-%02u-%02u %02u:%02u:%02u",
+             reason ? reason : "soft RTC",
+             (unsigned)datetime.year,
+             (unsigned)datetime.month,
+             (unsigned)datetime.day,
+             (unsigned)datetime.hour,
+             (unsigned)datetime.minute,
+             (unsigned)datetime.second);
+  } else {
+    ESP_LOGW(TAG,
+             "DS3231 time update from %s failed: %s",
+             reason ? reason : "soft RTC",
+             esp_err_to_name(err));
+  }
+  return err;
+}
+
+bool rtc_apply_manual_time_from_strings() {
+  if (!rtc_set_from_strings_source(RtcTimeSource::MANUAL)) {
+    return false;
+  }
+
+  g_time_synced_from_gps = false;
+  rtc_sync_to_esp_rtc();
+  if (rtc_write_external_from_soft("manual time") == ESP_OK) {
+    g_rtc_time_source = RtcTimeSource::DS3231;
+  }
+  return true;
+}
+
+static bool rtc_init_from_ds3231() {
+  esp_err_t err = external_rtc_init();
+  if (err != ESP_OK) {
+    return false;
+  }
+
+  external_rtc_datetime_t datetime = {};
+  err = external_rtc_read_datetime(&datetime);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "DS3231 time not loaded; using ESP RTC or saved time: %s",
+             esp_err_to_name(err));
+    return false;
+  }
+
+  rtc_set_external_datetime_strings(datetime);
+  if (!rtc_set_from_strings_source(RtcTimeSource::DS3231)) {
+    ESP_LOGW(TAG, "DS3231 time parse failed; using ESP RTC or saved time");
+    return false;
+  }
+
+  g_time_synced_from_gps = false;
+  g_rtc_sleep_epoch = 0;
+  rtc_sync_to_esp_rtc();
+  ESP_LOGI(TAG,
+           "DS3231 time loaded: %04u-%02u-%02u %02u:%02u:%02u",
+           (unsigned)datetime.year,
+           (unsigned)datetime.month,
+           (unsigned)datetime.day,
+           (unsigned)datetime.hour,
+           (unsigned)datetime.minute,
+           (unsigned)datetime.second);
+  return true;
+}
+
+// Initialize soft RTC from ESP RTC (persists through deep sleep)
 // Applies compensation if we have valid sleep epoch data
-static bool rtc_init_from_hw() {
+static bool rtc_init_from_esp_rtc() {
   struct timeval tv;
   if (gettimeofday(&tv, NULL) != 0) return false;
 
-  // Check if hardware RTC has valid time (year > 2020)
+  // Check if ESP RTC has valid time (year > 2020)
   struct tm t;
   localtime_r(&tv.tv_sec, &t);
   if (t.tm_year + 1900 < 2020) return false;
@@ -2048,49 +2217,22 @@ static bool rtc_init_from_hw() {
     g_rtc_sleep_epoch = 0;
   }
 
-  rtc_epoch_base = compensated_now;
   // Account for sub-second offset: tv.tv_usec tells us how far past the
   // whole second we are, so rewind rtc_ms_start by that amount.
-  rtc_ms_start = esp_timer_get_time() / 1000 - tv.tv_usec / 1000;
-  rtc_last_update = rtc_ms_start;
-  rtc_valid = true;
+  rtc_seed_epoch(compensated_now,
+                 esp_timer_get_time() / 1000 - tv.tv_usec / 1000,
+                 RtcTimeSource::ESP_RTC);
 
-  // Update g_date/g_time strings from compensated time
-  localtime_r(&compensated_now, &t);
-  char buf_date[32];
-  snprintf(buf_date, sizeof(buf_date), "%04d-%02d-%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
-  g_date = buf_date;
-  char buf_time[16];
-  snprintf(buf_time, sizeof(buf_time), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
-  g_time = buf_time;
-
-  ESP_LOGI(TAG, "RTC initialized: %s %s (compensated=%s)",
+  g_time_synced_from_gps = false;
+  ESP_LOGI(TAG, "ESP RTC initialized: %s %s (compensated=%s)",
            g_date.c_str(), g_time.c_str(),
            (g_rtc_comp != 0) ? "yes" : "no");
   return true;
 }
 
-// Sync hardware RTC from soft RTC (call after FT8 time sync)
-void rtc_sync_to_hw() {
-  if (!rtc_valid) return;
-
-  time_t now = rtc_epoch_base + (esp_timer_get_time() / 1000 - rtc_ms_start) / 1000;
-  struct timeval tv = { .tv_sec = now, .tv_usec = 0 };
-  settimeofday(&tv, NULL);
-  ESP_LOGI(TAG, "Hardware RTC synced from soft RTC");
-}
-
 static void rtc_update_strings() {
   if (!rtc_valid) return;
-  struct tm t;
-  time_t now = rtc_epoch_base + (esp_timer_get_time() / 1000 - rtc_ms_start) / 1000;
-  localtime_r(&now, &t);
-  char buf_date[32];
-  snprintf(buf_date, sizeof(buf_date), "%04d-%02d-%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
-  g_date = buf_date;
-  char buf_time[16];
-  snprintf(buf_time, sizeof(buf_time), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
-  g_time = buf_time;
+  rtc_update_strings_from_epoch(rtc_current_epoch_seconds());
 }
 
 int64_t rtc_now_ms() {
@@ -2117,7 +2259,7 @@ static void rtc_tick() {
           draw_status_line(4, std::string("Date: ") + g_date, false);
         }
         if (old_time != g_time) {
-          draw_status_line(5, std::string("Time: ") + g_time + (g_time_synced_from_gps ? " G" : ""), false);
+          draw_status_line(5, std::string("Time: ") + g_time + rtc_time_source_suffix(), false);
         }
       }
     }
@@ -2746,7 +2888,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
 
   ESP_LOGI(TAG, "Decoded %d unique messages", s_dec_count);
 
-  // ---- Auto sync RTC ----
+  // ---- Auto sync soft RTC from decode timing ----
   if (s_dec_count > 3) {
     // Simple insertion sort to find median of time_s values
     float sorted_t[DEC_MAX];
@@ -2766,7 +2908,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
       rtc_ms_start -= delta_ms;
       rtc_last_update -= delta_ms;
       rtc_update_strings();
-      rtc_sync_to_hw();
+      rtc_sync_to_esp_rtc();
       ESP_LOGI("SYNC", "Applied RTC sync: median=%.2fs delta=%dms", median, delta_ms);
     }
   }
@@ -3326,7 +3468,7 @@ static void draw_status_view() {
   if (status_edit_idx == 5 && !status_edit_buffer.empty()) {
     lines[5] = std::string("Time: ") + highlight_pos(status_edit_buffer, status_cursor_pos);
   } else {
-    lines[5] = std::string("Time: ") + g_time + (g_time_synced_from_gps ? " G" : "");
+    lines[5] = std::string("Time: ") + g_time + rtc_time_source_suffix();
   }
   for (int i = 0; i < 6; ++i) {
     bool hl = (status_edit_idx == i);
@@ -3678,7 +3820,7 @@ static void host_handle_line(const std::string& line_in) {
         char buf[16];
         snprintf(buf, sizeof(buf), "%04d-%02d-%02d", y, M, d);
         g_date = buf;
-        if (rtc_set_from_strings()) { g_time_synced_from_gps = false; rtc_sync_to_hw(); save_station_data(); send("OK"); }
+        if (rtc_apply_manual_time_from_strings()) { save_station_data(); send("OK"); }
         else send("ERROR: invalid date");
       }
     }
@@ -3694,7 +3836,7 @@ static void host_handle_line(const std::string& line_in) {
         char buf[16];
         snprintf(buf, sizeof(buf), "%02d:%02d:%02d", h, m, s);
         g_time = buf;
-        if (rtc_set_from_strings()) { g_time_synced_from_gps = false; rtc_sync_to_hw(); save_station_data(); send("OK"); }
+        if (rtc_apply_manual_time_from_strings()) { save_station_data(); send("OK"); }
         else send("ERROR: invalid time");
       }
     }
@@ -3710,7 +3852,7 @@ static void host_handle_line(const std::string& line_in) {
       g_rtc_sleep_epoch = sleep_epoch;
       save_station_data();
 
-      // Wait until the second boundary, then set HW RTC and sleep
+      // Wait until the second boundary, then set ESP RTC and sleep
       if (wait_ms > 0) vTaskDelay(pdMS_TO_TICKS(wait_ms));
       struct timeval tv = { .tv_sec = sleep_epoch, .tv_usec = 0 };
       settimeofday(&tv, NULL);
@@ -4023,10 +4165,11 @@ static void load_station_data() {
     storage_stream_close(stream);
   }
   autoseq_set_max_retry(g_autoseq_max_retry);
-  // Try hardware RTC first (persists through deep sleep), fall back to saved strings
-  if (!rtc_init_from_hw()) {
-    ESP_LOGI(TAG, "Hardware RTC not valid, using saved time strings");
-    rtc_set_from_strings();
+  // Prefer an external DS3231 when present, then ESP RTC/deep-sleep
+  // compensation, then the saved Station.txt strings.
+  if (!rtc_init_from_ds3231() && !rtc_init_from_esp_rtc()) {
+    ESP_LOGI(TAG, "No valid DS3231 or ESP RTC time; using saved time strings");
+    rtc_set_from_strings_source(RtcTimeSource::SAVED);
   }
   rebuild_active_bands();
   rebuild_ignore_prefixes();
@@ -4835,10 +4978,11 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 } else if (c == '\n') {
                   if (status_edit_idx == 4) g_date = status_edit_buffer;
                   else g_time = normalize_time_hms(status_edit_buffer);
-                  g_time_synced_from_gps = false;
-                  save_station_data();
-                  rtc_set_from_strings();
-                  rtc_sync_to_hw();  // Persist to hardware RTC
+                  if (rtc_apply_manual_time_from_strings()) {
+                    save_station_data();
+                  } else {
+                    debug_log_line("Invalid date/time");
+                  }
                   status_edit_idx = -1;
                   status_cursor_pos = -1;
                   status_edit_buffer.clear();
@@ -5134,7 +5278,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 if (rtc_valid) {
                   g_rtc_sleep_epoch = rtc_epoch_base +
                       (esp_timer_get_time() / 1000 - rtc_ms_start) / 1000;
-                  rtc_sync_to_hw();  // Sync to hardware RTC
+                  rtc_sync_to_esp_rtc();
                   save_station_data();
                   ESP_LOGI(TAG, "Saved sleep epoch: %ld, comp=%d",
                            (long)g_rtc_sleep_epoch, g_rtc_comp);

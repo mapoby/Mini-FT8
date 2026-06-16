@@ -51,8 +51,7 @@ void apply_radio_profile_binding();
 void update_autoseq_cq_type();
 void rebuild_active_bands();
 void rebuild_ignore_prefixes();
-bool rtc_set_from_strings();
-void rtc_sync_to_hw();
+bool rtc_apply_manual_time_from_strings();
 
 // Access to ui.cpp (RX list live in ui.cpp's static array).
 int  ui_get_rx_count();
@@ -574,8 +573,7 @@ bool core_cmd_set_rtc(int64_t epoch_ms) {
     g_date = dbuf;
     g_time = tbuf;
   }
-  if (!rtc_set_from_strings()) return false;
-  rtc_sync_to_hw();
+  if (!rtc_apply_manual_time_from_strings()) return false;
   g_config_save_pending = true;
   core_fire_config_changed();
   return true;

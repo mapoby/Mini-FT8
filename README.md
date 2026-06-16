@@ -19,6 +19,7 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 (I have no affiliation with the vendors.)
   - Must order: https://shop.m5stack.com/products/m5stack-cardputer-adv-version-esp32-s3 or from digikey: https://www.digikey.com/en/products/detail/m5stack-technology-co-ltd/K132-ADV/27685158
   - Optional: [https://shop.m5stack.com/products/gps-bds-unit-v1-1-at6668](https://shop.m5stack.com/products/gps-bds-unit-v1-1-at6668) (for Date/Time/Grid, other GPS modules work too)
+  - Optional: DS3231 RTC module on I2C `G8/G9` (for retained UTC date/time without GPS)
   - For KH1 TX : https://shop.m5stack.com/products/4pin-buckled-grove-cable, for a custmized serial cable
   - For KH1 RX: [USB C Microphone Adapter](https://www.amazon.com/dp/B0FWC9ZFC4?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1), Other adapters may also work, but this one is confirmed. (V2.0.2 Supports Cardputer direct microphone in, so the USB-C adapter becomes **optional, choose KH1-Mic**)
 
@@ -69,7 +70,7 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 |  | `2` | Run connect/sync now; starts audio and follows the CAT sync path. |
 |  | `3` | Step to the next active band. Applies after key 2 is pressed or when leaving STATUS. |
 |  | `4` | Toggle Tune. |
-|  | `5` | Edit Date (in place). `G` indicates date/time is synced from GPS. |
+|  | `5` | Edit Date (in place). On the Time line, `G` means GPS time and `R` means DS3231 RTC time. |
 |  | `6` | Edit Time (in place). |
 | `M` (MENU P1) | `1` | Cycle CQ Type. For CQ FD, enter operating class and ARRL/RAC section in FreeText, for example `1B SCV`. |
 |  | `2` | Send FreeText once. |
@@ -133,6 +134,16 @@ Both 9600 and 115200 baud GPS modules are supported (auto-detected). **Make sure
                                      │ SW: 5VOUT (Left)            │
                                      └─────────────────────────────┘
 ```
+
+## DS3231 RTC Connections
+
+Mini-FT8 can use an optional DS3231 module as an external UTC clock. Connect it
+to the Cardputer Adv shared I2C bus: `SDA=G8`, `SCL=G9`, plus module power and
+ground. On boot, a valid DS3231 time is used before the ESP RTC or saved
+`Station.txt` time. Status `S -> 6` appends `R` when the active time came from
+the DS3231, and appends `G` after a full GPS time sync. GPS and manual time
+updates write the DS3231 when it is present; FT8 decode fine corrections do not.
+
 ## KH1 Connections
 ![KH1 Cables](kh1_cables.jpeg)
 

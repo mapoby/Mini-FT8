@@ -1,4 +1,4 @@
-# RTC Deep Sleep Compensation
+# ESP RTC Deep Sleep Compensation
 
 ## Problem
 
@@ -10,7 +10,7 @@ This makes the clock inaccurate after wake-up.
 
 Implement a compensation mechanism that:
 1. Records the accurate time before entering deep sleep
-2. Measures the raw RTC elapsed time during sleep
+2. Measures the raw ESP RTC elapsed time during sleep
 3. Applies a user-calibrated compensation factor to correct drift
 
 ## Data Model
@@ -24,12 +24,12 @@ rtc_comp=150                  # Compensation: seconds per 10000 seconds
 
 ### Compensation Factor Definition
 
-`rtc_comp` represents how many extra (or fewer) seconds the RTC counts per 10000 real seconds:
+`rtc_comp` represents how many extra (or fewer) seconds the ESP RTC counts per 10000 real seconds:
 
-| rtc_comp | Meaning | RTC Behavior |
+| rtc_comp | Meaning | ESP RTC Behavior |
 |----------|---------|--------------|
-| +150 | 1.5% fast | After 10000 real sec, RTC shows 10150 sec |
-| -123 | 1.23% slow | After 10000 real sec, RTC shows 9877 sec |
+| +150 | 1.5% fast | After 10000 real sec, ESP RTC shows 10150 sec |
+| -123 | 1.23% slow | After 10000 real sec, ESP RTC shows 9877 sec |
 | 0 | Perfect | No compensation needed |
 
 ### Compensation Formula
@@ -38,8 +38,8 @@ rtc_comp=150                  # Compensation: seconds per 10000 seconds
 actual_elapsed = raw_elapsed * 10000 / (10000 + rtc_comp)
 ```
 
-Example (RTC is 1.5% fast, slept for ~10 hours):
-- Raw RTC shows: 36540 seconds elapsed
+Example (ESP RTC is 1.5% fast, slept for ~10 hours):
+- Raw ESP RTC shows: 36540 seconds elapsed
 - Compensation: `36540 * 10000 / 10150 = 36000` seconds (10 hours actual)
 
 ## Implementation
@@ -64,14 +64,14 @@ void enter_deep_sleep() {
 ### After Wake-up
 
 ```cpp
-bool rtc_init_from_hw() {
+bool rtc_init_from_esp_rtc() {
     struct timeval tv;
-    gettimeofday(&tv, NULL);  // Read hardware RTC
+    gettimeofday(&tv, NULL);  // Read ESP RTC
 
     // Check if we have valid sleep data
     if (g_rtc_sleep_epoch <= 0 || tv.tv_sec < g_rtc_sleep_epoch) {
-        // No valid sleep data, fall back to raw hardware RTC
-        return init_from_raw_hw_rtc(tv.tv_sec);
+        // No valid sleep data, fall back to raw ESP RTC
+        return init_from_raw_esp_rtc(tv.tv_sec);
     }
 
     // Calculate raw elapsed time
@@ -111,7 +111,7 @@ To determine the compensation factor:
 
 Example:
 - Actual sleep: 36000 seconds (10 hours)
-- RTC shows: 36540 seconds elapsed
+- ESP RTC shows: 36540 seconds elapsed
 - `rtc_comp = (36540 - 36000) * 10000 / 36000 = 150` (1.5% fast)
 
 ## Station Data Format
@@ -132,7 +132,7 @@ For now, implement manual entry in menu page 2 (settings).
 
 ## Edge Cases
 
-1. **First boot / no sleep data**: `rtc_sleep_epoch = 0`, fall back to raw RTC or saved strings
+1. **First boot / no sleep data**: `rtc_sleep_epoch = 0`, fall back to raw ESP RTC or saved strings
 2. **rtc_sleep_epoch > current RTC**: Invalid state, RTC was reset, ignore compensation
 3. **Very long sleep**: Compensation still applies linearly (RC oscillator drift is approximately linear)
 4. **User changes time during operation**: Update `rtc_sleep_epoch` before next sleep
