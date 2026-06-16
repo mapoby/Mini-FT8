@@ -25,6 +25,7 @@ constexpr uint32_t kProbeWindowMs = 2500;
 const char* kTag = "GPS";
 
 gps_state_t s_state = {};
+gps_pins_t s_pins = {kGpsUartNum, kGpsRxPin, kGpsTxPin, kGpsBaudFast, true};
 std::string s_line_buffer;
 uint32_t s_probe_start_ms = 0;
 uint32_t s_probe_rx_bytes = 0;
@@ -125,32 +126,32 @@ bool configure_uart(int baud) {
 #else
   cfg.source_clk = UART_SCLK_DEFAULT;
 #endif
-  esp_err_t err = uart_param_config(kGpsUartNum, &cfg);
+  esp_err_t err = uart_param_config(s_pins.uart, &cfg);
   if (err != ESP_OK) return false;
-  err = uart_set_pin(kGpsUartNum, kGpsTxPin, kGpsRxPin,
+  err = uart_set_pin(s_pins.uart, s_pins.tx, s_pins.rx,
                      UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
   if (err != ESP_OK) return false;
-  err = uart_set_line_inverse(kGpsUartNum, (uart_signal_inv_t)0);
+  err = uart_set_line_inverse(s_pins.uart, (uart_signal_inv_t)0);
   if (err != ESP_OK) return false;
-  err = uart_set_baudrate(kGpsUartNum, normalize_baud(baud));
+  err = uart_set_baudrate(s_pins.uart, normalize_baud(baud));
   if (err != ESP_OK) return false;
-  uart_flush_input(kGpsUartNum);
+  uart_flush_input(s_pins.uart);
   return true;
 }
 
 bool ensure_uart_driver() {
-  esp_err_t err = uart_driver_install(kGpsUartNum, 2048, 0, 0, nullptr, 0);
+  esp_err_t err = uart_driver_install(s_pins.uart, 2048, 0, 0, nullptr, 0);
   if (err == ESP_ERR_INVALID_STATE) {
-    uart_driver_delete(kGpsUartNum);
-    err = uart_driver_install(kGpsUartNum, 2048, 0, 0, nullptr, 0);
+    uart_driver_delete(s_pins.uart);
+    err = uart_driver_install(s_pins.uart, 2048, 0, 0, nullptr, 0);
   }
   return err == ESP_OK;
 }
 
 void switch_baud_internal(int baud) {
   baud = normalize_baud(baud);
-  if (uart_set_baudrate(kGpsUartNum, baud) != ESP_OK) return;
-  uart_flush_input(kGpsUartNum);
+  if (uart_set_baudrate(s_pins.uart, baud) != ESP_OK) return;
+  uart_flush_input(s_pins.uart);
   s_state.active_baud = baud;
   s_state.baud_locked = false;
   rearm_probe_window();
@@ -226,8 +227,20 @@ void ingest_uart_bytes(const uint8_t* data, int len) {
 }  // namespace
 
 void gps_start(int preload_baud) {
-  preload_baud = normalize_baud(preload_baud);
+  gps_pins_t pins = {};
+  pins.uart = kGpsUartNum;
+  pins.rx = kGpsRxPin;
+  pins.tx = kGpsTxPin;
+  pins.default_baud = preload_baud;
+  pins.auto_baud = true;
+  gps_start(pins);
+}
+
+void gps_start(const gps_pins_t& pins) {
   if (s_state.running) return;
+
+  s_pins = pins;
+  int preload_baud = normalize_baud(s_pins.default_baud);
 
   if (!ensure_uart_driver()) {
     ESP_LOGW(kTag, "GPS UART driver install failed");
@@ -235,7 +248,7 @@ void gps_start(int preload_baud) {
   }
   if (!configure_uart(preload_baud)) {
     ESP_LOGW(kTag, "GPS UART config failed");
-    uart_driver_delete(kGpsUartNum);
+    uart_driver_delete(s_pins.uart);
     return;
   }
 
@@ -247,14 +260,15 @@ void gps_start(int preload_baud) {
   s_pending_baud_update = false;
   s_pending_baud_value = 0;
   rearm_probe_window();
-  ESP_LOGI(kTag, "GPS started on UART%d TX=G%d RX=G%d preload=%d",
-           (int)kGpsUartNum, (int)kGpsTxPin, (int)kGpsRxPin, preload_baud);
+  ESP_LOGI(kTag, "GPS started on UART%d TX=G%d RX=G%d preload=%d auto=%d",
+           (int)s_pins.uart, (int)s_pins.tx, (int)s_pins.rx, preload_baud,
+           s_pins.auto_baud ? 1 : 0);
 }
 
 void gps_stop() {
   if (!s_state.running) return;
-  uart_flush_input(kGpsUartNum);
-  uart_driver_delete(kGpsUartNum);
+  uart_flush_input(s_pins.uart);
+  uart_driver_delete(s_pins.uart);
   s_state = {};
   s_pending_baud_update = false;
   s_pending_baud_value = 0;
@@ -269,10 +283,10 @@ void gps_tick() {
   if (!s_state.running) return;
 
   uint8_t buf[256];
-  int len = uart_read_bytes(kGpsUartNum, buf, sizeof(buf), 0);
+  int len = uart_read_bytes(s_pins.uart, buf, sizeof(buf), 0);
   if (len > 0) ingest_uart_bytes(buf, len);
 
-  if (!s_state.baud_locked) {
+  if (s_pins.auto_baud && !s_state.baud_locked) {
     uint32_t now = now_ms();
     if (s_probe_rx_bytes > 0 &&
         (now - s_probe_start_ms) >= kProbeWindowMs &&

@@ -443,6 +443,9 @@ static void host_process_bytes(const uint8_t* buf, size_t len);
 static void enter_mode(UIMode new_mode);
 static std::string menu_sleep_batt_line();
 static int normalize_gps_baud_value(int value);
+static gps_pins_t gps_pins_for_current_source();
+static const char* gps_source_name();
+static void apply_debug_uart_pin_policy();
 static bool rtc_set_from_strings_source(RtcTimeSource source);
 static esp_err_t rtc_write_external_from_soft(const char* reason);
 static const char* rtc_time_source_suffix();
@@ -548,7 +551,8 @@ static RtcTimeSource g_rtc_time_source = RtcTimeSource::SAVED;
 
 // RTC deep sleep compensation
 // rtc_sleep_epoch: epoch time when entering deep sleep (for calculating elapsed time)
-// rtc_comp is seconds per 10000 seconds and can be adjusted via MENU O page.
+// rtc_comp is seconds per 10000 seconds. It remains load/save/core-API
+// compatible, but the local O-page editor is no longer exposed.
 static constexpr int kRtcCompFixed = 120;
 static time_t g_rtc_sleep_epoch = 0;
 int g_rtc_comp = kRtcCompFixed;        // visible to core_api.cpp
@@ -581,6 +585,7 @@ OffsetSrc g_offset_src = OffsetSrc::RANDOM;  // visible to core_api.cpp
 RadioType g_radio = RadioType::QMX;          // visible to core_api.cpp
 static bool g_kh1_connected = false;
 static int g_gps_baud = 115200;
+static bool g_gnss_lora_enabled = false;
 static constexpr size_t kIgnorePrefixTextMaxLen = 64;
 std::string g_comment1 = "MiniFT8 /Radio";      // visible to core_api.cpp
 static std::string g_ignore_prefix_text;
@@ -1111,12 +1116,13 @@ static void ensure_usb() {
 }
 
 static bool uart_inject_last_was_cr = false;
+static bool g_debug_uart_pins_enabled = true;
 
 static void poll_uart_inject_keys() {
-  if (!s_key_inject_queue) return;
+  if (!s_key_inject_queue || !g_debug_uart_pins_enabled) return;
   // Read directly from the console UART FIFO — no driver needed.
   // sdkconfig configures ESP console on UART0 peripheral with custom
-  // pins TX=GPIO13, RX=GPIO15 (see CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_0
+  // pins TX=G4, RX=G5 (see CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_0
   // and CONFIG_ESP_CONSOLE_UART_TX_GPIO / _RX_GPIO). KH1 CAT uses
   // UART1 peripheral on GPIO1 — no conflict.
   uart_dev_t *hw = UART_LL_GET_HW(0);
@@ -1209,6 +1215,38 @@ static void uart_mirror_dump_screen() {
   fflush(stdout);
 }
 #endif  // UART_SCREEN_MIRROR
+
+static void set_gpio_floating_input(gpio_num_t pin) {
+  gpio_reset_pin(pin);
+  gpio_set_direction(pin, GPIO_MODE_INPUT);
+  gpio_set_pull_mode(pin, GPIO_FLOATING);
+  gpio_intr_disable(pin);
+}
+
+static void apply_debug_uart_pin_policy() {
+  const bool enable = !g_gnss_lora_enabled;
+  if (enable && g_debug_uart_pins_enabled) return;
+
+  const gpio_num_t tx = (gpio_num_t)CONFIG_ESP_CONSOLE_UART_TX_GPIO;
+  const gpio_num_t rx = (gpio_num_t)CONFIG_ESP_CONSOLE_UART_RX_GPIO;
+  if (enable) {
+    uart_set_pin(UART_NUM_0, tx, rx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_inject_last_was_cr = false;
+    g_debug_uart_pins_enabled = true;
+    ESP_LOGI(TAG, "G4/G5 debug UART enabled");
+  } else {
+    if (s_key_inject_queue) xQueueReset(s_key_inject_queue);
+    uart_inject_last_was_cr = false;
+#if UART_SCREEN_MIRROR
+    g_uart_mirror_pending = false;
+#endif
+    set_gpio_floating_input(tx);
+    set_gpio_floating_input(rx);
+    const bool changed = g_debug_uart_pins_enabled;
+    g_debug_uart_pins_enabled = false;
+    if (changed) ESP_LOGI(TAG, "G4/G5 debug UART disabled for GNSS LoRa");
+  }
+}
 
 struct WAVHeader {
   char riff[4];
@@ -1506,20 +1544,28 @@ void apply_radio_profile_binding() {
   audio_source_backend_t prev_audio = audio_source_get_backend();
   g_radio = canonical_radio_type(g_radio);
   g_gps_baud = normalize_gps_baud_value(g_gps_baud);
+  auto start_gps = [&]() {
+    gps_start(gps_pins_for_current_source());
+  };
   if (is_kh1_radio(g_radio)) {
-    // KH1 mode is explicit-connect: GPS keeps UART1 until user presses Connect to KH1.
+    // KH1 CAT and PORTA GPS both use UART1 on G1/G2. GNSS LoRa uses UART2
+    // on G15/G13, so it can keep running while KH1 is connected.
     if (g_kh1_connected) {
-      gps_stop();
+      if (g_gnss_lora_enabled) {
+        start_gps();
+      } else {
+        gps_stop();
+      }
       radio_control_kh1_set_enabled(true);
     } else {
       radio_control_kh1_set_enabled(false);
-      gps_start(g_gps_baud);
+      start_gps();
     }
   } else {
-    // Leaving KH1 releases UART1 back to GPS.
+    // Leaving KH1 releases UART1 back to PORTA GPS.
     g_kh1_connected = false;
     radio_control_kh1_set_enabled(false);
-    gps_start(g_gps_baud);
+    start_gps();
   }
   RadioProfileBinding binding = get_radio_profile_binding(g_radio);
   audio_source_set_backend(binding.audio_backend);
@@ -1712,7 +1758,7 @@ static void gps_runtime_tick() {
   static bool s_gps_grid_logged = false;
   static int s_last_time_sync_hour_key = -1;
 
-  if (is_kh1_radio(g_radio) && g_kh1_connected) return;
+  if (is_kh1_radio(g_radio) && g_kh1_connected && !g_gnss_lora_enabled) return;
 
   gps_tick();
 
@@ -1891,6 +1937,28 @@ static std::string normalize_time_hms(const std::string& src) {
 
 static int normalize_gps_baud_value(int value) {
   return (value == 9600 || value == 115200) ? value : 115200;
+}
+
+static gps_pins_t gps_pins_for_current_source() {
+  gps_pins_t pins = {};
+  if (g_gnss_lora_enabled) {
+    pins.uart = UART_NUM_2;
+    pins.rx = GPIO_NUM_15;
+    pins.tx = GPIO_NUM_13;
+    pins.default_baud = 115200;
+    pins.auto_baud = false;
+  } else {
+    pins.uart = UART_NUM_1;
+    pins.rx = GPIO_NUM_1;
+    pins.tx = GPIO_NUM_2;
+    pins.default_baud = normalize_gps_baud_value(g_gps_baud);
+    pins.auto_baud = true;
+  }
+  return pins;
+}
+
+static const char* gps_source_name() {
+  return g_gnss_lora_enabled ? "GNSS_LoRa" : "PORTA";
 }
 
 static std::string normalize_date_ymd(const std::string& src) {
@@ -3338,11 +3406,7 @@ static void draw_menu_view() {
   lines.push_back(std::string("RxTxLog:") + (g_rxtx_log ? "ON" : "OFF"));
   lines.push_back(std::string("SkipTX1:") + (g_skip_tx1 ? "ON" : "OFF"));
   lines.push_back(std::string("ActiveBand:") + head_trim(g_active_band_text, 16));
-  if (menu_edit_idx == 15) {
-    lines.push_back(std::string("RTC Comp:") + menu_edit_buf);
-  } else {
-    lines.push_back(std::string("RTC Comp:") + std::to_string(g_rtc_comp));
-  }
+  lines.push_back(std::string("GNSS_LoRa:") + (g_gnss_lora_enabled ? "ON" : "OFF"));
   if (menu_copy_feedback_deadline > 0 && !menu_copy_feedback_text.empty()) {
     lines.push_back(menu_copy_feedback_text);
   } else {
@@ -3406,7 +3470,7 @@ static void draw_gps_view(bool force_redraw) {
   std::vector<std::string> lines;
   lines.reserve(6);
   gps_state_t state = gps_get_state();
-  lines.push_back("--- GPS TELEMETRY ---");
+  lines.push_back(std::string("Src:") + gps_source_name());
   if (state.valid_fix) {
     lines.push_back(std::string("Fix: 3D (") + std::to_string(state.satellites) + " Sats)");
   } else {
@@ -4041,6 +4105,7 @@ static void load_station_data() {
   g_rtc_comp = kRtcCompFixed;
   g_autoseq_max_retry = AUTOSEQ_MAX_RETRY;
   g_gps_baud = 115200;
+  g_gnss_lora_enabled = false;
   g_grid_saved_manual = g_grid;
   g_grid_from_gps = false;
   g_grid_gps_display8.clear();
@@ -4121,6 +4186,10 @@ static void load_station_data() {
       g_radio = parse_radio_config_value(line + 6);
     } else if (sscanf(line, "gps_baud=%d", &val) == 1) {
       g_gps_baud = normalize_gps_baud_value(val);
+    } else if (sscanf(line, "gnss_lora=%d", &val) == 1) {
+      g_gnss_lora_enabled = (val != 0);
+    } else if (sscanf(line, "gps_source=%d", &val) == 1) {
+      if (val == 2) g_gnss_lora_enabled = true;
     } else if (strncmp(line, "cq_ft=", 6) == 0) {
       g_cq_freetext = trim_upper_copy(line + 6);
     } else if (strncmp(line, "free_text=", 10) == 0) {
@@ -4217,6 +4286,7 @@ void save_station_data() {
   out << "offset_src=" << (int)g_offset_src << "\n";
   out << "radio=" << (int)canonical_radio_type(g_radio) << "\n";
   out << "gps_baud=" << normalize_gps_baud_value(g_gps_baud) << "\n";
+  out << "gnss_lora=" << (g_gnss_lora_enabled ? 1 : 0) << "\n";
   out << "comment1=" << g_comment1 << "\n";
   out << "ignore_prefixes=" << g_ignore_prefix_text << "\n";
   out << "rxtx_log=" << (g_rxtx_log ? 1 : 0) << "\n";
@@ -4465,6 +4535,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
   ui_mode = UIMode::RX;
   load_station_data();
+  apply_debug_uart_pin_policy();
   apply_radio_profile_binding();
   update_autoseq_cq_type();
 
@@ -4526,6 +4597,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       uart_ll_read_rxfifo(hw, scratch, n);
     }
   }
+  apply_debug_uart_pin_policy();
 
   // UI loop
   char last_key = 0;
@@ -4544,7 +4616,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     }
     // Merge injected keys from console UART RX (G4/G5 per sdkconfig)
     poll_uart_inject_keys();
-    if (c == 0 && s_key_inject_queue) {
+    if (c == 0 && s_key_inject_queue && g_debug_uart_pins_enabled) {
       char injected = 0;
       if (xQueueReceive(s_key_inject_queue, &injected, 0) == pdTRUE) {
         c = injected;
@@ -4559,7 +4631,10 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     // Dump screen on the iteration AFTER a UART keypress was consumed,
     // once the UI has had a chance to process the key and redraw.
     static bool s_uart_mirror_fire = false;
-    if (s_uart_mirror_fire) {
+    if (!g_debug_uart_pins_enabled) {
+      g_uart_mirror_pending = false;
+      s_uart_mirror_fire = false;
+    } else if (s_uart_mirror_fire) {
       uart_mirror_dump_screen();
       s_uart_mirror_fire = false;
     }
@@ -5371,8 +5446,11 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 menu_long_backup = g_active_band_text;
                 draw_menu_view();
               } else if (c == '4') {
-                menu_edit_idx = 15; // RTC Comp line
-                menu_edit_buf = std::to_string(g_rtc_comp);
+                gps_stop();
+                g_gnss_lora_enabled = !g_gnss_lora_enabled;
+                apply_debug_uart_pin_policy();
+                save_station_data();
+                apply_radio_profile_binding();
                 draw_menu_view();
               } else if (c == '5') {
                 CopyLogsResult copy_res = copy_logs_to_sd_overwrite();
