@@ -100,25 +100,15 @@ Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure betw
 
 ## Download Logs
 
-- A standalone first install requires the full merged image so the 3 MB
-  `fatfs` partition table is installed. The merged image contains no FATFS
-  payload, so normal reflashing does not overwrite stored files.
 - Mini-FT8 and Mini-CW share the `fatfs` partition. Their files can coexist,
   and current M5Launcher installs/reinstalls can switch between the applications
   while preserving an existing compatible FATFS partition. Both applications
   use 512-byte FATFS and wear-levelling sectors.
-- A fresh or invalid FATFS is formatted automatically. `erase_flash`, a
-  full-chip erase, or an incompatible partition-table change destroys its files.
 
 - Use SD
   - Insert a FAT/FAT32-formatted SD card.
   - In MENU P3 (`O`), press `5` (Copy files to SD). All files will be copied to the SD card.
   - If the result shows `Missed`, a reboot will usually fix it.
-
-- Use `pc_terminal.py`
-  - On the M5 Cardputer, press `C` to enter communication mode.
-  - On the PC, run `python .\pc_terminal.py COM11` for interactive use with multiple commands.
-  - On the PC, run `python .\pc_terminal.py COM11 read 20260113.txt` for a single command.
 
 ## GPS Connections
 
