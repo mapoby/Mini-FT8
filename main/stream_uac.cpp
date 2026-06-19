@@ -350,20 +350,20 @@ static void usb_lib_task(void* arg) {
     host_config.skip_phy_setup = false;
     host_config.intr_flags = ESP_INTR_FLAG_LEVEL1;
 
-    // Custom FIFO partitioning enables simultaneous bidirectional ISO
-    // streaming with QDX or QMX hardware. ESP32-S3 has 200 FIFO lines.
-    // Built-in Kconfig biases give either RX 608 / PTX 128
-    // (BIAS_IN, our previous setting) or RX 136 / PTX 600 — neither
-    // covers 24-bit/48k/stereo MPS=300 in both directions at once.
-    //
-    // This split reserves 364 B for RX and 364 B for PTX (91 lines each)
-    // plus 72 B for non-periodic OUT (CDC CAT bulk-OUT). 364 B is enough
-    // for one 300-byte ISO packet plus 64-byte status overhead — i.e.
-    // 1.21x MPS. The host task must drain each packet within the 1 ms
-    // inter-frame window.
-    host_config.fifo_settings_custom.rx_fifo_lines   = 91;   // 364 B
-    host_config.fifo_settings_custom.nptx_fifo_lines = 18;   // 72 B
-    host_config.fifo_settings_custom.ptx_fifo_lines  = 91;   // 364 B
+    if (s_profile == UAC_PROFILE_QMX) {
+        // Custom FIFO partitioning enables simultaneous bidirectional ISO
+        // streaming with QDX or QMX hardware. ESP32-S3 has 200 FIFO lines.
+        // Built-in Kconfig biases do not cover 24-bit/48k/stereo MPS=300
+        // in both directions at once. This split reserves 364 B for RX,
+        // 364 B for PTX, and 72 B for non-periodic OUT (CDC CAT bulk-OUT).
+        host_config.fifo_settings_custom.rx_fifo_lines   = 91;   // 364 B
+        host_config.fifo_settings_custom.nptx_fifo_lines = 18;   // 72 B
+        host_config.fifo_settings_custom.ptx_fifo_lines  = 91;   // 364 B
+        ESP_LOGI(TAG, "USB FIFO profile=%s policy=qmx-custom rx=91 nptx=18 ptx=91",
+                 profile_name(s_profile));
+    } else {
+        ESP_LOGI(TAG, "USB FIFO profile=%s policy=default", profile_name(s_profile));
+    }
 
     esp_err_t err = usb_host_install(&host_config);
     if (err != ESP_OK) {
@@ -376,19 +376,23 @@ static void usb_lib_task(void* arg) {
 
     ESP_LOGI(TAG, "USB Host installed");
 
-    // Install CDC-ACM driver (for CAT control) before starting class drivers
-    const cdc_acm_host_driver_config_t cdc_cfg = {
-        .driver_task_stack_size = 3072,
-        .driver_task_priority = 4,
-        .xCoreID = 0,
-        .new_dev_cb = cdc_new_dev_cb,
-    };
-    err = cdc_acm_host_install(&cdc_cfg);
-    if (err == ESP_OK) {
-        s_cdc_installed = true;
-        ESP_LOGI(TAG, "CDC-ACM driver installed");
+    if (s_profile == UAC_PROFILE_QMX) {
+        // Install CDC-ACM driver for QMX/QDX CAT control before starting class drivers.
+        const cdc_acm_host_driver_config_t cdc_cfg = {
+            .driver_task_stack_size = 3072,
+            .driver_task_priority = 4,
+            .xCoreID = 0,
+            .new_dev_cb = cdc_new_dev_cb,
+        };
+        err = cdc_acm_host_install(&cdc_cfg);
+        if (err == ESP_OK) {
+            s_cdc_installed = true;
+            ESP_LOGI(TAG, "CDC-ACM driver installed");
+        } else {
+            ESP_LOGW(TAG, "CDC-ACM driver install failed: %s", esp_err_to_name(err));
+        }
     } else {
-        ESP_LOGW(TAG, "CDC-ACM driver install failed: %s", esp_err_to_name(err));
+        ESP_LOGI(TAG, "CDC-ACM driver skipped profile=%s", profile_name(s_profile));
     }
 
     xTaskNotifyGive((TaskHandle_t)arg);
@@ -498,7 +502,8 @@ static void uac_lib_task(void* arg) {
 
                     // Start stream format negotiation.
                     // QMX profile keeps the existing strict format.
-                    // Generic profile tries mono and 16-bit fallbacks.
+                    // Generic profile stays 48 kHz and tries mic-only
+                    // mono/stereo 24-bit and 16-bit candidates.
                     uac_host_stream_config_t candidates[4];
                     int candidate_count = 0;
                     auto add_candidate = [&](uint8_t ch, uint8_t bits) {
@@ -537,8 +542,15 @@ static void uac_lib_task(void* arg) {
                     }
 
                     if (!started) {
-                        ESP_LOGE(TAG, "Failed to start stream for profile=%s", profile_name(s_profile));
-                        snprintf(s_status_string, sizeof(s_status_string), "Format not supported");
+                        if (s_profile == UAC_PROFILE_GENERIC_USB) {
+                            ESP_LOGE(TAG, "No 48k UAC mic format for profile=%s",
+                                     profile_name(s_profile));
+                            snprintf(s_status_string, sizeof(s_status_string), "No 48k UAC mic format");
+                        } else {
+                            ESP_LOGE(TAG, "Failed to start stream for profile=%s",
+                                     profile_name(s_profile));
+                            snprintf(s_status_string, sizeof(s_status_string), "Format not supported");
+                        }
                         uac_host_device_close(handle);
                         continue;
                     }
@@ -553,8 +565,10 @@ static void uac_lib_task(void* arg) {
                              s_format.bit_resolution,
                              s_format.channels);
 
-                    // Try to open companion CDC-ACM interface (CAT)
-                    cdc_try_open();
+                    if (s_profile == UAC_PROFILE_QMX) {
+                        // Try to open companion CDC-ACM interface (CAT).
+                        cdc_try_open();
+                    }
 
                     // Start the audio processing task.
                     //
@@ -598,6 +612,14 @@ static void uac_lib_task(void* arg) {
                     }
 
                 } else if (evt.driver.event == UAC_HOST_DRIVER_EVENT_TX_CONNECTED) {
+                    if (s_profile != UAC_PROFILE_QMX) {
+                        ESP_LOGI(TAG, "Speaker connected ignored profile=%s addr=%u iface=%u",
+                                 profile_name(s_profile),
+                                 (unsigned)evt.driver.addr,
+                                 (unsigned)evt.driver.iface_num);
+                        continue;
+                    }
+
                     s_spk_addr  = evt.driver.addr;
                     s_spk_iface = evt.driver.iface_num;
                     s_spk_known = true;

@@ -3456,6 +3456,12 @@ static std::string status_sync_line() {
       return std::string("Connect ") + name;
     }
     const bool cat_ready = radio_control_ready();
+    if (radio == RadioType::KH1_USBC && !streaming) {
+      const std::string rx_status = audio_source_get_status_string();
+      if (rx_status == "No 48k UAC mic format") {
+        return head_trim(rx_status, 19);
+      }
+    }
     if (cat_ready && streaming) return std::string("Sync ") + name + "(RX+TX)";
     if (cat_ready && !streaming) return std::string("Sync ") + name + "(TX)";
     return std::string("Connect ") + name;
@@ -4459,25 +4465,11 @@ static void begin_usb_host_mode() {
     g_kh1_connected = true;
     apply_radio_profile_binding();
   }
+  const bool kh1_usbc = (canonical_radio_type(g_radio) == RadioType::KH1_USBC);
   if (!audio_source_is_streaming()) {
-    debug_log_line("UAC2 start");
-    apply_radio_profile_binding();
-    const char* backend = audio_source_backend_name(audio_source_get_backend());
-    const bool is_uac_backend = (std::strstr(backend, "uac") != nullptr);
-    debug_log_line("UAC2 bind");
-    if (is_uac_backend) log_mem_caps("UAC_BEFORE_START");
-    if (!audio_source_start()) {
-      if (is_uac_backend) log_mem_caps("UAC_AFTER_START");
-      debug_log_line("UAC2 afail");
-    } else {
-      if (is_uac_backend) log_mem_caps("UAC_AFTER_START");
-      debug_log_line("UAC2 aok");
-      g_decode_enabled = true;
-      ui_set_paused(false);
-      ui_clear_waterfall();
-      esp_err_t rc = radio_control_on_audio_start();
-      debug_log_line(rc == ESP_OK ? "UAC2 catok" : "UAC2 catng");
-    }
+    start_rx_audio_for_current_radio("status key 2", !kh1_usbc);
+  } else if (!kh1_usbc) {
+    notify_radio_control_audio_start_if_allowed("status key 2");
   }
   int freq_hz = (int)(g_bands[g_band_sel].freq * 1000.0f);
   if (radio_control_ready()) {
@@ -4786,6 +4778,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   }
 
   static int last_status_sync_sig = -1; // -1 forces a redraw on first entry
+  static std::string last_status_sync_text;
   int cur_status_sync_sig = audio_source_is_streaming() ? 1 : 0;
   cur_status_sync_sig |= ((int)canonical_radio_type(g_radio) << 4);
   if (is_kh1_radio(g_radio)) {
@@ -4793,13 +4786,21 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     if (g_kh1_connected) cur_status_sync_sig |= 8;
     if (g_kh1_connected && radio_control_ready()) cur_status_sync_sig |= 4;
   }
-  if (ui_mode == UIMode::STATUS && cur_status_sync_sig != last_status_sync_sig) {
+  std::string cur_status_sync_text;
+  if (ui_mode == UIMode::STATUS) {
+    cur_status_sync_text = status_sync_line();
+  }
+  if (ui_mode == UIMode::STATUS &&
+      (cur_status_sync_sig != last_status_sync_sig ||
+       cur_status_sync_text != last_status_sync_text)) {
     draw_status_view();
   }
   if (ui_mode != UIMode::STATUS) {
     last_status_sync_sig = -1;
+    last_status_sync_text.clear();
   } else {
     last_status_sync_sig = cur_status_sync_sig;
+    last_status_sync_text = cur_status_sync_text;
   }
 
   // Ensure decode is enabled whenever streaming becomes active.
