@@ -9,6 +9,7 @@
 static const char* TAG = "RADIO_FTX1";
 
 static bool ftx1_ready(void) {
+    ESP_LOGI(TAG, "FTX-1 backend selected (stub, not yet implemented)");
     return false;  // stub pending Phase 2 hardware bring-up
 }
 
