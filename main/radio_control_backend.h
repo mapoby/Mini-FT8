@@ -18,6 +18,7 @@ typedef struct {
 
 const radio_control_ops_t* radio_control_qmx_get_ops(void);
 const radio_control_ops_t* radio_control_qdx_get_ops(void);
+const radio_control_ops_t* radio_control_ftx1_get_ops(void);
 const radio_control_ops_t* radio_control_kh1_get_ops(void);
 void radio_control_kh1_set_enabled(bool enabled);
 bool radio_control_kh1_is_enabled(void);

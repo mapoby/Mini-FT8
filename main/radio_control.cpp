@@ -14,6 +14,8 @@ static const radio_control_ops_t* current_ops(void) {
         return radio_control_kh1_get_ops();
     case RADIO_CONTROL_QDX:
         return radio_control_qdx_get_ops();
+    case RADIO_CONTROL_FTX1:
+        return radio_control_ftx1_get_ops();
     case RADIO_CONTROL_QMX:
     default:
         return radio_control_qmx_get_ops();
@@ -38,6 +40,8 @@ const char* radio_control_backend_name(radio_control_backend_t backend) {
         return "kh1_cat";
     case RADIO_CONTROL_QDX:
         return "qdx";
+    case RADIO_CONTROL_FTX1:
+        return "ftx1";
     default:
         return "unknown";
     }

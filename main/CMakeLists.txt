@@ -8,6 +8,7 @@ idf_component_register(
          "radio_control_qmx.cpp"
          "radio_control_qdx.cpp"
          "radio_control_kh1_cat.cpp"
+         "radio_control_ftx1.cpp"
          "ft8_audio_pipeline.cpp"
          "stream_uac.cpp"
          "stream_mic.cpp"

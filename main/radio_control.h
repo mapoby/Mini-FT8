@@ -12,6 +12,7 @@ typedef enum {
     RADIO_CONTROL_QMX = 0,
     RADIO_CONTROL_KH1_CAT = 1,
     RADIO_CONTROL_QDX = 2,
+    RADIO_CONTROL_FTX1 = 3,
 } radio_control_backend_t;
 
 void radio_control_set_backend(radio_control_backend_t backend);
