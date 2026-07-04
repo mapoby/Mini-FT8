@@ -1544,7 +1544,7 @@ static const char* offset_name(OffsetSrc o) {
 }
 
 static RadioType canonical_radio_type(RadioType r) {
-  if (r == RadioType::QDX ||
+  if (r == RadioType::QDX || r == RadioType::FTX1 ||
       r == RadioType::KH1_USBC || r == RadioType::KH1_MIC) return r;
   return RadioType::QMX;
 }
@@ -1573,6 +1573,8 @@ static RadioType radio_type_from_saved_int(int value) {
       return RadioType::KH1_MIC;
     case (int)RadioType::QDX:
       return RadioType::QDX;
+    case (int)RadioType::FTX1:
+      return RadioType::FTX1;
     case (int)RadioType::QMX:
     default:
       return RadioType::QMX;
@@ -1604,6 +1606,9 @@ static RadioType parse_radio_config_value(const char* raw) {
   if (token == "QDX") {
     return RadioType::QDX;
   }
+  if (token == "FTX1" || token == "FTX-1") {
+    return RadioType::FTX1;
+  }
   return RadioType::QMX;
 }
 
@@ -1615,6 +1620,10 @@ static RadioProfileBinding get_radio_profile_binding(RadioType r) {
       return {AUDIO_SOURCE_KH1_MIC, RADIO_CONTROL_KH1_CAT};
     case RadioType::QDX:
       return {AUDIO_SOURCE_QMX_UAC, RADIO_CONTROL_QDX};
+    case RadioType::FTX1:
+      // AUDIO_SOURCE_QMX_UAC is a Phase-1 placeholder; revisit in Phase 4 (AUDIO-01/02/03)
+      // once the FTX-1's real USB audio profile is validated against hardware.
+      return {AUDIO_SOURCE_QMX_UAC, RADIO_CONTROL_FTX1};
     case RadioType::QMX:
     default:
       return {AUDIO_SOURCE_QMX_UAC, RADIO_CONTROL_QMX};
@@ -1627,6 +1636,7 @@ static const char* radio_name(RadioType r) {
     case RadioType::QDX: return "QDX";
     case RadioType::KH1_USBC: return "KH1-USBC";
     case RadioType::KH1_MIC: return "KH1-MIC";
+    case RadioType::FTX1: return "FTX-1";
     default: break;
   }
   return "None";
@@ -5482,6 +5492,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                       g_radio = RadioType::KH1_MIC;
                       break;
                     case RadioType::KH1_MIC:
+                      g_radio = RadioType::FTX1;
+                      break;
+                    case RadioType::FTX1:
                     default:
                       g_radio = RadioType::QMX;
                       break;
