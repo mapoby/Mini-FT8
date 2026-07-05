@@ -129,7 +129,7 @@ static void uac_lib_task(void* arg);
 static void stream_uac_task(void* arg);
 static void cdc_close(void);
 static void cdc_try_open(void);
-static void cp210x_try_open(void);
+static void cp210x_try_open();
 static void cdc_event_cb(const cdc_acm_host_dev_event_data_t* event, void* user_ctx);
 
 // Speaker constants and event callback forward declaration. The
@@ -280,7 +280,7 @@ static void cdc_try_open(void) {
 // cdc_try_open(), there is no hint-scan or blind interface loop: the
 // FTX-1's VID/PID/interface are known constants (CP2105_PID, iface 0 --
 // hardware-confirmed in Plan 03, see 02-RESEARCH.md Assumptions A1/A2).
-static void cp210x_try_open(void) {
+static void cp210x_try_open() {
     if (!s_cdc_installed) return;
     if (s_cdc_handle) return;
 
@@ -619,6 +619,9 @@ static void uac_lib_task(void* arg) {
                     if (s_profile == UAC_PROFILE_QMX) {
                         // Try to open companion CDC-ACM interface (CAT).
                         cdc_try_open();
+                    } else if (s_profile == UAC_PROFILE_FTX1) {
+                        // Try to open companion CP210x CAT-1 interface.
+                        cp210x_try_open();
                     }
 
                     // Start the audio processing task.
@@ -867,8 +870,11 @@ static bool uac_should_stop(void* ctx) {
 
 static void uac_on_block_processed(void* ctx) {
     (void)ctx;
-    if (!s_cdc_handle) {
+    if (s_cdc_handle) return;
+    if (s_profile == UAC_PROFILE_QMX) {
         cdc_try_open();
+    } else if (s_profile == UAC_PROFILE_FTX1) {
+        cp210x_try_open();
     }
 }
 
