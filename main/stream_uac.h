@@ -29,6 +29,7 @@ typedef enum {
 typedef enum {
     UAC_PROFILE_QMX = 0,
     UAC_PROFILE_GENERIC_USB = 1,
+    UAC_PROFILE_FTX1 = 2,
 } uac_stream_profile_t;
 
 #define UAC_WATERFALL_ROW_WIDTH FT8_AUDIO_WATERFALL_ROW_WIDTH
