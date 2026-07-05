@@ -4,13 +4,10 @@
 #include <cstring>
 
 #include "esp_log.h"
-// NOTE: do NOT include "stream_uac.h" in Phase 1 -- no CAT/UAC I/O yet (Phase 2 dependency, CAT-01)
-
-static const char* TAG = "RADIO_FTX1";
+#include "stream_uac.h"
 
 static bool ftx1_ready(void) {
-    ESP_LOGI(TAG, "FTX-1 backend selected (stub, not yet implemented)");
-    return false;  // stub pending Phase 2 hardware bring-up
+    return cat_cdc_ready();
 }
 
 static esp_err_t ftx1_on_audio_start(void) {
