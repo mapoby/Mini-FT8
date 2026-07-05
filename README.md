@@ -2,6 +2,8 @@ Subscribe to [https://freelists.org/list/qrp-portable](https://freelists.org/lis
 
 Also see [PaperFT8](https://github.com/wcheng95/PaperFT8)
 
+### Dean, KD3AN had added support for IC705: (https://github.com/hamrec/cp705)
+
 # First POTA activation (v1.0 2025-12-31)
 ![First POTA Activation](IMG_6087.jpeg)
 
