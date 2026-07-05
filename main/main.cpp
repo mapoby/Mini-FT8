@@ -1621,9 +1621,7 @@ static RadioProfileBinding get_radio_profile_binding(RadioType r) {
     case RadioType::QDX:
       return {AUDIO_SOURCE_QMX_UAC, RADIO_CONTROL_QDX};
     case RadioType::FTX1:
-      // AUDIO_SOURCE_QMX_UAC is a Phase-1 placeholder; revisit in Phase 4 (AUDIO-01/02/03)
-      // once the FTX-1's real USB audio profile is validated against hardware.
-      return {AUDIO_SOURCE_QMX_UAC, RADIO_CONTROL_FTX1};
+      return {AUDIO_SOURCE_FTX1_CP210X, RADIO_CONTROL_FTX1};
     case RadioType::QMX:
     default:
       return {AUDIO_SOURCE_QMX_UAC, RADIO_CONTROL_QMX};

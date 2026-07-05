@@ -12,7 +12,8 @@ static audio_source_backend_t s_active_backend = AUDIO_SOURCE_QMX_UAC;
 static bool s_have_active_backend = false;
 
 static bool backend_is_uac(audio_source_backend_t backend) {
-    return backend == AUDIO_SOURCE_QMX_UAC || backend == AUDIO_SOURCE_USB_UAC_GENERIC;
+    return backend == AUDIO_SOURCE_QMX_UAC || backend == AUDIO_SOURCE_USB_UAC_GENERIC ||
+           backend == AUDIO_SOURCE_FTX1_CP210X;
 }
 
 void audio_source_set_backend(audio_source_backend_t backend) {
@@ -31,6 +32,8 @@ const char* audio_source_backend_name(audio_source_backend_t backend) {
         return "usb_uac_generic";
     case AUDIO_SOURCE_KH1_MIC:
         return "kh1_mic";
+    case AUDIO_SOURCE_FTX1_CP210X:
+        return "ftx1_cp210x";
     default:
         return "unknown";
     }
@@ -42,6 +45,8 @@ bool audio_source_start(void) {
         uac_stream_profile_t profile = UAC_PROFILE_QMX;
         if (s_backend == AUDIO_SOURCE_USB_UAC_GENERIC) {
             profile = UAC_PROFILE_GENERIC_USB;
+        } else if (s_backend == AUDIO_SOURCE_FTX1_CP210X) {
+            profile = UAC_PROFILE_FTX1;
         }
         ESP_LOGI(TAG, "Start audio source backend=%s", audio_source_backend_name(s_backend));
         ok = uac_start_with_profile(profile);
