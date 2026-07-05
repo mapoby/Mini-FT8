@@ -17,6 +17,7 @@
 #include "usb/uac_host.h"
 #include "usb/cdc_acm_host.h"
 #include "usb/usb_types_ch9.h"
+#include "usb/vcp_cp210x.h"
 
 #include <cstring>
 #include <cmath>
@@ -128,6 +129,7 @@ static void uac_lib_task(void* arg);
 static void stream_uac_task(void* arg);
 static void cdc_close(void);
 static void cdc_try_open(void);
+static void cp210x_try_open(void);
 static void cdc_event_cb(const cdc_acm_host_dev_event_data_t* event, void* user_ctx);
 
 // Speaker constants and event callback forward declaration. The
@@ -163,6 +165,8 @@ static const char* profile_name(uac_stream_profile_t profile) {
         return "qmx_uac";
     case UAC_PROFILE_GENERIC_USB:
         return "usb_uac_generic";
+    case UAC_PROFILE_FTX1:
+        return "ftx1_cp210x";
     default:
         return "unknown";
     }
@@ -198,6 +202,7 @@ static void cdc_event_cb(const cdc_acm_host_dev_event_data_t* event, void* user_
 static void cdc_try_open(void) {
     if (!s_cdc_installed) return;
     if (s_cdc_handle) return;
+    if (s_profile != UAC_PROFILE_QMX) return;   // CAT-02 hard boundary
 
     // Throttle attempts
     int64_t now_ms = rtc_now_ms();
@@ -269,6 +274,50 @@ static void cdc_try_open(void) {
         ESP_LOGD(TAG, "CDC-ACM not found yet (profile=%s attempt at %" PRId64 " ms)",
                  profile_name(s_profile), now_ms);
     }
+}
+
+// Open the FTX-1's CP210x CAT-1 (Enhanced COM) virtual port. Unlike
+// cdc_try_open(), there is no hint-scan or blind interface loop: the
+// FTX-1's VID/PID/interface are known constants (CP2105_PID, iface 0 --
+// hardware-confirmed in Plan 03, see 02-RESEARCH.md Assumptions A1/A2).
+static void cp210x_try_open(void) {
+    if (!s_cdc_installed) return;
+    if (s_cdc_handle) return;
+
+    // Throttle attempts
+    int64_t now_ms = rtc_now_ms();
+    if (s_cdc_last_attempt_ms != 0 && (now_ms - s_cdc_last_attempt_ms) < 1000) return;
+    s_cdc_last_attempt_ms = now_ms;
+
+    cdc_acm_host_device_config_t dev_cfg = {
+        .connection_timeout_ms = 1000,
+        .out_buffer_size = 64,
+        .in_buffer_size = 256,   // FTX-1 needs RX for query replies (Phase 3); QMX is TX-only
+        .event_cb = cdc_event_cb,
+        .data_cb = NULL,
+        .user_arg = NULL,
+    };
+
+    cdc_acm_dev_hdl_t handle = NULL;
+    esp_err_t err = cp210x_vcp_open(CP2105_PID, /*interface_idx=*/0, &dev_cfg, &handle);
+    if (err != ESP_OK) {
+        if (err != ESP_ERR_NOT_FOUND) {
+            ESP_LOGW(TAG, "CP210x open (FTX-1 CAT-1) failed: %s", esp_err_to_name(err));
+        }
+        return;
+    }
+
+    // CAT-03: defense-in-depth RTS/DTR deassert (dtr=false, rts=false),
+    // immediately, before any CAT traffic and regardless of the FTX-1's
+    // RPTT SELECT menu state.
+    esp_err_t line_err = cdc_acm_host_set_control_line_state(handle, false, false);
+    ESP_LOGI(TAG, "CP210x opened (FTX-1 CAT-1 iface 0); RTS/DTR deassert: %s",
+             esp_err_to_name(line_err));
+
+    s_cdc_handle = handle;
+    s_cdc_iface = 0;
+    cdc_acm_host_desc_print(handle);
+    g_cdc_initial_sync_pending = true;
 }
 
 static void cdc_new_dev_cb(usb_device_handle_t usb_dev) {
@@ -376,8 +425,10 @@ static void usb_lib_task(void* arg) {
 
     ESP_LOGI(TAG, "USB Host installed");
 
-    if (s_profile == UAC_PROFILE_QMX) {
+    if (s_profile == UAC_PROFILE_QMX || s_profile == UAC_PROFILE_FTX1) {
         // Install CDC-ACM driver for QMX/QDX CAT control before starting class drivers.
+        // Also required for FTX-1: cp210x_vcp_open() calls cdc_acm_host_open()
+        // internally and depends on this base driver being installed.
         const cdc_acm_host_driver_config_t cdc_cfg = {
             .driver_task_stack_size = 3072,
             .driver_task_priority = 4,
