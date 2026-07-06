@@ -314,6 +314,17 @@ static void cp210x_try_open() {
     ESP_LOGI(TAG, "CP210x opened (FTX-1 CAT-1 iface 0); RTS/DTR deassert: %s",
              esp_err_to_name(line_err));
 
+    // CAT-1 defaults to 38400 8N1; configure explicitly so CAT commands are
+    // never framed at the wrong baud rate (SYNC-01 prerequisite).
+    cdc_acm_line_coding_t line_coding = {
+        .dwDTERate = 38400,
+        .bCharFormat = 0,   // 1 stop bit
+        .bParityType = 0,   // none
+        .bDataBits = 8,
+    };
+    esp_err_t lc_err = cdc_acm_host_line_coding_set(handle, &line_coding);
+    ESP_LOGI(TAG, "CP210x CAT-1 line coding set (38400 8N1): %s", esp_err_to_name(lc_err));
+
     s_cdc_handle = handle;
     s_cdc_iface = 0;
     cdc_acm_host_desc_print(handle);
