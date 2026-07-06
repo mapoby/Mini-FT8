@@ -410,12 +410,23 @@ static void usb_lib_task(void* arg) {
     host_config.skip_phy_setup = false;
     host_config.intr_flags = ESP_INTR_FLAG_LEVEL1;
 
-    if (s_profile == UAC_PROFILE_QMX) {
+    if (s_profile == UAC_PROFILE_QMX || s_profile == UAC_PROFILE_FTX1) {
         // Custom FIFO partitioning enables simultaneous bidirectional ISO
-        // streaming with QDX or QMX hardware. ESP32-S3 has 200 FIFO lines.
-        // Built-in Kconfig biases do not cover 24-bit/48k/stereo MPS=300
-        // in both directions at once. This split reserves 364 B for RX,
-        // 364 B for PTX, and 72 B for non-periodic OUT (CDC CAT bulk-OUT).
+        // streaming with QDX, QMX, or FTX-1 hardware. ESP32-S3 has 200
+        // FIFO lines total (hard ceiling, HAL_ASSERTs if exceeded at
+        // usb_host_install() time). Built-in Kconfig biases do not cover
+        // 24-bit/48k/stereo MPS=300 in both directions at once. This
+        // split reserves 364 B for RX, 364 B for PTX, and 72 B for
+        // non-periodic OUT (CDC CAT bulk-OUT for QMX; CP210x CAT-1 bulk
+        // for FTX-1). Sum = 91+18+91 = 200, exactly the ceiling with
+        // zero headroom -- any future change to one value MUST be paired
+        // with an equal-or-greater decrease elsewhere, re-verified against
+        // the 200-line sum before flashing.
+        // FTX-1 additionally carries CP210x bulk CAT traffic sharing this
+        // same nptx_fifo_lines pool; whether 18 lines remains sufficient
+        // under combined load (audio both directions + CAT query traffic)
+        // is unconfirmed from documentation alone and requires empirical
+        // validation on real hardware in the 04-02 hardware-checkpoint plan.
         host_config.fifo_settings_custom.rx_fifo_lines   = 91;   // 364 B
         host_config.fifo_settings_custom.nptx_fifo_lines = 18;   // 72 B
         host_config.fifo_settings_custom.ptx_fifo_lines  = 91;   // 364 B
