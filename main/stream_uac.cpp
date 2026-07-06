@@ -694,7 +694,7 @@ static void uac_lib_task(void* arg) {
                     }
 
                 } else if (evt.driver.event == UAC_HOST_DRIVER_EVENT_TX_CONNECTED) {
-                    if (s_profile != UAC_PROFILE_QMX) {
+                    if (s_profile != UAC_PROFILE_QMX && s_profile != UAC_PROFILE_FTX1) {
                         ESP_LOGI(TAG, "Speaker connected ignored profile=%s addr=%u iface=%u",
                                  profile_name(s_profile),
                                  (unsigned)evt.driver.addr,
