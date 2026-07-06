@@ -566,10 +566,8 @@ static void uac_lib_task(void* arg) {
                         // Try to open companion CP210x CAT-1 interface.
                         // Runs unconditionally once the UAC device is open,
                         // independent of mic stream negotiation outcome:
-                        // the FTX-1's mic-only advertises 16-bit while this
-                        // profile's sole candidate is 24-bit, so negotiation
-                        // reliably fails on real hardware and must not gate
-                        // CAT-1 availability.
+                        // CAT-1 availability must never depend on whether
+                        // the mic candidate-scan below succeeds.
                         cp210x_try_open();
                     }
 
@@ -577,6 +575,9 @@ static void uac_lib_task(void* arg) {
                     // QMX profile keeps the existing strict format.
                     // Generic profile stays 48 kHz and tries mic-only
                     // mono/stereo 24-bit and 16-bit candidates.
+                    // FTX-1 profile also scans mic-only candidates (D-02),
+                    // QMX-parity-shaped formats first, since its USB Audio
+                    // descriptor is unconfirmed from documentation alone.
                     uac_host_stream_config_t candidates[4];
                     int candidate_count = 0;
                     auto add_candidate = [&](uint8_t ch, uint8_t bits) {
@@ -591,6 +592,14 @@ static void uac_lib_task(void* arg) {
                         add_candidate(1, 16);
                         add_candidate(2, 24);
                         add_candidate(2, 16);
+                    } else if (s_profile == UAC_PROFILE_FTX1) {
+                        // D-02 try-order: QMX-parity-shaped formats first,
+                        // degrade toward GENERIC_USB's mono/16-bit fallback
+                        // only if richer formats aren't advertised.
+                        add_candidate(2, 24);
+                        add_candidate(2, 16);
+                        add_candidate(1, 24);
+                        add_candidate(1, 16);
                     } else {
                         add_candidate(UAC_CHANNELS, UAC_BIT_RESOLUTION);
                     }
@@ -615,7 +624,7 @@ static void uac_lib_task(void* arg) {
                     }
 
                     if (!started) {
-                        if (s_profile == UAC_PROFILE_GENERIC_USB) {
+                        if (s_profile == UAC_PROFILE_GENERIC_USB || s_profile == UAC_PROFILE_FTX1) {
                             ESP_LOGE(TAG, "No 48k UAC mic format for profile=%s",
                                      profile_name(s_profile));
                             snprintf(s_status_string, sizeof(s_status_string), "No 48k UAC mic format");
