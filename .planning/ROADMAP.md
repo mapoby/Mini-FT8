@@ -13,7 +13,7 @@ This milestone adds the Yaesu FTX-1 as a fourth radio backend to Mini-FT8, follo
 - [x] **Phase 1: Backend Vtable Plumbing** - FTX-1 selectable as a radio type with a stubbed ops vtable, no hardware required
 - [x] **Phase 2: CP210x USB Bring-up & CAT Connection** - Firmware reliably opens a CAT channel to the physical FTX-1 over its CP210x virtual COM port (completed 2026-07-06)
 - [x] **Phase 3: CAT Command Implementation** - Frequency, mode, and PTT control work over CAT against the physical radio (completed 2026-07-06)
-- [ ] **Phase 4: Bidirectional UAC Audio Negotiation** - Mic RX and speaker TX audio stream correctly over USB against the physical radio
+- [x] **Phase 4: Bidirectional UAC Audio Negotiation** - Mic RX and speaker TX audio stream correctly over USB against the physical radio (completed 2026-07-06)
 - [ ] **Phase 5: End-to-End Integration and Parity Testing** - Full FT8 and FT4 QSOs complete end-to-end on the physical FTX-1
 
 ## Phase Details
@@ -71,7 +71,7 @@ This milestone adds the Yaesu FTX-1 as a fourth radio backend to Mini-FT8, follo
 **Plans**: 2 plans
 
 - [x] 04-01-PLAN.md — FTX-1 mic candidate-scan, speaker guard widening, and FIFO partition widening in stream_uac.cpp (AUDIO-01, AUDIO-02, AUDIO-03)
-- [ ] 04-02-PLAN.md — Physical FTX-1 hardware checkpoint: clean build, negotiated mic format, TX tone quality, and combined-load FIFO stability across multiple cycles (AUDIO-01, AUDIO-02, AUDIO-03)
+- [x] 04-02-PLAN.md — Physical FTX-1 hardware checkpoint: clean build, negotiated mic format, TX tone quality, and combined-load FIFO stability across multiple cycles (AUDIO-01, AUDIO-02, AUDIO-03)
 
 ### Phase 5: End-to-End Integration and Parity Testing
 **Goal**: A full FT8 or FT4 QSO — RX decode, autoseq, and TX — works end-to-end with the FTX-1, at parity with QMX/QDX/KH1.
@@ -96,5 +96,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 | 1. Backend Vtable Plumbing | 1/1 | Complete    | 2026-07-05 |
 | 2. CP210x USB Bring-up & CAT Connection | 3/3 | Complete    | 2026-07-06 |
 | 3. CAT Command Implementation | 0/2 | Not started | - |
-| 4. Bidirectional UAC Audio Negotiation | 1/2 | In progress | - |
+| 4. Bidirectional UAC Audio Negotiation | 2/2 | Complete    | 2026-07-06 |
 | 5. End-to-End Integration and Parity Testing | 0/TBD | Not started | - |
