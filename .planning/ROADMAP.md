@@ -70,7 +70,7 @@ This milestone adds the Yaesu FTX-1 as a fourth radio backend to Mini-FT8, follo
   4. Simultaneous bidirectional audio plus CP210x CAT traffic runs through multiple RX/TX cycles with no FIFO overrun/underrun in the logs
 **Plans**: 2 plans
 
-- [ ] 04-01-PLAN.md — FTX-1 mic candidate-scan, speaker guard widening, and FIFO partition widening in stream_uac.cpp (AUDIO-01, AUDIO-02, AUDIO-03)
+- [x] 04-01-PLAN.md — FTX-1 mic candidate-scan, speaker guard widening, and FIFO partition widening in stream_uac.cpp (AUDIO-01, AUDIO-02, AUDIO-03)
 - [ ] 04-02-PLAN.md — Physical FTX-1 hardware checkpoint: clean build, negotiated mic format, TX tone quality, and combined-load FIFO stability across multiple cycles (AUDIO-01, AUDIO-02, AUDIO-03)
 
 ### Phase 5: End-to-End Integration and Parity Testing
@@ -96,5 +96,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 | 1. Backend Vtable Plumbing | 1/1 | Complete    | 2026-07-05 |
 | 2. CP210x USB Bring-up & CAT Connection | 3/3 | Complete    | 2026-07-06 |
 | 3. CAT Command Implementation | 0/2 | Not started | - |
-| 4. Bidirectional UAC Audio Negotiation | 0/2 | Not started | - |
+| 4. Bidirectional UAC Audio Negotiation | 1/2 | In progress | - |
 | 5. End-to-End Integration and Parity Testing | 0/TBD | Not started | - |
