@@ -562,6 +562,17 @@ static void uac_lib_task(void* arg) {
                     // Print device info
                     uac_host_printf_device_param(handle);
 
+                    if (s_profile == UAC_PROFILE_FTX1) {
+                        // Try to open companion CP210x CAT-1 interface.
+                        // Runs unconditionally once the UAC device is open,
+                        // independent of mic stream negotiation outcome:
+                        // the FTX-1's mic-only advertises 16-bit while this
+                        // profile's sole candidate is 24-bit, so negotiation
+                        // reliably fails on real hardware and must not gate
+                        // CAT-1 availability.
+                        cp210x_try_open();
+                    }
+
                     // Start stream format negotiation.
                     // QMX profile keeps the existing strict format.
                     // Generic profile stays 48 kHz and tries mic-only
@@ -630,9 +641,6 @@ static void uac_lib_task(void* arg) {
                     if (s_profile == UAC_PROFILE_QMX) {
                         // Try to open companion CDC-ACM interface (CAT).
                         cdc_try_open();
-                    } else if (s_profile == UAC_PROFILE_FTX1) {
-                        // Try to open companion CP210x CAT-1 interface.
-                        cp210x_try_open();
                     }
 
                     // Start the audio processing task.
