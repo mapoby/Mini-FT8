@@ -83,3 +83,23 @@ None — this plan's changes stay within the `<threat_model>` already defined in
 - FOUND: main/radio_control_ftx1.cpp (all task-2 functions present, verified via grep)
 - FOUND: commit ede5ccf (Task 1)
 - FOUND: commit 93be267 (Task 2)
+
+## Addendum: Task 3 (gap-closure, added after 03-02 hardware checkpoint)
+
+**Found during:** 03-02's hardware checkpoint against a physical FTX-1. `cat_cdc_ready()` never became true because `cp210x_try_open()` for `UAC_PROFILE_FTX1` was only called inside the UAC mic-stream-negotiation success block. The FTX-1 profile tries a single 24-bit candidate, but the real FTX-1 mic UAC interface only advertises 16-bit, so negotiation always failed, `started` stayed false, and the `!started` branch's `continue;` skipped the `cp210x_try_open()` call on every boot — CAT-1 never opened.
+
+**Fix (`main/stream_uac.cpp`):** Moved the FTX-1 branch's `cp210x_try_open()` call to run unconditionally immediately after `uac_host_printf_device_param(handle)`, before stream-format negotiation begins — independent of whether the mic stream successfully starts. The QMX branch (`cdc_try_open()`) is unchanged, still gated inside the post-negotiation-success block, since QMX's existing single-candidate format matches its hardware in the field.
+
+**Also committed:** `sdkconfig` change from this same hardware session — `CONFIG_USB_HOST_HUBS_SUPPORTED=y` and `CONFIG_USB_HOST_HUB_MULTI_LEVEL=y` (previously disabled). Live-hardware-confirmed: the FTX-1 enumerates through an internal USB hub joining its CP2105 CAT chip and a separate USB-audio chip; without hub support the USB host stack cannot see past the hub to reach the CP2105 at all.
+
+**Files modified:** `main/stream_uac.cpp`, `sdkconfig`
+**Commit:** db2186b
+
+**Verification:**
+
+- `cp210x_try_open()` call site now precedes the stream-negotiation loop and is not gated by `started` or reachable by the `!started` early-`continue`.
+- QMX's `cdc_try_open()` conditional structure/position unchanged (diff-verified).
+- `sdkconfig` shows `CONFIG_USB_HOST_HUBS_SUPPORTED=y` and `CONFIG_USB_HOST_HUB_MULTI_LEVEL=y`.
+- `idf.py build` verification deferred to the next 03-02 Task 1 re-run (ESP-IDF toolchain not on PATH in this executor's Bash sessions).
+
+No other deviations for this task.
