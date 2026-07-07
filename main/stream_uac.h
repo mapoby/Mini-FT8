@@ -57,6 +57,11 @@ bool uac_tx_begin_cpfsk(float base_hz,
 bool uac_tx_begin_tune(float tone_hz);
 void uac_tx_end(void);
 
+// FTX-1 half-duplex mic/speaker swap. No-op for every other profile.
+// See stream_uac.cpp's s_ftx1_direction comment for the full rationale.
+void uac_ftx1_prepare_tx(void);
+void uac_ftx1_prepare_rx(void);
+
 #ifdef __cplusplus
 }
 #endif

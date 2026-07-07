@@ -88,6 +88,29 @@ static cdc_acm_dev_hdl_t s_cdc_handle = NULL;
 static TaskHandle_t s_usb_task_handle = NULL;
 static TaskHandle_t s_uac_task_handle = NULL;
 
+// Mic (UAC IN) addr/iface are remembered from the driver's one-time
+// RX_CONNECTED event so the FTX-1 half-duplex swap can reopen the mic
+// on demand, without waiting for another RX_CONNECTED event that will
+// never come (it only fires once, at physical enumeration).
+static uint8_t s_mic_addr = 0;
+static uint8_t s_mic_iface = 0;
+static bool s_mic_known = false;
+
+// FTX-1 half-duplex mic/speaker swap direction. The ESP32-S3's fixed
+// 8-channel HCD ceiling cannot hold both the mic and speaker streaming
+// pipes open at once alongside the hub + CP210x CAT-1 devices (measured,
+// see .planning/debug/ftx1-hcd-channel-exhaustion.md). FT8/FT4 is
+// inherently half-duplex, so mic and speaker are time-multiplexed:
+// whichever direction is about to be used is claimed ahead of time
+// (reusing the same pre-open/suspended pattern the speaker already used),
+// and the other direction's pipe is fully released. Scoped to
+// UAC_PROFILE_FTX1 only -- QMX/QDX/KH1 keep both pipes open permanently.
+typedef enum {
+    FTX1_DIR_RX = 0,
+    FTX1_DIR_TX = 1,
+} ftx1_direction_t;
+static ftx1_direction_t s_ftx1_direction = FTX1_DIR_RX;
+
 // Speaker (UAC OUT) is captured and fully allocated during enumeration.
 // QDX transmission only resumes or suspends the pre-opened endpoint.
 static uint8_t s_spk_addr = 0;
@@ -132,6 +155,12 @@ static void cdc_close(void);
 static void cdc_try_open(void);
 static void cp210x_try_open();
 static void cdc_event_cb(const cdc_acm_host_dev_event_data_t* event, void* user_ctx);
+static bool mic_negotiate_and_start(uac_host_device_handle_t handle);
+static void mic_ensure_stream_task(void);
+static bool mic_open_and_start(void);
+static bool mic_close(void);
+static bool spk_open_and_claim(void);
+static void spk_close(void);
 
 // Speaker constants and event callback forward declaration. The
 // constants are referenced from uac_lib_task's TX_CONNECTED handler
@@ -431,6 +460,294 @@ static bool ftx1_enum_filter_cb(const usb_device_desc_t* dev_desc, uint8_t* bCon
     return true;
 }
 
+// Negotiates a mic stream format on an already-opened UAC device handle and
+// starts it. Shared by the initial RX_CONNECTED open and the FTX-1
+// half-duplex swap's on-demand mic reopen, so both paths pick candidates
+// the same way and update s_format identically.
+static bool mic_negotiate_and_start(uac_host_device_handle_t handle) {
+    uac_host_stream_config_t candidates[4];
+    int candidate_count = 0;
+    auto add_candidate = [&](uint8_t ch, uint8_t bits) {
+        candidates[candidate_count].channels = ch;
+        candidates[candidate_count].bit_resolution = bits;
+        candidates[candidate_count].sample_freq = UAC_SAMPLE_RATE;
+        candidates[candidate_count].flags = 0;
+        candidate_count++;
+    };
+    if (s_profile == UAC_PROFILE_GENERIC_USB) {
+        add_candidate(1, 24);
+        add_candidate(1, 16);
+        add_candidate(2, 24);
+        add_candidate(2, 16);
+    } else if (s_profile == UAC_PROFILE_FTX1) {
+        // D-02 try-order: QMX-parity-shaped formats first, degrade toward
+        // GENERIC_USB's mono/16-bit fallback only if richer formats aren't
+        // advertised.
+        add_candidate(2, 24);
+        add_candidate(2, 16);
+        add_candidate(1, 24);
+        add_candidate(1, 16);
+    } else {
+        add_candidate(UAC_CHANNELS, UAC_BIT_RESOLUTION);
+    }
+
+    bool started = false;
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+    for (int i = 0; i < candidate_count; ++i) {
+        const uac_host_stream_config_t* cfg = &candidates[i];
+        ESP_LOGI(TAG, "Starting stream (profile=%s) candidate %d/%d: %dHz, %d-bit, %dch",
+                 profile_name(s_profile), i + 1, candidate_count,
+                 cfg->sample_freq, cfg->bit_resolution, cfg->channels);
+        err = uac_host_device_start(handle, cfg);
+        if (err == ESP_OK) {
+            s_format.sample_freq = cfg->sample_freq;
+            s_format.bit_resolution = cfg->bit_resolution;
+            s_format.channels = cfg->channels;
+            started = true;
+            ESP_LOGI(TAG, "Selected stream format: %dHz, %d-bit, %dch",
+                     s_format.sample_freq, s_format.bit_resolution, s_format.channels);
+            break;
+        }
+        ESP_LOGW(TAG, "Stream candidate failed: %s", esp_err_to_name(err));
+    }
+
+    if (!started) {
+        if (s_profile == UAC_PROFILE_GENERIC_USB || s_profile == UAC_PROFILE_FTX1) {
+            ESP_LOGE(TAG, "No 48k UAC mic format for profile=%s", profile_name(s_profile));
+            snprintf(s_status_string, sizeof(s_status_string), "No 48k UAC mic format");
+        } else {
+            ESP_LOGE(TAG, "Failed to start stream for profile=%s", profile_name(s_profile));
+            snprintf(s_status_string, sizeof(s_status_string), "Format not supported");
+        }
+    }
+    return started;
+}
+
+// Creates the audio-processing task if not already running. FT4's decoder
+// needs a larger stack than FT8. Keep the FT8 stack static and allocate the
+// FT4 stack on demand. Called both at initial mic connect and after the
+// FTX-1 half-duplex swap reopens the mic (the task self-deletes on close).
+static void mic_ensure_stream_task(void) {
+    if (s_stream_task_handle != NULL) return;
+#if ENABLE_FT4
+    if (g_protocol == &kProtocolFT4) {
+        BaseType_t cr = xTaskCreatePinnedToCore(
+            stream_uac_task, "stream_uac",
+            16384, NULL,
+            UAC_STREAM_TASK_PRIORITY,
+            &s_stream_task_handle, 1);
+        if (cr != pdPASS) {
+            ESP_LOGE(TAG, "stream_uac_task create FAILED (dynamic FT4) free=%u",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
+            s_stream_task_handle = NULL;
+        }
+        return;
+    }
+#endif
+    // FT8 uses a static 8 KB stack.
+    static StackType_t  s_stream_task_stack[8192 / sizeof(StackType_t)];
+    static StaticTask_t s_stream_task_tcb;
+    size_t free_before = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+    ESP_LOGI(TAG, "Pre-task-create heap: free=%u largest=%u",
+             (unsigned)free_before, (unsigned)largest);
+    s_stream_task_handle = xTaskCreateStaticPinnedToCore(
+        stream_uac_task, "stream_uac",
+        8192 / sizeof(StackType_t), NULL,
+        UAC_STREAM_TASK_PRIORITY,
+        s_stream_task_stack, &s_stream_task_tcb, 1);
+    if (!s_stream_task_handle) {
+        ESP_LOGE(TAG, "stream_uac_task create FAILED (static FT8) free=%u largest=%u",
+                 (unsigned)free_before, (unsigned)largest);
+    }
+}
+
+// Reopens the mic using the addr/iface remembered from the one-time
+// RX_CONNECTED event, negotiates a format, and restarts the stream task.
+// Used by uac_ftx1_prepare_rx() after the speaker's channel has been freed.
+static bool mic_open_and_start(void) {
+    if (s_mic_handle != NULL) return true;   // already open
+    if (!s_mic_known) {
+        ESP_LOGW(TAG, "mic reopen requested before RX_CONNECTED ever fired");
+        return false;
+    }
+
+    uac_host_device_config_t dev_config = {
+        .addr = s_mic_addr,
+        .iface_num = s_mic_iface,
+        .buffer_size = UAC_BUFFER_SIZE,
+        .buffer_threshold = UAC_BUFFER_THRESHOLD,
+        .callback = uac_device_callback,
+        .callback_arg = NULL
+    };
+
+    uac_host_device_handle_t handle = NULL;
+    esp_err_t err = uac_host_device_open(&dev_config, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "mic reopen failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    if (!mic_negotiate_and_start(handle)) {
+        uac_host_device_close(handle);
+        return false;
+    }
+
+    s_mic_handle = handle;
+    s_state = UAC_STATE_STREAMING;
+    g_streaming = true;
+    snprintf(s_status_string, sizeof(s_status_string),
+             "Streaming %s %luk/%u/%u",
+             profile_name(s_profile),
+             (unsigned long)(s_format.sample_freq / 1000),
+             s_format.bit_resolution,
+             s_format.channels);
+
+    mic_ensure_stream_task();
+    return true;
+}
+
+// Closes the mic's UAC stream and releases its HCD channel. Blocks
+// (bounded, <=300ms) until stream_uac_task has observed s_mic_handle==NULL
+// and self-deleted, so the device handle is never closed while a read is
+// still in flight on it from another task. Used by uac_ftx1_prepare_tx()
+// ahead of a TX slot.
+static bool mic_close(void) {
+    if (s_mic_handle == NULL) return false;
+
+    uac_host_device_handle_t handle_to_close = s_mic_handle;
+    s_mic_handle = NULL;   // signals uac_should_stop()/read loop to exit
+    g_streaming = false;
+    s_state = UAC_STATE_WAITING;
+    snprintf(s_status_string, sizeof(s_status_string), "Idle (TX slot)");
+
+    for (int i = 0; i < 30 && s_stream_task_handle != NULL; ++i) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (s_stream_task_handle != NULL) {
+        ESP_LOGW(TAG, "mic_close: stream task did not exit within 300ms, closing anyway");
+    }
+
+    uac_host_device_stop(handle_to_close);
+    uac_host_device_close(handle_to_close);
+    return true;
+}
+
+// Opens and claims the speaker (pre-negotiated, suspended -- no URBs queued
+// yet), and allocates the pump buffer + permanent writer task on first use.
+// Shared by QMX's eager open-at-enumeration and the FTX-1 half-duplex
+// swap's on-demand claim ahead of a TX slot.
+static bool spk_open_and_claim(void) {
+    if (s_spk_handle) return true;   // already open
+
+    uac_host_device_config_t cfg = {};
+    cfg.addr = s_spk_addr;
+    cfg.iface_num = s_spk_iface;
+    cfg.buffer_size = SPK_BUFFER_SIZE;
+    cfg.buffer_threshold = SPK_BUFFER_THRESHOLD;
+    cfg.callback = spk_event_cb;
+    cfg.callback_arg = nullptr;
+    esp_err_t oerr = uac_host_device_open(&cfg, &s_spk_handle);
+    if (oerr != ESP_OK) {
+        ESP_LOGE(TAG, "spk open failed: %s", esp_err_to_name(oerr));
+        s_spk_handle = NULL;
+        return false;
+    }
+
+    // Claim iface + alloc xfer URBs + EP slot now, but pass
+    // FLAG_STREAM_SUSPEND_AFTER_START so no URBs are queued on the bus yet.
+    // Resume happens at TX via uac_host_device_resume (cheap, no realloc).
+    // Suspend at TX-end stops URB flow but keeps everything allocated.
+    //
+    // Candidate scan mirrors the mic's D-02 pattern: QMX's speaker is
+    // confirmed 24-bit-capable and keeps its single fixed candidate
+    // unchanged. FTX-1's codec (confirmed 16-bit-only on the mic side,
+    // symmetric per typical single-chip codec design) falls back to
+    // 2ch/16-bit when 2ch/24-bit is rejected.
+    uac_host_stream_config_t spk_candidates[2];
+    int spk_candidate_count = 0;
+    auto add_spk_candidate = [&](uint8_t bits) {
+        spk_candidates[spk_candidate_count].channels = 2;
+        spk_candidates[spk_candidate_count].bit_resolution = bits;
+        spk_candidates[spk_candidate_count].sample_freq = 48000;
+        spk_candidates[spk_candidate_count].flags = FLAG_STREAM_SUSPEND_AFTER_START;
+        spk_candidate_count++;
+    };
+    add_spk_candidate(24);
+    if (s_profile == UAC_PROFILE_FTX1) {
+        add_spk_candidate(16);
+    }
+
+    esp_err_t serr = ESP_ERR_NOT_FOUND;
+    int won = -1;
+    for (int i = 0; i < spk_candidate_count; ++i) {
+        ESP_LOGI(TAG, "Starting spk stream (profile=%s) candidate %d/%d: %dHz, %d-bit, %dch",
+                 profile_name(s_profile), i + 1, spk_candidate_count,
+                 spk_candidates[i].sample_freq, spk_candidates[i].bit_resolution,
+                 spk_candidates[i].channels);
+        serr = uac_host_device_start(s_spk_handle, &spk_candidates[i]);
+        if (serr == ESP_OK) {
+            won = i;
+            break;
+        }
+        ESP_LOGW(TAG, "spk stream candidate failed: %s", esp_err_to_name(serr));
+    }
+
+    if (won < 0) {
+        ESP_LOGE(TAG, "spk pre-start failed: %s", esp_err_to_name(serr));
+        uac_host_device_close(s_spk_handle);
+        s_spk_handle = NULL;
+        return false;
+    }
+
+    s_spk_bit_resolution = spk_candidates[won].bit_resolution;
+    ESP_LOGI(TAG, "Selected stream format: %dHz, %d-bit, %dch",
+             spk_candidates[won].sample_freq, s_spk_bit_resolution,
+             spk_candidates[won].channels);
+    ESP_LOGI(TAG, "Speaker opened+claimed (handle=%p, ringbuf=%u B, suspended)",
+             s_spk_handle, (unsigned)SPK_BUFFER_SIZE);
+
+    // Allocate the pump buffer + permanent writer task on first use only.
+    // Per-TX cost after that is just flipping s_spk_writer_run -- no allocs.
+    if (!s_spk_pump_buf) {
+        s_spk_pump_buf = (uint8_t*)heap_caps_malloc(SPK_PUMP_BYTES, MALLOC_CAP_DEFAULT);
+        if (!s_spk_pump_buf) {
+            ESP_LOGE(TAG, "spk pump buf alloc failed");
+        }
+    }
+    if (s_spk_pump_buf && !s_spk_writer_task) {
+        s_spk_writer_stop = false;
+        s_spk_writer_run = false;
+        BaseType_t ok = xTaskCreatePinnedToCore(
+            spk_writer_task, "uac_tx_writer",
+            3072, NULL, 5, &s_spk_writer_task, 1);
+        if (ok != pdPASS) {
+            ESP_LOGE(TAG, "spk writer task create failed");
+            s_spk_writer_task = NULL;
+        } else {
+            ESP_LOGI(TAG, "Speaker writer task ready (idle)");
+        }
+    }
+    return true;
+}
+
+// Closes the speaker's UAC stream and releases its HCD channel. The
+// permanent writer task and pump buffer are left allocated (reused on the
+// next spk_open_and_claim()); this only requires the writer to be idle
+// (s_spk_writer_run == false), which uac_tx_end() already guarantees before
+// TX completion is visible to check_slot_boundary(). Used by
+// uac_ftx1_prepare_rx() after a TX slot ends.
+static void spk_close(void) {
+    if (!s_spk_handle) return;
+    if (s_spk_writer_run) {
+        ESP_LOGW(TAG, "spk_close: writer still active, deferring close");
+        return;
+    }
+    uac_host_device_stop(s_spk_handle);
+    uac_host_device_close(s_spk_handle);
+    s_spk_handle = NULL;
+}
+
 // USB host library task
 static void usb_lib_task(void* arg) {
     usb_host_config_t host_config = {};
@@ -587,9 +904,16 @@ static void uac_lib_task(void* arg) {
                         continue;
                     }
 
+                    // Remembered so the FTX-1 half-duplex swap can reopen
+                    // the mic later without a second RX_CONNECTED event
+                    // (the driver only fires this once, at enumeration).
+                    s_mic_addr = evt.driver.addr;
+                    s_mic_iface = evt.driver.iface_num;
+                    s_mic_known = true;
+
                     uac_host_device_config_t dev_config = {
-                        .addr = evt.driver.addr,
-                        .iface_num = evt.driver.iface_num,
+                        .addr = s_mic_addr,
+                        .iface_num = s_mic_iface,
                         .buffer_size = UAC_BUFFER_SIZE,
                         .buffer_threshold = UAC_BUFFER_THRESHOLD,
                         .callback = uac_device_callback,
@@ -616,68 +940,7 @@ static void uac_lib_task(void* arg) {
                         cp210x_try_open();
                     }
 
-                    // Start stream format negotiation.
-                    // QMX profile keeps the existing strict format.
-                    // Generic profile stays 48 kHz and tries mic-only
-                    // mono/stereo 24-bit and 16-bit candidates.
-                    // FTX-1 profile also scans mic-only candidates (D-02),
-                    // QMX-parity-shaped formats first, since its USB Audio
-                    // descriptor is unconfirmed from documentation alone.
-                    uac_host_stream_config_t candidates[4];
-                    int candidate_count = 0;
-                    auto add_candidate = [&](uint8_t ch, uint8_t bits) {
-                        candidates[candidate_count].channels = ch;
-                        candidates[candidate_count].bit_resolution = bits;
-                        candidates[candidate_count].sample_freq = UAC_SAMPLE_RATE;
-                        candidates[candidate_count].flags = 0;
-                        candidate_count++;
-                    };
-                    if (s_profile == UAC_PROFILE_GENERIC_USB) {
-                        add_candidate(1, 24);
-                        add_candidate(1, 16);
-                        add_candidate(2, 24);
-                        add_candidate(2, 16);
-                    } else if (s_profile == UAC_PROFILE_FTX1) {
-                        // D-02 try-order: QMX-parity-shaped formats first,
-                        // degrade toward GENERIC_USB's mono/16-bit fallback
-                        // only if richer formats aren't advertised.
-                        add_candidate(2, 24);
-                        add_candidate(2, 16);
-                        add_candidate(1, 24);
-                        add_candidate(1, 16);
-                    } else {
-                        add_candidate(UAC_CHANNELS, UAC_BIT_RESOLUTION);
-                    }
-
-                    bool started = false;
-                    for (int i = 0; i < candidate_count; ++i) {
-                        const uac_host_stream_config_t* cfg = &candidates[i];
-                        ESP_LOGI(TAG, "Starting stream (profile=%s) candidate %d/%d: %dHz, %d-bit, %dch",
-                                 profile_name(s_profile), i + 1, candidate_count,
-                                 cfg->sample_freq, cfg->bit_resolution, cfg->channels);
-                        err = uac_host_device_start(handle, cfg);
-                        if (err == ESP_OK) {
-                            s_format.sample_freq = cfg->sample_freq;
-                            s_format.bit_resolution = cfg->bit_resolution;
-                            s_format.channels = cfg->channels;
-                            started = true;
-                            ESP_LOGI(TAG, "Selected stream format: %dHz, %d-bit, %dch",
-                                     s_format.sample_freq, s_format.bit_resolution, s_format.channels);
-                            break;
-                        }
-                        ESP_LOGW(TAG, "Stream candidate failed: %s", esp_err_to_name(err));
-                    }
-
-                    if (!started) {
-                        if (s_profile == UAC_PROFILE_GENERIC_USB || s_profile == UAC_PROFILE_FTX1) {
-                            ESP_LOGE(TAG, "No 48k UAC mic format for profile=%s",
-                                     profile_name(s_profile));
-                            snprintf(s_status_string, sizeof(s_status_string), "No 48k UAC mic format");
-                        } else {
-                            ESP_LOGE(TAG, "Failed to start stream for profile=%s",
-                                     profile_name(s_profile));
-                            snprintf(s_status_string, sizeof(s_status_string), "Format not supported");
-                        }
+                    if (!mic_negotiate_and_start(handle)) {
                         uac_host_device_close(handle);
                         continue;
                     }
@@ -697,46 +960,7 @@ static void uac_lib_task(void* arg) {
                         cdc_try_open();
                     }
 
-                    // Start the audio processing task.
-                    //
-                    // FT4's decoder needs a larger stack than FT8. Keep the
-                    // FT8 stack static and allocate the FT4 stack on demand.
-                    if (s_stream_task_handle == NULL) {
-#if ENABLE_FT4
-                        if (g_protocol == &kProtocolFT4) {
-                            BaseType_t cr = xTaskCreatePinnedToCore(
-                                stream_uac_task, "stream_uac",
-                                16384, NULL,
-                                UAC_STREAM_TASK_PRIORITY,
-                                &s_stream_task_handle, 1);
-                            if (cr != pdPASS) {
-                                ESP_LOGE(TAG, "stream_uac_task create FAILED (dynamic FT4) free=%u",
-                                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
-                                s_stream_task_handle = NULL;
-                            }
-                        } else {
-#endif
-                        // FT8 uses the existing static 8 KB stack.
-                        static StackType_t  s_stream_task_stack[8192 / sizeof(StackType_t)];
-                        static StaticTask_t s_stream_task_tcb;
-                        size_t free_before = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
-                        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
-                        ESP_LOGI(TAG, "Pre-task-create heap: free=%u largest=%u",
-                                 (unsigned)free_before, (unsigned)largest);
-                        s_stream_task_handle = xTaskCreateStaticPinnedToCore(
-                            stream_uac_task, "stream_uac",
-                            8192 / sizeof(StackType_t), NULL,
-                            UAC_STREAM_TASK_PRIORITY,
-                            s_stream_task_stack, &s_stream_task_tcb, 1);
-                        if (!s_stream_task_handle) {
-                            ESP_LOGE(TAG, "stream_uac_task create FAILED "
-                                     "(static FT8) free=%u largest=%u",
-                                     (unsigned)free_before, (unsigned)largest);
-                        }
-#if ENABLE_FT4
-                        }
-#endif
-                    }
+                    mic_ensure_stream_task();
 
                 } else if (evt.driver.event == UAC_HOST_DRIVER_EVENT_TX_CONNECTED) {
                     if (s_profile != UAC_PROFILE_QMX && s_profile != UAC_PROFILE_FTX1) {
@@ -752,108 +976,21 @@ static void uac_lib_task(void* arg) {
                     s_spk_known = true;
                     ESP_LOGI(TAG, "Speaker captured: addr=%u iface=%u",
                              (unsigned)s_spk_addr, (unsigned)s_spk_iface);
-                    // Open and claim the speaker while enumeration-time heap
-                    // is contiguous, then hold it across all TX cycles.
-                    if (!s_spk_handle) {
-                        uac_host_device_config_t cfg = {};
-                        cfg.addr = s_spk_addr;
-                        cfg.iface_num = s_spk_iface;
-                        cfg.buffer_size = SPK_BUFFER_SIZE;
-                        cfg.buffer_threshold = SPK_BUFFER_THRESHOLD;
-                        cfg.callback = spk_event_cb;
-                        cfg.callback_arg = nullptr;
-                        esp_err_t oerr = uac_host_device_open(&cfg, &s_spk_handle);
-                        if (oerr != ESP_OK) {
-                            ESP_LOGE(TAG, "spk pre-open failed at enum: %s",
-                                     esp_err_to_name(oerr));
-                            s_spk_handle = NULL;
-                        } else {
-                            // Claim iface + alloc xfer URBs + EP slot now,
-                            // but pass FLAG_STREAM_SUSPEND_AFTER_START so
-                            // no URBs are queued on the bus yet. The
-                            // 512-byte aligned xfer_desc_list (2x 512B
-                            // for ISOC double-buffering) requires fresh
-                            // heap to satisfy alignment — at TX time the
-                            // largest contiguous block is <2 KB and
-                            // aligned alloc fails. Resume happens at TX
-                            // via uac_host_device_resume (cheap, no
-                            // realloc). Suspend at TX-end stops URB flow
-                            // but keeps everything allocated.
-                            //
-                            // Candidate scan mirrors the mic's D-02 pattern:
-                            // QMX's speaker is confirmed 24-bit-capable and
-                            // keeps its single fixed candidate unchanged.
-                            // FTX-1's codec (confirmed 16-bit-only on the
-                            // mic side, symmetric per typical single-chip
-                            // codec design) falls back to 2ch/16-bit when
-                            // 2ch/24-bit is rejected.
-                            uac_host_stream_config_t spk_candidates[2];
-                            int spk_candidate_count = 0;
-                            auto add_spk_candidate = [&](uint8_t bits) {
-                                spk_candidates[spk_candidate_count].channels = 2;
-                                spk_candidates[spk_candidate_count].bit_resolution = bits;
-                                spk_candidates[spk_candidate_count].sample_freq = 48000;
-                                spk_candidates[spk_candidate_count].flags = FLAG_STREAM_SUSPEND_AFTER_START;
-                                spk_candidate_count++;
-                            };
-                            add_spk_candidate(24);
-                            if (s_profile == UAC_PROFILE_FTX1) {
-                                add_spk_candidate(16);
-                            }
 
-                            esp_err_t serr = ESP_ERR_NOT_FOUND;
-                            int won = -1;
-                            for (int i = 0; i < spk_candidate_count; ++i) {
-                                ESP_LOGI(TAG, "Starting spk stream (profile=%s) candidate %d/%d: %dHz, %d-bit, %dch",
-                                         profile_name(s_profile), i + 1, spk_candidate_count,
-                                         spk_candidates[i].sample_freq, spk_candidates[i].bit_resolution,
-                                         spk_candidates[i].channels);
-                                serr = uac_host_device_start(s_spk_handle, &spk_candidates[i]);
-                                if (serr == ESP_OK) {
-                                    won = i;
-                                    break;
-                                }
-                                ESP_LOGW(TAG, "spk stream candidate failed: %s", esp_err_to_name(serr));
-                            }
-
-                            if (won < 0) {
-                                ESP_LOGE(TAG, "spk pre-start failed at enum: %s",
-                                         esp_err_to_name(serr));
-                                uac_host_device_close(s_spk_handle);
-                                s_spk_handle = NULL;
-                            } else {
-                                s_spk_bit_resolution = spk_candidates[won].bit_resolution;
-                                ESP_LOGI(TAG, "Selected stream format: %dHz, %d-bit, %dch",
-                                         spk_candidates[won].sample_freq, s_spk_bit_resolution,
-                                         spk_candidates[won].channels);
-                                ESP_LOGI(TAG, "Speaker pre-opened+claimed (handle=%p, ringbuf=%u B, suspended)",
-                                         s_spk_handle, (unsigned)SPK_BUFFER_SIZE);
-                                // Allocate the pump buffer + permanent
-                                // writer task NOW too, while heap is
-                                // healthy. Per-TX cost is just flipping
-                                // s_spk_writer_run — no allocs.
-                                if (!s_spk_pump_buf) {
-                                    s_spk_pump_buf = (uint8_t*)heap_caps_malloc(
-                                        SPK_PUMP_BYTES, MALLOC_CAP_DEFAULT);
-                                    if (!s_spk_pump_buf) {
-                                        ESP_LOGE(TAG, "spk pump buf alloc failed at enum");
-                                    }
-                                }
-                                if (s_spk_pump_buf && !s_spk_writer_task) {
-                                    s_spk_writer_stop = false;
-                                    s_spk_writer_run = false;
-                                    BaseType_t ok = xTaskCreatePinnedToCore(
-                                        spk_writer_task, "uac_tx_writer",
-                                        3072, NULL, 5, &s_spk_writer_task, 1);
-                                    if (ok != pdPASS) {
-                                        ESP_LOGE(TAG, "spk writer task create failed at enum");
-                                        s_spk_writer_task = NULL;
-                                    } else {
-                                        ESP_LOGI(TAG, "Speaker writer task ready (idle)");
-                                    }
-                                }
-                            }
-                        }
+                    if (s_profile == UAC_PROFILE_FTX1) {
+                        // FTX-1 half-duplex redesign: mic+speaker can never
+                        // both hold a streaming pipe at once on this hardware
+                        // (measured hard 8-channel HCD ceiling — see
+                        // .planning/debug/ftx1-hcd-channel-exhaustion.md).
+                        // The mic already holds the channel from
+                        // RX_CONNECTED; defer opening the speaker until
+                        // uac_ftx1_prepare_tx() claims it ahead of a TX slot.
+                        ESP_LOGI(TAG, "Speaker open deferred (FTX-1 half-duplex, mic holds channel)");
+                    } else if (!s_spk_handle) {
+                        // QMX/QDX have channel headroom: open and claim the
+                        // speaker while enumeration-time heap is contiguous,
+                        // then hold it across all TX cycles.
+                        spk_open_and_claim();
                     }
                 }
             }
@@ -1013,6 +1150,8 @@ bool uac_start_with_profile(uac_stream_profile_t profile) {
     s_format.bit_resolution = UAC_BIT_RESOLUTION;
     s_format.channels = UAC_CHANNELS;
     s_spk_bit_resolution = 24;
+    s_mic_known = false;
+    s_ftx1_direction = FTX1_DIR_RX;
     ft8_audio_pipeline_clear_latest_waterfall_row();
 
     ESP_LOGI(TAG, "Starting UAC host profile=%s", profile_name(s_profile));
@@ -1227,6 +1366,29 @@ void uac_tx_end(void) {
 
     ESP_LOGI(TAG, "UAC OUT stopped packets=%u errors=%u",
              (unsigned)s_spk_packets_sent, (unsigned)s_spk_write_errors);
+}
+
+// FTX-1 half-duplex swap entry points. No-ops for every other profile
+// (QMX/QDX/KH1/generic-USB keep both pipes open permanently, unaffected).
+// See s_ftx1_direction declaration above for the full rationale.
+void uac_ftx1_prepare_tx(void) {
+    if (s_profile != UAC_PROFILE_FTX1) return;
+    if (s_ftx1_direction == FTX1_DIR_TX) return;
+
+    ESP_LOGI(TAG, "FTX-1 half-duplex swap: RX -> TX (closing mic, claiming speaker)");
+    mic_close();
+    spk_open_and_claim();
+    s_ftx1_direction = FTX1_DIR_TX;
+}
+
+void uac_ftx1_prepare_rx(void) {
+    if (s_profile != UAC_PROFILE_FTX1) return;
+    if (s_ftx1_direction == FTX1_DIR_RX) return;
+
+    ESP_LOGI(TAG, "FTX-1 half-duplex swap: TX -> RX (closing speaker, reopening mic)");
+    spk_close();
+    mic_open_and_start();
+    s_ftx1_direction = FTX1_DIR_RX;
 }
 
 const char* uac_get_status_string(void) {

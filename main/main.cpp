@@ -2553,6 +2553,12 @@ void arm_pending_tx(const AutoseqTxEntry& pending) {
   g_pending_tx         = pending;
   g_pending_tx.offset_hz = resolve_tx_offset(g_pending_tx);
   g_pending_tx_valid   = true;
+
+  // FTX-1 half-duplex swap: this is the earliest point every TX-scheduling
+  // path (autoseq tick, beacon CQ, free-text, manual RX tap) agrees a TX is
+  // coming, well before the slot boundary that will actually trigger it.
+  // No-op for every other radio profile.
+  uac_ftx1_prepare_tx();
 }
 
 static void check_slot_boundary() {
@@ -2574,6 +2580,10 @@ static void check_slot_boundary() {
              (long long)slot_idx, slot_parity);
     autoseq_tick(slot_idx, slot_parity, 0);
     g_was_txing = false;
+    // FTX-1 half-duplex swap: TX just ended, so this slot defaults to RX
+    // until a future decode re-arms a TX (see arm_pending_tx()). No-op for
+    // every other radio profile.
+    uac_ftx1_prepare_rx();
     core_fire_qso_changed();  // propagates to all registered consumers
   }
 
@@ -3424,6 +3434,10 @@ static void tx_tick() {
     g_pending_tx_valid = false;
     g_tx_cancel_requested = false;
     g_was_txing = false;  // TX was cancelled - don't call tick at slot boundary
+    // Cancelled TX bypasses check_slot_boundary()'s normal completion path
+    // above, so the FTX-1 half-duplex swap back to RX must happen here
+    // too. No-op for every other radio profile.
+    uac_ftx1_prepare_rx();
     core_fire_qso_changed();  // propagates to all registered consumers
     return;
   }
