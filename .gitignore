@@ -48,3 +48,6 @@ Testing/
 # Scratch diff/patch files
 *.diff
 *.patch
+
+# Claude Code session lock (transient, machine-local)
+.claude/scheduled_tasks.lock
