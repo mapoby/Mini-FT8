@@ -2559,6 +2559,13 @@ void arm_pending_tx(const AutoseqTxEntry& pending) {
   // coming, well before the slot boundary that will actually trigger it.
   // No-op for every other radio profile.
   uac_ftx1_prepare_tx();
+
+  // Mark decode as applied for current slot so check_slot_boundary() will
+  // allow TX to fire even when no actual decode occurred (e.g. beacon CQ).
+  // Critical for FTX-1 half-duplex: once uac_ftx1_prepare_tx() closes the mic,
+  // no further decodes can happen, so without this g_decode_applied_slot_idx
+  // would never advance and TX would never trigger.
+  g_decode_applied_slot_idx = rtc_now_ms() / g_protocol->slot_time_ms;
 }
 
 static void check_slot_boundary() {
