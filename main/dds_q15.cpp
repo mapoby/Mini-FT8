@@ -134,6 +134,22 @@ static inline void emit_silence(uint8_t*& out, unsigned frames) {
     }
 }
 
+static inline void emit_stereo_frame_16(uint8_t* out, int16_t sample_q15) {
+    uint8_t b0 = static_cast<uint8_t>(sample_q15 & 0xFF);
+    uint8_t b1 = static_cast<uint8_t>((sample_q15 >> 8) & 0xFF);
+    out[0] = b0;
+    out[1] = b1;
+    out[2] = b0;
+    out[3] = b1;
+}
+
+static inline void emit_silence_16(uint8_t*& out, unsigned frames) {
+    while (frames-- > 0) {
+        out[0] = out[1] = out[2] = out[3] = 0;
+        out += 4;
+    }
+}
+
 void dds_render_24bit_stereo(uint8_t* out, unsigned frames) {
     uint64_t phase = s_phase;
 
@@ -177,6 +193,54 @@ void dds_render_24bit_stereo(uint8_t* out, unsigned frames) {
     for (unsigned n = 0; n < frames; ++n) {
         emit_stereo_frame(out, sin_q15_from_phase(phase));
         out += 6;
+        phase += increment;
+    }
+    s_phase = phase;
+}
+
+void dds_render_16bit_stereo(uint8_t* out, unsigned frames) {
+    uint64_t phase = s_phase;
+
+    if (s_cpfsk_active.load(std::memory_order_acquire)) {
+        const uint32_t samples_per_symbol = s_cpfsk_samples_per_symbol;
+        const uint64_t total_samples =
+            static_cast<uint64_t>(s_cpfsk_symbol_count) * samples_per_symbol;
+        uint32_t counter = s_cpfsk_sample_counter;
+
+        while (frames > 0) {
+            if (counter >= total_samples) {
+                emit_silence_16(out, frames);
+                frames = 0;
+                break;
+            }
+
+            size_t symbol_index = counter / samples_per_symbol;
+            uint32_t position_in_symbol =
+                counter - static_cast<uint32_t>(symbol_index) * samples_per_symbol;
+            uint32_t samples_left = samples_per_symbol - position_in_symbol;
+            unsigned render_count =
+                (frames < samples_left) ? frames : samples_left;
+            uint64_t increment = s_cpfsk_incs[symbol_index];
+            s_inc.store(increment, std::memory_order_relaxed);
+
+            for (unsigned i = 0; i < render_count; ++i) {
+                emit_stereo_frame_16(out, sin_q15_from_phase(phase));
+                out += 4;
+                phase += increment;
+            }
+            counter += render_count;
+            frames -= render_count;
+        }
+
+        s_cpfsk_sample_counter = counter;
+        s_phase = phase;
+        return;
+    }
+
+    uint64_t increment = s_inc.load(std::memory_order_relaxed);
+    for (unsigned n = 0; n < frames; ++n) {
+        emit_stereo_frame_16(out, sin_q15_from_phase(phase));
+        out += 4;
         phase += increment;
     }
     s_phase = phase;

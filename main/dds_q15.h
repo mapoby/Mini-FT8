@@ -25,6 +25,11 @@ void dds_cpfsk_end(void);
 // Render packed 24-bit stereo PCM (six bytes per frame).
 void dds_render_24bit_stereo(uint8_t* out, unsigned frames);
 
+// Render packed 16-bit stereo PCM (four bytes per frame). Same CPFSK
+// symbol-timing state as dds_render_24bit_stereo(); only the per-sample
+// byte packing differs (native int16_t, no upshift).
+void dds_render_16bit_stereo(uint8_t* out, unsigned frames);
+
 #ifdef __cplusplus
 }
 #endif

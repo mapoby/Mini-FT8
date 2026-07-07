@@ -100,6 +100,7 @@ static volatile bool s_spk_writer_run = false;   // per-TX gate
 static uint8_t* s_spk_pump_buf = nullptr;
 static uint32_t s_spk_packets_sent = 0;
 static uint32_t s_spk_write_errors = 0;
+static uint8_t s_spk_bit_resolution = 24;  // set at TX_CONNECTED to the negotiated format
 static TaskHandle_t s_stream_task_handle = NULL;
 static volatile bool s_stop_requested = false;
 static char s_status_string[64] = "Idle";
@@ -745,18 +746,53 @@ static void uac_lib_task(void* arg) {
                             // via uac_host_device_resume (cheap, no
                             // realloc). Suspend at TX-end stops URB flow
                             // but keeps everything allocated.
-                            uac_host_stream_config_t scfg = {};
-                            scfg.channels = 2;
-                            scfg.bit_resolution = 24;
-                            scfg.sample_freq = 48000;
-                            scfg.flags = FLAG_STREAM_SUSPEND_AFTER_START;
-                            esp_err_t serr = uac_host_device_start(s_spk_handle, &scfg);
-                            if (serr != ESP_OK) {
+                            //
+                            // Candidate scan mirrors the mic's D-02 pattern:
+                            // QMX's speaker is confirmed 24-bit-capable and
+                            // keeps its single fixed candidate unchanged.
+                            // FTX-1's codec (confirmed 16-bit-only on the
+                            // mic side, symmetric per typical single-chip
+                            // codec design) falls back to 2ch/16-bit when
+                            // 2ch/24-bit is rejected.
+                            uac_host_stream_config_t spk_candidates[2];
+                            int spk_candidate_count = 0;
+                            auto add_spk_candidate = [&](uint8_t bits) {
+                                spk_candidates[spk_candidate_count].channels = 2;
+                                spk_candidates[spk_candidate_count].bit_resolution = bits;
+                                spk_candidates[spk_candidate_count].sample_freq = 48000;
+                                spk_candidates[spk_candidate_count].flags = FLAG_STREAM_SUSPEND_AFTER_START;
+                                spk_candidate_count++;
+                            };
+                            add_spk_candidate(24);
+                            if (s_profile == UAC_PROFILE_FTX1) {
+                                add_spk_candidate(16);
+                            }
+
+                            esp_err_t serr = ESP_ERR_NOT_FOUND;
+                            int won = -1;
+                            for (int i = 0; i < spk_candidate_count; ++i) {
+                                ESP_LOGI(TAG, "Starting spk stream (profile=%s) candidate %d/%d: %dHz, %d-bit, %dch",
+                                         profile_name(s_profile), i + 1, spk_candidate_count,
+                                         spk_candidates[i].sample_freq, spk_candidates[i].bit_resolution,
+                                         spk_candidates[i].channels);
+                                serr = uac_host_device_start(s_spk_handle, &spk_candidates[i]);
+                                if (serr == ESP_OK) {
+                                    won = i;
+                                    break;
+                                }
+                                ESP_LOGW(TAG, "spk stream candidate failed: %s", esp_err_to_name(serr));
+                            }
+
+                            if (won < 0) {
                                 ESP_LOGE(TAG, "spk pre-start failed at enum: %s",
                                          esp_err_to_name(serr));
                                 uac_host_device_close(s_spk_handle);
                                 s_spk_handle = NULL;
                             } else {
+                                s_spk_bit_resolution = spk_candidates[won].bit_resolution;
+                                ESP_LOGI(TAG, "Selected stream format: %dHz, %d-bit, %dch",
+                                         spk_candidates[won].sample_freq, s_spk_bit_resolution,
+                                         spk_candidates[won].channels);
                                 ESP_LOGI(TAG, "Speaker pre-opened+claimed (handle=%p, ringbuf=%u B, suspended)",
                                          s_spk_handle, (unsigned)SPK_BUFFER_SIZE);
                                 // Allocate the pump buffer + permanent
@@ -943,6 +979,7 @@ bool uac_start_with_profile(uac_stream_profile_t profile) {
     s_format.sample_freq = UAC_SAMPLE_RATE;
     s_format.bit_resolution = UAC_BIT_RESOLUTION;
     s_format.channels = UAC_CHANNELS;
+    s_spk_bit_resolution = 24;
     ft8_audio_pipeline_clear_latest_waterfall_row();
 
     ESP_LOGI(TAG, "Starting UAC host profile=%s", profile_name(s_profile));
@@ -1051,8 +1088,15 @@ static void spk_writer_task(void* /*arg*/) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
-        dds_render_24bit_stereo(s_spk_pump_buf, frames_per_block);
-        esp_err_t err = uac_host_device_write(s_spk_handle, s_spk_pump_buf, SPK_PUMP_BYTES,
+        uint32_t write_bytes;
+        if (s_spk_bit_resolution == 16) {
+            dds_render_16bit_stereo(s_spk_pump_buf, frames_per_block);
+            write_bytes = frames_per_block * 4;  // 2ch * 2 bytes/sample
+        } else {
+            dds_render_24bit_stereo(s_spk_pump_buf, frames_per_block);
+            write_bytes = SPK_PUMP_BYTES;  // 2ch * 3 bytes/sample
+        }
+        esp_err_t err = uac_host_device_write(s_spk_handle, s_spk_pump_buf, write_bytes,
                                               pdMS_TO_TICKS(SPK_WRITE_TIMEOUT_MS));
         if (err == ESP_OK) {
             s_spk_packets_sent += SPK_PUMP_PACKETS;
