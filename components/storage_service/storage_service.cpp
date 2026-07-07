@@ -1028,6 +1028,15 @@ bool storage_sync_station_from_sd() {
     }
     s_station_sync_attempted = true;
 
+    if (storage_file_exists(kStationFile)) {
+        // Internal Station.txt already exists (normal boot with prior settings) — importing
+        // the SD copy here would silently clobber in-app changes with a stale backup. This
+        // import path exists only to bootstrap Station.txt onto a freshly-partitioned/erased
+        // internal filesystem from an SD-provided copy (see adc548d).
+        ESP_LOGI(TAG, "Internal Station.txt already present; skipping SD import");
+        return true;
+    }
+
     if (mount_sd_locked() != ESP_OK) {
         ESP_LOGI(TAG, "SD not mounted; using internal Station.txt");
         return false;
