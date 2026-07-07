@@ -2316,6 +2316,22 @@ bool rtc_apply_manual_time_from_strings() {
   return true;
 }
 
+// Fine-tune the already-committed clock by +/-1s against a live reference
+// without retyping the full HH:MM:SS string. Retyping re-absorbs several
+// seconds of human read/type latency on every correction attempt; nudging
+// lets the user converge on an external reference a second at a time.
+static void rtc_nudge_seconds(int delta) {
+  if (!rtc_valid) return;
+  time_t epoch = rtc_current_epoch_seconds() + delta;
+  rtc_seed_epoch(epoch, esp_timer_get_time() / 1000, RtcTimeSource::MANUAL);
+  g_time_synced_from_gps = false;
+  rtc_sync_to_esp_rtc();
+  if (rtc_write_external_from_soft("manual nudge") == ESP_OK) {
+    g_rtc_time_source = RtcTimeSource::DS3231;
+  }
+  save_station_data();
+}
+
 static bool rtc_init_from_ds3231() {
   esp_err_t err = external_rtc_init();
   if (err != ESP_OK) {
@@ -5122,6 +5138,12 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
               }
               else if (c == '6') {
                 status_edit_idx = 5; status_edit_buffer = g_time; status_cursor_pos = 0; while (status_cursor_pos < (int)status_edit_buffer.size() && (status_edit_buffer[status_cursor_pos] == ':')) status_cursor_pos++; draw_status_view();
+              }
+              else if (c == '7') {
+                rtc_nudge_seconds(-1); draw_status_view();
+              }
+              else if (c == '8') {
+                rtc_nudge_seconds(+1); draw_status_view();
               }
             } else {
               if (status_edit_idx == 1) {
