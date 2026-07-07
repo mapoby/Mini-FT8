@@ -405,11 +405,44 @@ static void uac_driver_callback(uint8_t addr, uint8_t iface_num,
     xQueueSend(s_event_queue, &evt, 0);
 }
 
+// FTX-1's internal USB hub exposes an undocumented Yaesu auxiliary device
+// (VID:0x26aa PID:0x0030, Yaesu Musen Co.) alongside the CP210x CAT-1 and
+// audio codec interfaces. This device is not used by any Mini-FT8 feature.
+// Its default control pipe consumes 1 of the ESP32-S3's fixed 8 HCD channels,
+// which is exactly the deficit that prevents mic+speaker from both being
+// active simultaneously (see .planning/debug/resolved/ftx1-hcd-channel-exhaustion.md).
+// Rejecting this specific VID/PID during enumeration (returning false here)
+// causes the ESP-IDF USB Host stack to free its control-pipe channel and
+// disable its hub port automatically (enum.c enum_cancel() -> usbh_dev_close();
+// usb_host.c ENUM_EVENT_CANCELED -> hub_port_disable()). This VID/PID pair is
+// unique to the FTX-1's internal hub and cannot match QMX/QDX/KH1 or any
+// generic USB device, so this filter is a no-op passthrough for every other
+// device on the bus.
+#define FTX1_AUX_DEVICE_VID 0x26aa
+#define FTX1_AUX_DEVICE_PID 0x0030
+
+static bool ftx1_enum_filter_cb(const usb_device_desc_t* dev_desc, uint8_t* bConfigurationValue) {
+    if (dev_desc->idVendor == FTX1_AUX_DEVICE_VID && dev_desc->idProduct == FTX1_AUX_DEVICE_PID) {
+        ESP_LOGI(TAG, "Rejecting enumeration of FTX-1 aux device VID:0x%04x PID:0x%04x "
+                 "(frees 1 HCD channel for mic+speaker)", dev_desc->idVendor, dev_desc->idProduct);
+        return false;
+    }
+    *bConfigurationValue = 1;
+    return true;
+}
+
 // USB host library task
 static void usb_lib_task(void* arg) {
     usb_host_config_t host_config = {};
     host_config.skip_phy_setup = false;
     host_config.intr_flags = ESP_INTR_FLAG_LEVEL1;
+
+    if (s_profile == UAC_PROFILE_FTX1) {
+        // Scoped strictly to the FTX-1 profile: QMX/QDX/KH1/generic-USB
+        // sessions never install this callback, so they are unaffected even
+        // though the VID/PID check alone is already device-specific.
+        host_config.enum_filter_cb = ftx1_enum_filter_cb;
+    }
 
     if (s_profile == UAC_PROFILE_QMX || s_profile == UAC_PROFILE_FTX1) {
         // Custom FIFO partitioning enables simultaneous bidirectional ISO
