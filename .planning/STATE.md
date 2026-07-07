@@ -3,9 +3,9 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 4 complete (04-02 hardware checkpoint passed)
-last_updated: "2026-07-06T22:00:00.000Z"
-last_activity: 2026-07-06
+stopped_at: Phase 5 in progress (05-01 QSO checkpoint) - blocked on HCD channel ceiling
+last_updated: "2026-07-07T11:30:00.000Z"
+last_activity: 2026-07-07
 progress:
   total_phases: 5
   completed_phases: 4
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-07-04)
 
 ## Current Position
 
-Phase: 4 complete. Phase 5 not started.
-Plan: 04-01 and 04-02 both complete
-Status: Phase 04 complete
-Last activity: 2026-07-06
+Phase: 5 in progress. Plans 01-01 through 04-02 complete. 05-01 (FT8 QSO checkpoint) in progress,
+blocked on a hard hardware finding (see Blockers/Concerns) before a full QSO can be demonstrated.
+Status: Executing Phase 05
+Last activity: 2026-07-07
 
 Progress: [████████░░] 80%
 
@@ -77,6 +77,11 @@ Recent decisions affecting current work:
 - 04-01: AUDIO-01/02/03 code implementation complete; validated on real hardware in 04-02 and now marked Complete in REQUIREMENTS.md
 - 04-02: Physical hardware checkpoint passed — 25 consecutive error-free RX decode cycles (~6.8min) confirmed mic negotiation/waterfall continuity and FIFO stability under combined CAT+audio load; TX tone quality confirmed clean by user in prior testing. FIFO split unchanged (91/18/91, sum=200), no retune needed.
 - 04-02 (hardware-topology finding): the Cardputer ADV's PC-facing USB-Serial/JTAG console and its USB-OTG host peripheral share the ESP32-S3's single USB D+/D- pin pair — the PC debug link (COM12) drops entirely whenever a USB host device (the FTX-1) is attached. A separate, independently-wired debug UART (CH340, COM5 in this session) must be used for any live logging while a USB host device is connected. This applies to any future hardware session on this board, not just Phase 4.
+- 04-02 (correction, discovered 2026-07-07): the "TX tone confirmed clean by user in prior testing" claim in 04-02-SUMMARY.md is now doubtful. The 05-01 checkpoint discovered the speaker (UAC-OUT) interface had *never* successfully opened on this hardware (`spk pre-start failed at enum: ESP_ERR_NOT_FOUND` on every single boot, root-caused and fixed 2026-07-07 — see below). The Phase 4 TX-tone confirmation almost certainly reflected a PTT/keying check (radio visibly transmitting) rather than actual verified audio content, since no audio could have reached the radio before today's fix.
+- 05-01 (2026-07-07, fixed): RTC entry-latency bug — manual UTC time entry via the on-screen editor had no compensation for human read/type latency, pushing FT8 decode timing outside its ~2.5s sync tolerance (observed offsets -1.3 to -1.6s pre-fix, decode rate ~36%). Added `rtc_nudge_seconds()` + `7`/`8` keys in STATUS view to fine-tune the clock ±1s against a live reference without retyping the full string. Confirmed on hardware: offsets collapsed to ~0.00s, decode rate recovered to near-100% (7/5/7 unique messages per cycle). Commit `9f34ae2`. Debug session: `.planning/debug/resolved/ft8-slot-boundary-rtc-timing.md`.
+- 05-01 (2026-07-07, fixed): SD card Station.txt overwrite bug — `storage_sync_station_from_sd()` unconditionally overwrote internal Station.txt with the SD card's (possibly stale) copy on every boot, silently discarding any settings saved via `save_station_data()` (radio selection reverting to QMX after every power cycle). Gated the SD import to only fire when internal Station.txt doesn't already exist (preserves the original bootstrap/restore intent, commit `adc548d`). Confirmed on hardware: FTX-1 selection now persists across power cycles with an SD card inserted. Commit `bdd0f66`. Debug session: `.planning/debug/resolved/sd-station-txt-overwrite.md`.
+- 05-01 (2026-07-07, fixed): FTX-1 speaker 24-bit rejection — the FTX-1's USB audio codec (C-Media-style chip, VID:0x0d8c PID:0x0016) only supports 16-bit sample resolution; the speaker (TX) path only ever requested a fixed 2ch/24-bit/48000Hz format with no fallback, so it always failed enumeration and no TX audio ever reached the radio (this was Phase 4's D-05 scenario, now hardware-confirmed). Added `dds_render_16bit_stereo()` and a speaker candidate-scan (24-bit then 16-bit fallback for FTX-1; QMX unchanged) mirroring the mic's existing pattern. Confirmed on hardware across 2 boot cycles: "Speaker pre-opened+claimed" now succeeds. Commit `ffe422c`. Debug session: `.planning/debug/resolved/ftx1-speaker-24bit-rejected.md`.
+- 05-01 (2026-07-07, investigated, NOT fixed — see Blockers/Concerns): HCD channel exhaustion — fixing the speaker (above) revealed that mic+speaker cannot both be active simultaneously on this hardware topology, a hard ESP32-S3 hardware ceiling. Debug session: `.planning/debug/resolved/ftx1-hcd-channel-exhaustion.md`.
 
 ### Pending Todos
 
@@ -90,6 +95,7 @@ None yet.
 - `idf.py build` has not been run against 02-01 or 02-02's changes in any executor session (ESP-IDF toolchain not on PATH in Bash sessions despite being installed at `C:\Espressif\esp-idf-v5.5.1`) — orchestrator or a manually-sourced session should confirm a clean `-Werror` build, including that `espressif/usb_host_cp210x_vcp` fetches correctly, before/during 02-03's hardware checkpoint
 - `idf.py build` for 04-01's changes was confirmed clean (exit 0, no errors/warnings) during 04-02's hardware checkpoint, via a sourced ESP-IDF PowerShell session
 - The exact winning mic candidate (channels/bit-depth) was not captured verbatim in 04-02 — the negotiation event fires once at FTX-1 USB attach, before debug-UART monitoring began on an already-running session. Negotiation success is strongly confirmed indirectly (25 consecutive error-free decode cycles), but if the literal candidate index is needed later, monitor COM5 from before the FTX-1 is physically attached.
+- **MAJOR (2026-07-07): Mic (RX) and speaker (TX) cannot both be open simultaneously on the physical FTX-1 as currently wired.** The ESP32-S3's USB-OTG host controller has a hardware-fixed 8-channel ceiling (`GHWCFG2.NUMHSTCHNL`, read-only silicon register — not tunable via Kconfig or software). The FTX-1's actual USB topology (internal hub: 2 channels + CP2105 CAT-1: 3 channels + audio codec both directions: 3 channels + an unidentified Yaesu auxiliary device VID:0x26aa/PID:0x0030: 1 channel) requires 9 simultaneously-held channels once mic+speaker are both active — exceeding the ceiling by exactly 1. This was invisible before 2026-07-07's speaker fix, because the speaker never successfully claimed its channel prior to that (an accidental 8-channel fit). No safe software fix exists: VID/PID-based enumeration suppression of the auxiliary device is structurally impossible (its control pipe is allocated by ESP-IDF's `usbh.c` before VID/PID is ever readable during enumeration); port-based suppression would require hardcoding a fragile, unit-specific hub port mapping and was explicitly rejected as fragile. **This blocks any real FT8/FT4 QSO that requires simultaneous RX decode + TX capability — E2E-01/E2E-02 cannot be validated as "full QSO, both directions live" until this is addressed.** Recommended future direction (not attempted, real design work): close the mic's UAC pipe during each TX slot (FT8/FT4 is half-duplex within a single slot — you don't need to decode while transmitting) and reopen it immediately after, avoiding the need for 9 channels simultaneously. Real-time risk against the 15s/7.5s slot timing budget needs prototyping in a dedicated future session. Full channel-by-channel breakdown and research trail: `.planning/debug/resolved/ftx1-hcd-channel-exhaustion.md`.
 
 ## Deferred Items
 
