@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 5 in progress (05-01 QSO checkpoint) - blocked on HCD channel ceiling
-last_updated: "2026-07-07T11:30:00.000Z"
-last_activity: 2026-07-07
+stopped_at: Phase 5 in progress - 05-01 (FT8) hardware-verified complete with a real logged QSO; 05-02 (FT4) in progress, TX/RX/half-duplex confirmed working, full FT4 QSO completion not yet explicitly confirmed
+last_updated: "2026-07-09T00:00:00.000Z"
+last_activity: 2026-07-09
 progress:
   total_phases: 5
   completed_phases: 4
   total_plans: 8
   completed_plans: 8
-  percent: 80
+  percent: 85
 ---
 
 # Project State
@@ -28,12 +28,63 @@ See: .planning/PROJECT.md (updated 2026-07-04)
 Phase: 5 in progress. Plans 01-01 through 04-02 complete. 05-01 (FT8 QSO checkpoint) in progress.
 The HCD channel-exhaustion blocker is RESOLVED (2026-07-07, half-duplex mic/speaker swap implementation).
 TX trigger bug FIXED (2026-07-07, commit f138027) — added g_decode_applied_slot_idx update in arm_pending_tx()
-to allow TX to fire when mic is closed for half-duplex. Code ready for build/flash/test.
-Remaining for 05-01: build firmware, flash to Cardputer, hardware-verify TX actually fires on beacon CQ.
+to allow TX to fire when mic is closed for half-duplex.
+Beacon-enable + STATUS-exit hang FIXED (2026-07-08, not yet committed) — race between main task and
+audio/decode task in uac_ftx1_prepare_tx()/rx() (now mutex-guarded), unconditional STATUS-exit CAT
+resync fighting the half-duplex TX arm (now skipped when TX just armed), and a defensive fix for
+g_decode_applied_slot_idx freezing once the mic closes. Hardware-verified: two consecutive beacon CQ
+cycles transmitted cleanly (79 tones each), RX resumed automatically after each. Debug session:
+.planning/debug/resolved/ftx1-beacon-arm-status-hang.md.
+TX audio silent bug FIXED (2026-07-08, not yet committed) — main.cpp's tx_start() only routed TX
+through the sample-counted USB-audio path (uac_tx_begin_cpfsk) for RadioType::QDX; FTX-1 was never
+added to that condition and fell through to a per-symbol CAT tone path whose FTX-1 backend
+(ftx1_set_tone_hz) is a no-op stub. CAT PTT/keying worked, but zero audio ever reached the radio.
+Fixed by adding RadioType::FTX1 to the QDX condition. A secondary defense-in-depth fix also added
+(uac_tx_start_writer() now reads/logs FTX-1 speaker mute/volume and raises volume to 100 if below).
+Hardware-verified: "UAC OUT CPFSK start" now fires every cycle, thousands of packets/cycle with zero
+errors, user confirmed audio level visible on the FTX-1's own meter, AND external stations reported
+receiving the beacon via PSKReporter (full RF confirmation). Debug session:
+.planning/debug/resolved/ftx1-tx-audio-silent.md.
+E2E-01 (full FT8 QSO) HARDWARE-VERIFIED COMPLETE (2026-07-08): beacon CQ answered by DL6EL, full
+autoseq exchange (report -> RR73 -> mutual 73) completed and logged ("AUTOSEQ: Logged QSO: DL6EL
+grid=JN57 rst_sent=10 rst_rcvd=16"), confirmed by both sides (DL6EL's own "73" decoded back).
+A subsequent "5x full QSOs" user-run final regression test also completed with no errors reported.
+This is the first real, complete, externally-confirmed FT8 QSO over the FTX-1 this milestone.
+FT4 mode (E2E-02) IN PROGRESS (2026-07-08/09): switched via Menu key '6' (g_protocol_pending_ft4,
+takes effect on reboot). Confirmed on hardware: correct FT4 parameters in TX (spacing=20.8333Hz,
+count=105 symbols, 288-sample/7.5s-slot blocks), half-duplex mic/speaker swap completing well
+within FT4's tighter 7.5s window with no hangs, autoseq processing decodes and generating replies
+correctly (picked up YO4NF's reply to CQ, was replying to SV7BAY with a report when session paused).
+A full FT4 QSO completion (mutual RR73/73, ADIF log entry) was NOT yet explicitly observed/confirmed
+before the session ended for the day — this is the next thing to verify to close out Phase 5.
+Three new UI features added and hardware-confirmed working (user request, not spec'd in ROADMAP):
+(1) SNR display on RX list (small red/blue badge, blue if snr>0) and QSO log defaulting to the
+call/R-SNR/S-SNR view; (2) manual coarse clock sync — '0' key on STATUS snaps the RTC to the nearest
+FT8/FT4 slot boundary (rounds down, for human keypress latency); (3) QSO log combined view
+(DD/MM HH:MM CALL +RR -SS in one line, replacing the old two-view toggle). See
+.planning/quick/20260708-snr-display/, .planning/quick/20260708-manual-slot-sync/,
+.planning/quick/20260708-qso-log-combined-view/.
+MAJOR SIDE INCIDENT (2026-07-08/09, RESOLVED): internal FATFS storage partition became corrupted
+(lost/orphaned clusters — 0 bytes free but empty directory listing when inspected via MSC/USB-drive
+mode from a PC), most likely from an abrupt idf.py-flash hard-reset interrupting a filesystem write
+during one of the day's many flash cycles. Symptom: every setting (radio selection, callsign, grid,
+bands) reverted to default on every reboot, persistently. Fixed by reformatting the partition via
+Windows (Format-Volume, FAT) while the device was in MSC mode — no firmware/code change needed.
+Confirmed on hardware: Station.txt round-trips cleanly again, FTX-1 selection persists. Any local
+QSO logs (.adi/.txt) on that partition were already inaccessible in the corrupted state before the
+reformat, so nothing additionally recoverable was lost. Debug session:
+.planning/debug/resolved/fatfs-station-txt-persistent-failure.md. Practical lesson for future
+sessions: consider whether frequent flash-triggered hard resets during heavy iterative UI/feature
+work pose an ongoing corruption risk to this partition — not investigated further this session.
+IMPORTANT — NOTHING FROM TODAY IS COMMITTED YET. `git status` shows main/main.cpp,
+main/stream_uac.cpp, components/ui/ui.cpp, components/ui/include/ui.h all modified in the working
+tree, uncommitted. Last commit is still 5271f63 (TX trigger bug fix docs). A commit was never
+requested by the user today — next session should either request one explicitly or be reminded
+this is pending before further work risks losing track of what's committed vs. not.
 Status: Executing Phase 05
-Last activity: 2026-07-07
+Last activity: 2026-07-09
 
-Progress: [████████░░] 80%
+Progress: [████████▌░] 85%
 
 ## Performance Metrics
 
@@ -88,10 +139,48 @@ Recent decisions affecting current work:
 - 05-01 (2026-07-07, partial fix + conclusive hardware measurement): Found and hardware-verified a real, working fix for one contributing channel — ESP-IDF's public `usb_host_enum_filter_cb_t` API can reject the FTX-1's unused Yaesu auxiliary device (VID:0x26aa PID:0x0030) during enumeration, freeing its default control-pipe channel (confirmed via ESP-IDF's own `ENUM: Canceled enumeration` log line, not just this project's log). Kept in the tree (`main/stream_uac.cpp` `ftx1_enum_filter_cb()`, `sdkconfig` `CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK=y`) — it is correct and harmless. However, direct instrumentation of the actual compiled HCD source (`managed_components/espressif__usb/src/hcd_dwc.c` — discovered this project compiles its own vendored copy of the `usb` component, not the global ESP-IDF install) measured `allocated=8 total=8` at the exact moment the mic's pipe-alloc fails: hub + CDC(CAT) + audio-control + speaker alone already consume the full 8-channel hardware ceiling (read from the ESP32-S3's GHWCFG2 silicon register) with zero margin, even with the aux device's channel already freed. A settle-delay hypothesis (mic negotiation racing the aux device's async cleanup) was also tested and disproven — the confirmed channel-free completes 150ms+ before the mic's failing attempt regardless. Conclusion at that point: simultaneous mic+speaker+CAT is a measured, zero-margin hardware wall on this exact USB topology.
 - 05-01 (2026-07-07, RESOLVED): Implemented and hardware-verified the half-duplex mic/speaker redesign. Since mic and speaker are symmetric siblings on the FTX-1's audio device (same descriptor shape, 1 streaming pipe each) and FT8/FT4 never need simultaneous RX-decode + TX, they are now time-multiplexed for the FTX-1 profile only: `uac_ftx1_prepare_tx()`/`uac_ftx1_prepare_rx()` (main/stream_uac.cpp, declared in stream_uac.h) close one UAC stream and pre-claim (suspended, not yet streaming) the other, wired into `arm_pending_tx()` (single point of truth for every TX-scheduling path) and both TX-completion paths in main.cpp (`check_slot_boundary()`'s normal path and `tx_tick()`'s cancel path). No-op for QMX/QDX/KH1/generic-USB. Confirmed on real hardware across 9+ consecutive RX->TX->RX cycles (repeated CQ beaconing over several minutes): zero channel-exhaustion errors, real TX audio reaching the radio every cycle (79 tones sent), RX decode resuming cleanly afterward each time. One cosmetic ERROR-level log ("Unable to release UAC Interface" from the vendored `espressif__usb_host_uac` driver) appears on every mic-close but does not correlate with any actual leak — flagged as low-priority, not blocking. Debug session: `.planning/debug/resolved/ftx1-hcd-channel-exhaustion-halfduplex.md`.
 - 05-01 (2026-07-07, FIXED, commit f138027): TX trigger bug — beacon CQ and all other TX paths were arming correctly (speaker swap completed, g_qso_xmit set, g_pending_tx valid) but `check_slot_boundary()` refused to actually fire TX because `g_decode_applied_slot_idx` was stale. Root cause: the guard `g_decode_applied_slot_idx >= slot_idx - 1` prevents TX from firing on stale state, but once `uac_ftx1_prepare_tx()` closes the mic for half-duplex swap, no further decodes happen to advance the index. Fix: added `g_decode_applied_slot_idx = rtc_now_ms() / g_protocol->slot_time_ms;` in `arm_pending_tx()` after the half-duplex swap, signaling that current state is valid even without a decode (beacon CQ doesn't need a decode to fire). Code ready for build/flash/hardware verification. Debug session: user interaction logs show beacon firing but TX never starting, waterfall stopped (mic closed), speaker suspended indefinitely.
+- 05-01 (2026-07-08, FIXED, uncommitted): Beacon-enable + STATUS-exit hang — two independent bugs. (1)
+  `uac_ftx1_prepare_tx()`/`uac_ftx1_prepare_rx()` (main/stream_uac.cpp) had no locking; the main task
+  (`enter_mode()` on STATUS exit) and the audio/decode task (`decode_monitor_results()`) could race
+  into `mic_close()`/`spk_open_and_claim()` concurrently, double-closing the same UAC mic handle and
+  corrupting the vendored UAC driver's interface state, hanging the audio task permanently. Fixed with
+  a FreeRTOS mutex (`s_ftx1_swap_mutex`) around both functions. (2) `enter_mode()` unconditionally
+  called `sync_radio_to_current_band("STATUS exit")` immediately after `arm_pending_tx()`, forcing the
+  radio back to RX mode via CAT right after the half-duplex TX-arm swap; fixed by skipping that call
+  when a TX was just armed in the same invocation. A third defensive fix: `check_slot_boundary()` now
+  advances `g_decode_applied_slot_idx` to `slot_idx-1` whenever `audio_source_is_streaming()` is false
+  and it's fallen behind (no-op for QMX/QDX/KH1), preventing a second independent path to the same
+  "TX never fires" symptom once the mic is closed for half-duplex. Hardware-verified: two consecutive
+  beacon CQ cycles transmitted cleanly (79 tones each), RX resumed automatically after each. Debug
+  session: `.planning/debug/resolved/ftx1-beacon-arm-status-hang.md`.
+- 05-01 (2026-07-08, FIXED, uncommitted): TX audio silent bug — `tx_start()` (main/main.cpp) only
+  routed TX through the sample-counted USB-audio path (`uac_tx_begin_cpfsk`) for `RadioType::QDX`;
+  FTX-1 was never added to that condition and fell through to a per-symbol CAT tone path whose FTX-1
+  backend (`ftx1_set_tone_hz`) is a no-op stub. CAT PTT/keying worked (radio visibly transmitted,
+  clean-looking logs), but zero audio ever reached the radio — this was the real explanation for the
+  Phase 4 "TX tone confirmed clean" claim already flagged as doubtful. Fixed by adding
+  `RadioType::FTX1` to the QDX condition. A secondary defense-in-depth fix also added:
+  `uac_tx_start_writer()` now reads/logs FTX-1 speaker mute/volume state post-resume and raises volume
+  to 100 if reported lower (first hardware read showed vol=73 by default, not muted). Hardware-verified:
+  "UAC OUT CPFSK start" now fires every cycle, thousands of packets/cycle with zero errors, user
+  confirmed audio level visible on the FTX-1's own meter, AND external stations reported receiving the
+  beacon via PSKReporter (full RF confirmation). Debug session:
+  `.planning/debug/resolved/ftx1-tx-audio-silent.md`.
+- 05-01/05-02 (2026-07-08, RESOLVED): Both above fixes hardware-verified together via a complete,
+  real, logged FT8 QSO with DL6EL (report exchange -> RR73 -> mutual 73, confirmed both directions),
+  plus a user-run "5x full QSOs" final regression test with no errors reported. FT4 mode subsequently
+  confirmed working at the protocol level (correct TX parameters, half-duplex swap within the tighter
+  7.5s window, autoseq processing decodes/replies) but a full FT4 QSO completion was not explicitly
+  observed before the session ended.
+- 2026-07-08/09 (RESOLVED, no code fix — infrastructure issue): Internal FATFS storage corruption —
+  see "MAJOR SIDE INCIDENT" in Current Position above and
+  `.planning/debug/resolved/fatfs-station-txt-persistent-failure.md`. Fixed via partition reformat
+  (Windows Format-Volume through MSC/USB-drive mode), not a firmware change.
 
 ### Pending Todos
 
-None yet.
+- WiFi connectivity for NTP sync and QRZ.com log upload — future milestone, needs feasibility check against existing USB Host + audio heap/HCD-channel budget first. See `.planning/todos/pending/20260708-wifi-ntp-qrz-upload.md`.
+- FTX-1 Connect button (STATUS key '2') should force VFO mode before frequency sync — CAT `FA` command appears ignored if radio is in Memory-channel mode. Needs correct Yaesu CAT VFO-select command identified against the FTX-1's own CAT reference + hardware verification, not a guess. See `.planning/todos/pending/20260708-ftx1-connect-force-vfo-mode.md`.
 
 ### Blockers/Concerns
 
@@ -114,6 +203,15 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-07-06T22:00:00.000Z
-Stopped at: Phase 4 complete (04-02 hardware checkpoint passed)
-Resume file: none — run /gsd-plan-phase 5 to begin Phase 5
+Last session: 2026-07-09T00:00:00.000Z
+Stopped at: Phase 5 — E2E-01 (FT8) hardware-verified complete with a real logged QSO (DL6EL) plus a
+5x-QSO regression pass; E2E-02 (FT4) in progress, protocol-level behavior confirmed working
+(correct TX params, half-duplex swap, autoseq decode/reply) but no full FT4 QSO completion observed
+yet. Also fixed today: the beacon-arm/STATUS-exit hang, the TX-audio-never-reached-radio bug, and an
+unrelated internal-storage corruption incident (reformatted, resolved). Added three small UI
+features (SNR display, manual slot sync, combined QSO log view) at user request.
+UNCOMMITTED: main/main.cpp, main/stream_uac.cpp, components/ui/ui.cpp,
+components/ui/include/ui.h all have working-tree changes from today, none committed. Last commit
+is still 5271f63. Next session should confirm with the user whether to commit before continuing.
+Resume file: none — next step is completing/confirming a full FT4 QSO (E2E-02), then Phase 5 can be
+marked complete and the milestone closed out (ROADMAP.md/REQUIREMENTS.md updates, commit).

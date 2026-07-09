@@ -512,6 +512,7 @@ static std::vector<std::string> g_q_lines;
 static std::vector<std::string> g_q_files;
 enum class QPageView { Default, Alternate };
 struct QsoLogEntry {
+  std::string date_on;  // DD/MM
   std::string time_on;
   std::string band;
   std::string call;
@@ -520,7 +521,7 @@ struct QsoLogEntry {
   bool has_rst_sent = false;
   int rst_sent = 0;
 };
-static QPageView g_q_page_view = QPageView::Default;
+static QPageView g_q_page_view = QPageView::Alternate;
 static std::vector<QsoLogEntry> g_q_entries;
 static bool g_q_entries_have_next_page = false;
 static bool g_q_show_entries = false;
@@ -1041,19 +1042,13 @@ static std::string qso_format_sent4(bool has_value, int value) {
 static void qso_rebuild_entry_lines() {
   g_q_lines.clear();
   for (const auto& e : g_q_entries) {
-    std::string call_field = qso_trim_head(e.call, 11);
-    if (call_field.size() < 11) {
-      call_field.append(11 - call_field.size(), ' ');
+    std::string call_field = qso_trim_head(e.call, 10);
+    if (call_field.size() < 10) {
+      call_field.append(10 - call_field.size(), ' ');
     }
-
-    if (g_q_page_view == QPageView::Alternate) {
-      const std::string rcvd = qso_format_signed3(e.has_rst_rcvd, e.rst_rcvd);
-      const std::string sent = qso_format_sent4(e.has_rst_sent, e.rst_sent);
-      g_q_lines.push_back(call_field + rcvd + " " + sent);
-    } else {
-      const std::string band_disp = qso_trim_head(e.band, 6);
-      g_q_lines.push_back(e.time_on + " " + band_disp + " " + call_field);
-    }
+    const std::string rcvd = qso_format_signed3(e.has_rst_rcvd, e.rst_rcvd);
+    const std::string sent = qso_format_sent4(e.has_rst_sent, e.rst_sent);
+    g_q_lines.push_back(e.date_on + " " + e.time_on + " " + call_field + rcvd + " " + sent);
   }
 
   if (g_q_lines.empty()) {
@@ -1098,6 +1093,7 @@ static void qso_load_entries(const std::string& path) {
       return s.substr(gt + 1, end - gt - 1);
     };
     std::string call = get_field("call:");
+    std::string date_raw = get_field("qso_date:");
     std::string time_on = get_field("time_on:");
     std::string freq = get_field("freq:");
     std::string rst_rcvd_raw = get_field("rst_rcvd:");
@@ -1111,6 +1107,10 @@ static void qso_load_entries(const std::string& path) {
         if (fabs(bm - mhz) < 0.1) { band = b.name; break; }
       }
     }
+    std::string date_on = "--/--";
+    if (date_raw.size() == 8) {  // ADIF QSO_DATE: YYYYMMDD
+      date_on = date_raw.substr(6, 2) + "/" + date_raw.substr(4, 2);
+    }
     if (time_on.size() >= 4) {
       time_on = time_on.substr(0,4);
       time_on.insert(2, ":");
@@ -1120,6 +1120,7 @@ static void qso_load_entries(const std::string& path) {
     if (band.empty()) band = freq.empty() ? "?" : freq;
 
     QsoLogEntry e;
+    e.date_on = date_on;
     e.time_on = time_on;
     e.band = band;
     e.call = call;
@@ -1135,7 +1136,9 @@ static void qso_load_entries(const std::string& path) {
 static void qso_draw_page() {
   if (g_q_show_entries) {
     // Entry view: render raw QSO lines without "1..6 " prefixes.
-    ui_draw_debug(g_q_lines, 0);
+    // Smaller font: date+time+call+both SNR values don't fit the usual
+    // ~20-char/size-2 row budget.
+    ui_draw_debug(g_q_lines, 0, 1);
   } else {
     // File list view: keep numbered selection rows.
     ui_draw_list(g_q_lines, q_page, -1);
@@ -2332,6 +2335,30 @@ static void rtc_nudge_seconds(int delta) {
   save_station_data();
 }
 
+// Coarse manual sync: snap the clock to the most recent FT8/FT4 slot
+// boundary, for when the user observes (by ear, or against a reference
+// clock/radio) that a new slot cycle is starting right now. Always rounds
+// DOWN to the most recent boundary rather than to the nearest one, since a
+// human keypress always lags the true boundary instant, never leads it.
+// Operates at millisecond precision (unlike rtc_nudge_seconds's whole-second
+// epoch) because FT4's 7.5s slot period isn't a whole number of seconds.
+static void rtc_update_strings();  // defined below; used here for immediate refresh
+static void rtc_snap_to_slot_boundary() {
+  if (!rtc_valid) return;
+  int64_t now_ms = rtc_now_ms();
+  int64_t slot_ms = g_protocol->slot_time_ms;
+  int64_t delta_ms = now_ms - (now_ms / slot_ms) * slot_ms;
+  rtc_ms_start += delta_ms;
+  rtc_last_update += delta_ms;
+  rtc_update_strings();
+  g_time_synced_from_gps = false;
+  rtc_sync_to_esp_rtc();
+  if (rtc_write_external_from_soft("manual slot sync") == ESP_OK) {
+    g_rtc_time_source = RtcTimeSource::DS3231;
+  }
+  save_station_data();
+}
+
 static bool rtc_init_from_ds3231() {
   esp_err_t err = external_rtc_init();
   if (err != ESP_OK) {
@@ -2592,6 +2619,21 @@ static void check_slot_boundary() {
     // every other radio profile.
     uac_ftx1_prepare_rx();
     core_fire_qso_changed();  // propagates to all registered consumers
+  }
+
+  // FTX-1 half-duplex: once arm_pending_tx() closes the mic, no further
+  // decode can ever run, so g_decode_applied_slot_idx freezes at the arm-time
+  // slot forever. If the target parity slot is more than one slot away (e.g.
+  // beacon target parity equals the current slot's parity but we're already
+  // past this slot's early-TX window), the guard below never becomes true
+  // again and TX silently never fires. Keep the guard trivially satisfied
+  // while waiting on mic-closed TX-armed state -- there is no fresher decode
+  // to wait for. No-op for QMX/QDX/KH1, which keep the mic open across TX
+  // and keep advancing g_decode_applied_slot_idx normally.
+  // See .planning/debug/ftx1-beacon-arm-status-hang.md.
+  if (g_qso_xmit && !audio_source_is_streaming() &&
+      g_decode_applied_slot_idx < slot_idx - 1) {
+    g_decode_applied_slot_idx = slot_idx - 1;
   }
 
   // TX trigger: check if we should start TX in this slot
@@ -3389,9 +3431,13 @@ static void tx_start(int skip_tones) {
     }
   }
 
-  // QDX uses sample-counted UAC OUT. QMX and KH1 retain their existing
-  // per-symbol CAT paths.
-  if (g_tx_cat_ok && canonical_radio_type(g_radio) == RadioType::QDX) {
+  // QDX and FTX-1 use sample-counted UAC OUT (real USB audio to the radio).
+  // QMX and KH1 retain their existing per-symbol CAT paths (frequency-shift
+  // keying, no audio needed). FTX-1's CAT backend's set_tone_hz is a no-op
+  // stub -- without this branch, FTX-1 TX only ever sent CAT PTT with no
+  // audio ever reaching the radio. See .planning/debug/ftx1-tx-audio-silent.md.
+  if (g_tx_cat_ok && (canonical_radio_type(g_radio) == RadioType::QDX ||
+                       canonical_radio_type(g_radio) == RadioType::FTX1)) {
     const int remaining_tones = g_protocol->total_symbols - g_tx_tone_idx;
     if (remaining_tones <= 0 ||
         !uac_tx_begin_cpfsk(static_cast<float>(g_tx_base_hz),
@@ -3399,7 +3445,7 @@ static void tx_start(int skip_tones) {
                             static_cast<size_t>(remaining_tones),
                             g_protocol->tone_spacing,
                             g_protocol->samples_per_symbol)) {
-      ESP_LOGW(TAG, "tx_start: QDX UAC OUT start failed");
+      ESP_LOGW(TAG, "tx_start: UAC OUT start failed");
       radio_control_end_tx();
       g_tx_cat_ok = false;
       return;
@@ -4456,6 +4502,7 @@ void save_station_data() {
 static void enter_mode(UIMode new_mode) {
   // No special handling needed when leaving TX mode - autoseq manages queue internally
   if (ui_mode == UIMode::STATUS && new_mode != UIMode::STATUS) {
+    bool tx_just_armed = false;
     if (g_beacon != g_status_beacon_temp) {
       bool was_off = (g_beacon == BeaconMode::OFF);
       g_beacon = g_status_beacon_temp;
@@ -4471,6 +4518,7 @@ static void enter_mode(UIMode new_mode) {
         AutoseqTxEntry pending;
         if (autoseq_fetch_pending_tx(pending)) {
           arm_pending_tx(pending);
+          tx_just_armed = true;
         }
       }
     }
@@ -4483,7 +4531,12 @@ static void enter_mode(UIMode new_mode) {
     // sync already fired (e.g. from S->3 in-menu push, or from the
     // initial-connect path for QMX). For KH1 this is the primary sync
     // path (UART CAT has no discrete "first connect" event).
-    sync_radio_to_current_band("STATUS exit");
+    // Skipped when a TX was just armed above: radio_control_end_tx()
+    // forcing RX mode would fight the half-duplex mic-close/speaker-claim
+    // swap arm_pending_tx() just performed for the upcoming TX.
+    if (!tx_just_armed) {
+      sync_radio_to_current_band("STATUS exit");
+    }
   }
   ui_mode = new_mode;
   rx_flash_idx = -1;
@@ -5166,6 +5219,10 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
               else if (c == '8') {
                 rtc_nudge_seconds(+1); draw_status_view();
               }
+              else if (c == '0') {
+                rtc_snap_to_slot_boundary(); draw_status_view();
+                debug_log_line("Manual slot sync (0)");
+              }
             } else {
               if (status_edit_idx == 1) {
                 if (c == '`') { status_edit_idx = -1; status_edit_buffer.clear(); draw_status_view(); }
@@ -5259,7 +5316,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
               if (idx >= 0 && idx < (int)g_q_files.size()) {
                 const std::string selected_file = g_q_files[idx];
                 if (selected_file != g_q_current_file) {
-                  g_q_page_view = QPageView::Default;
+                  g_q_page_view = QPageView::Alternate;
                 }
                 g_q_current_file = selected_file;
                 g_q_show_entries = true;

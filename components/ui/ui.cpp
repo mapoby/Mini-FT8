@@ -333,6 +333,18 @@ static void draw_rx_line(int y, const RxDecodeEntry& l, int line_no, bool select
     M5.Display.printf("%d ", line_no);
     M5.Display.setTextColor(color, bg);
     M5.Display.printf("%s", l.text);
+
+    // SNR badge, right-aligned, same size as the row text. Blue for a
+    // positive report, red otherwise.
+    char snr_buf[8];
+    snprintf(snr_buf, sizeof(snr_buf), "%+d", l.snr);
+    int snr_w = (int)strlen(snr_buf) * 12;
+    int snr_x = SCREEN_W - snr_w - 2;
+    uint16_t snr_color = (l.snr > 0) ? rgb565(0, 120, 255) : rgb565(255, 0, 0);
+    M5.Display.setTextColor(snr_color, bg);
+    M5.Display.setCursor(snr_x, y);
+    M5.Display.printf("%s", snr_buf);
+
     int row_idx = line_no - 1;
     if (row_idx >= 0 && row_idx < RX_LINES) {
         char buf[RX_TEXT_MAX + 8];
@@ -448,12 +460,12 @@ void ui_draw_list(const std::vector<std::string>& lines, int page, int highlight
     M5.Display.endWrite();
 }
 
-void ui_draw_debug(const std::vector<std::string>& lines, int page) {
+void ui_draw_debug(const std::vector<std::string>& lines, int page, int text_size) {
     const int line_h = 19;
     const int start_y = UI_START_Y;
     DispGuard guard;
     M5.Display.startWrite();
-    M5.Display.setTextSize(2);
+    M5.Display.setTextSize(text_size);
     for (int i = 0; i < RX_LINES; ++i) {
         int idx = page * RX_LINES + i;
         int y = start_y + i * line_h;

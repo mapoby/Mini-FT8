@@ -111,6 +111,18 @@ typedef enum {
 } ftx1_direction_t;
 static ftx1_direction_t s_ftx1_direction = FTX1_DIR_RX;
 
+// Serializes uac_ftx1_prepare_tx()/uac_ftx1_prepare_rx() against concurrent
+// invocation. arm_pending_tx() (which calls uac_ftx1_prepare_tx()) is called
+// both from the main task (enter_mode() on STATUS exit, manual RX tap, etc.)
+// and from the audio/decode task (decode_monitor_results() on core 1 when a
+// beacon/autoseq TX becomes pending). Without this lock, two concurrent
+// callers can both observe s_ftx1_direction/s_mic_handle in their pre-swap
+// state and race into mic_close()+spk_open_and_claim() at once, double-closing
+// the same UAC mic handle -- corrupting the vendored UAC driver's interface
+// state and hanging the audio task. See
+// .planning/debug/ftx1-beacon-arm-status-hang.md.
+static SemaphoreHandle_t s_ftx1_swap_mutex = NULL;
+
 // Speaker (UAC OUT) is captured and fully allocated during enumeration.
 // QDX transmission only resumes or suspends the pre-opened endpoint.
 static uint8_t s_spk_addr = 0;
@@ -1152,6 +1164,12 @@ bool uac_start_with_profile(uac_stream_profile_t profile) {
     s_spk_bit_resolution = 24;
     s_mic_known = false;
     s_ftx1_direction = FTX1_DIR_RX;
+    if (!s_ftx1_swap_mutex) {
+        s_ftx1_swap_mutex = xSemaphoreCreateMutex();
+        if (!s_ftx1_swap_mutex) {
+            ESP_LOGE(TAG, "Failed to create FTX-1 swap mutex");
+        }
+    }
     ft8_audio_pipeline_clear_latest_waterfall_row();
 
     ESP_LOGI(TAG, "Starting UAC host profile=%s", profile_name(s_profile));
@@ -1306,6 +1324,30 @@ static bool uac_tx_start_writer(void) {
         return false;
     }
 
+    // FTX-1's codec has been observed keying the radio with zero meter
+    // deflection despite correct full-scale PCM reaching a resumed
+    // endpoint. Diagnose + defensively unmute/max-volume the speaker
+    // feature unit here (post-resume, when the device is guaranteed
+    // "active" for these control transfers). No-op for QMX/QDX/KH1,
+    // which are already working and unrelated to this symptom.
+    if (s_profile == UAC_PROFILE_FTX1) {
+        bool muted = false;
+        uint8_t volume = 0;
+        esp_err_t merr = uac_host_device_get_mute(s_spk_handle, &muted);
+        esp_err_t verr = uac_host_device_get_volume(s_spk_handle, &volume);
+        ESP_LOGI(TAG, "FTX-1 spk state: get_mute=%s (muted=%d) get_volume=%s (vol=%u)",
+                 esp_err_to_name(merr), (int)muted, esp_err_to_name(verr), (unsigned)volume);
+
+        if (merr == ESP_OK && muted) {
+            esp_err_t uerr = uac_host_device_set_mute(s_spk_handle, false);
+            ESP_LOGI(TAG, "FTX-1 spk unmute: %s", esp_err_to_name(uerr));
+        }
+        if (verr == ESP_OK && volume < 100) {
+            esp_err_t serr = uac_host_device_set_volume(s_spk_handle, 100);
+            ESP_LOGI(TAG, "FTX-1 spk set_volume(100): %s", esp_err_to_name(serr));
+        }
+    }
+
     s_spk_writer_run = true;
     return true;
 }
@@ -1373,22 +1415,34 @@ void uac_tx_end(void) {
 // See s_ftx1_direction declaration above for the full rationale.
 void uac_ftx1_prepare_tx(void) {
     if (s_profile != UAC_PROFILE_FTX1) return;
-    if (s_ftx1_direction == FTX1_DIR_TX) return;
+
+    if (s_ftx1_swap_mutex) xSemaphoreTake(s_ftx1_swap_mutex, portMAX_DELAY);
+    if (s_ftx1_direction == FTX1_DIR_TX) {
+        if (s_ftx1_swap_mutex) xSemaphoreGive(s_ftx1_swap_mutex);
+        return;
+    }
 
     ESP_LOGI(TAG, "FTX-1 half-duplex swap: RX -> TX (closing mic, claiming speaker)");
     mic_close();
     spk_open_and_claim();
     s_ftx1_direction = FTX1_DIR_TX;
+    if (s_ftx1_swap_mutex) xSemaphoreGive(s_ftx1_swap_mutex);
 }
 
 void uac_ftx1_prepare_rx(void) {
     if (s_profile != UAC_PROFILE_FTX1) return;
-    if (s_ftx1_direction == FTX1_DIR_RX) return;
+
+    if (s_ftx1_swap_mutex) xSemaphoreTake(s_ftx1_swap_mutex, portMAX_DELAY);
+    if (s_ftx1_direction == FTX1_DIR_RX) {
+        if (s_ftx1_swap_mutex) xSemaphoreGive(s_ftx1_swap_mutex);
+        return;
+    }
 
     ESP_LOGI(TAG, "FTX-1 half-duplex swap: TX -> RX (closing speaker, reopening mic)");
     spk_close();
     mic_open_and_start();
     s_ftx1_direction = FTX1_DIR_RX;
+    if (s_ftx1_swap_mutex) xSemaphoreGive(s_ftx1_swap_mutex);
 }
 
 const char* uac_get_status_string(void) {

@@ -78,7 +78,7 @@ void ui_draw_tx(const std::string& next, const std::vector<std::string>& queue, 
 int ui_handle_rx_key(char c);
 // Generic list draw (6 lines per page)
 void ui_draw_list(const std::vector<std::string>& lines, int page, int highlight_abs = -1);
-void ui_draw_debug(const std::vector<std::string>& lines, int page);
+void ui_draw_debug(const std::vector<std::string>& lines, int page, int text_size = 2);
 // Returns the currently rendered text rows (exact strings drawn for lines 1..6).
 void ui_get_visible_text_lines(std::vector<std::string>& out);
 // Override one mirrored row for custom render paths outside ui.cpp (e.g. STATUS).
