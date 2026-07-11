@@ -4,8 +4,8 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Phase 5 in progress - 05-01 (FT8) hardware-verified complete with a real logged QSO; 05-02 (FT4) in progress, TX/RX/half-duplex confirmed working, full FT4 QSO completion not yet explicitly confirmed
-last_updated: "2026-07-09T00:00:00.000Z"
-last_activity: 2026-07-09
+last_updated: "2026-07-11T00:00:00.000Z"
+last_activity: 2026-07-11
 progress:
   total_phases: 5
   completed_phases: 4
@@ -29,13 +29,13 @@ Phase: 5 in progress. Plans 01-01 through 04-02 complete. 05-01 (FT8 QSO checkpo
 The HCD channel-exhaustion blocker is RESOLVED (2026-07-07, half-duplex mic/speaker swap implementation).
 TX trigger bug FIXED (2026-07-07, commit f138027) — added g_decode_applied_slot_idx update in arm_pending_tx()
 to allow TX to fire when mic is closed for half-duplex.
-Beacon-enable + STATUS-exit hang FIXED (2026-07-08, not yet committed) — race between main task and
+Beacon-enable + STATUS-exit hang FIXED (2026-07-08, commit 9e215e2) — race between main task and
 audio/decode task in uac_ftx1_prepare_tx()/rx() (now mutex-guarded), unconditional STATUS-exit CAT
 resync fighting the half-duplex TX arm (now skipped when TX just armed), and a defensive fix for
 g_decode_applied_slot_idx freezing once the mic closes. Hardware-verified: two consecutive beacon CQ
 cycles transmitted cleanly (79 tones each), RX resumed automatically after each. Debug session:
 .planning/debug/resolved/ftx1-beacon-arm-status-hang.md.
-TX audio silent bug FIXED (2026-07-08, not yet committed) — main.cpp's tx_start() only routed TX
+TX audio silent bug FIXED (2026-07-08, commit 9e215e2) — main.cpp's tx_start() only routed TX
 through the sample-counted USB-audio path (uac_tx_begin_cpfsk) for RadioType::QDX; FTX-1 was never
 added to that condition and fell through to a per-symbol CAT tone path whose FTX-1 backend
 (ftx1_set_tone_hz) is a no-op stub. CAT PTT/keying worked, but zero audio ever reached the radio.
@@ -203,15 +203,20 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-07-09T00:00:00.000Z
+Last session: 2026-07-11T00:00:00.000Z
 Stopped at: Phase 5 — E2E-01 (FT8) hardware-verified complete with a real logged QSO (DL6EL) plus a
 5x-QSO regression pass; E2E-02 (FT4) in progress, protocol-level behavior confirmed working
 (correct TX params, half-duplex swap, autoseq decode/reply) but no full FT4 QSO completion observed
-yet. Also fixed today: the beacon-arm/STATUS-exit hang, the TX-audio-never-reached-radio bug, and an
+yet. Also fixed: the beacon-arm/STATUS-exit hang, the TX-audio-never-reached-radio bug, and an
 unrelated internal-storage corruption incident (reformatted, resolved). Added three small UI
 features (SNR display, manual slot sync, combined QSO log view) at user request.
-UNCOMMITTED: main/main.cpp, main/stream_uac.cpp, components/ui/ui.cpp,
-components/ui/include/ui.h all have working-tree changes from today, none committed. Last commit
-is still 5271f63. Next session should confirm with the user whether to commit before continuing.
+All code changes committed and pushed to origin/main: commit 9e215e2 (FTX-1 fixes + UI features).
+Full project documentation generated, codebase-verified, and committed: commit 968e590 (README
+FTX-1 section, ARCHITECTURE.md, CONFIGURATION.md, GETTING-STARTED.md, DEVELOPMENT.md, TESTING.md,
+CONTRIBUTING.md; also fixed a stale 120-vs-30 queue-size claim in the existing
+AUTOSEQ_INACTIVE_QUEUE.md). Tagged and released V2.2 "Yaesu FTX-1 Support" on GitHub
+(https://github.com/mapoby/Mini-FT8/releases/tag/V2.2) with the compiled MiniFT8_Merged_Auto.bin
+attached. Working tree is clean except a pre-existing, unrelated diff in dependencies.lock and
+managed_components/espressif__usb_host_cdc_acm/* that predates this session and was never touched.
 Resume file: none — next step is completing/confirming a full FT4 QSO (E2E-02), then Phase 5 can be
-marked complete and the milestone closed out (ROADMAP.md/REQUIREMENTS.md updates, commit).
+marked complete and the milestone closed out (ROADMAP.md/REQUIREMENTS.md updates).
