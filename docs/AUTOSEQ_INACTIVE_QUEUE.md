@@ -112,8 +112,8 @@ s_queue[]:
 - When both pointers meet (free space = 0), queue is full:
   evict the oldest inactive entry (rightmost) to make room.
 
-Queue size: **120 entries.** This accommodates a busy 1-hour activation.
-QsoContext is ~80 bytes with std::string SSO, so 120 entries ≈ 10 KB —
+Queue size: **30 entries** (`AUTOSEQ_MAX_QUEUE`, `main/autoseq.h`).
+QsoContext is ~80 bytes with std::string SSO, so 30 entries ≈ 2.4 KB —
 negligible on ESP32-S3 (512 KB SRAM).
 
 ### Sort Order

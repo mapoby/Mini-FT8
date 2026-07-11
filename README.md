@@ -184,3 +184,22 @@ updates write the DS3231 when it is present; FT8 decode fine corrections do not.
 
 - Mini-FT8 automatically sets KH1 TX power to 2 W.
 - For best RX performance, reduce AF volume to `05` or `06`.
+
+## FTX-1 Support
+
+The Yaesu FTX-1 is a supported radio, added after QMX/QDX/KH1. Unlike those
+radios, the FTX-1 connects with a **single USB cable** that carries both CAT
+control and bidirectional audio (mic in / speaker out) — there is no separate
+serial cable and no PORTA wiring to set up.
+
+- Select it from `N` (MENU P2) -> `3` (Select radio). The radio selection
+  cycles `QMX -> QDX -> KH1-USBC -> KH1-MIC -> FTX-1 -> QMX`.
+- The FTX-1 exposes a CP210x-based USB composite device (CAT-1/Enhanced COM
+  plus USB audio); Mini-FT8 auto-detects it once the radio is selected and
+  connected — no additional drivers or adapters are needed.
+- The FTX-1's internal USB hub also enumerates an undocumented Yaesu
+  auxiliary device; Mini-FT8 recognizes and ignores it so it does not
+  interfere with CAT/audio enumeration.
+- Audio is half-duplex on the FTX-1: the mic and speaker paths are
+  time-multiplexed (swapped between RX and TX) rather than kept open
+  simultaneously as with QMX/QDX/KH1.
